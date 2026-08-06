@@ -1,8 +1,8 @@
 //! 浏览器控制工具定义（与 EMA2 JS 扩展协议一致）。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-/// MCP tools/list 返回的 9 个工具。
+/// MCP tools/list 返回的浏览器工具。
 pub fn tool_list() -> Value {
     json!([
         {
@@ -92,7 +92,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "edge_console_messages",
-            "description": "Return console messages (log/warn/error) captured on the page since the first call",
+            "description": "Return console messages captured after console capture is initialized on the page",
             "inputSchema": {
                 "type": "object",
                 "properties": { "level": { "type": "string", "enum": ["log", "warn", "error"], "default": "error" } }
@@ -168,4 +168,155 @@ pub fn tool_list() -> Value {
             }
         }
     ])
+}
+
+pub fn contains(name: &str) -> bool {
+    matches!(
+        name,
+        "edge_get_tabs"
+            | "edge_get_active_tab"
+            | "edge_read_active_tab"
+            | "edge_read_tab"
+            | "edge_execute_js"
+            | "edge_click_element"
+            | "edge_new_tab"
+            | "edge_navigate"
+            | "edge_close_tab"
+            | "edge_wait_for"
+            | "edge_take_screenshot"
+            | "edge_console_messages"
+            | "edge_network_requests"
+            | "edge_type"
+            | "edge_press_key"
+            | "edge_fill_form"
+            | "edge_hover"
+            | "edge_scroll"
+    )
+}
+
+pub fn validate_arguments(name: &str, args: &Value) -> Result<(), &'static str> {
+    let object = args.as_object().ok_or("Tool arguments must be an object")?;
+    let string = |key: &str, max: usize, required: bool| -> Result<(), &'static str> {
+        match object.get(key) {
+            Some(Value::String(value))
+                if value.len() <= max && (!required || !value.trim().is_empty()) =>
+            {
+                Ok(())
+            }
+            None if !required => Ok(()),
+            _ => Err("Invalid tool argument"),
+        }
+    };
+    let number = |key: &str, required: bool| -> Result<Option<f64>, &'static str> {
+        match object.get(key) {
+            Some(value) => match value.as_f64() {
+                Some(value) if value.is_finite() => Ok(Some(value)),
+                _ => Err("Invalid numeric tool argument"),
+            },
+            None if !required => Ok(None),
+            None => Err("Missing numeric tool argument"),
+        }
+    };
+
+    match name {
+        "edge_read_tab" => {
+            let value = number("tabId", true)?.ok_or("tabId is required")?;
+            if value < 0.0 || value.fract() != 0.0 {
+                return Err("Invalid tabId");
+            }
+        }
+        "edge_execute_js" => string("code", 100_000, true)?,
+        "edge_click_element" | "edge_hover" => string("selector", 2_048, true)?,
+        "edge_new_tab" | "edge_navigate" => {
+            string("url", 8_192, true)?;
+            let url = object.get("url").and_then(Value::as_str).unwrap_or("");
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err("URL must use http or https");
+            }
+        }
+        "edge_close_tab" => {
+            if let Some(value) = number("tabId", false)?
+                && (value < 0.0 || value.fract() != 0.0)
+            {
+                return Err("Invalid tabId");
+            }
+        }
+        "edge_wait_for" => {
+            string("text", 100_000, false)?;
+            string("textGone", 100_000, false)?;
+            if object.contains_key("text") && object.contains_key("textGone") {
+                return Err("Use text or textGone, not both");
+            }
+            let time = number("time", false)?;
+            if let Some(value) = time {
+                if !(0.0..=300.0).contains(&value)
+                    || object.contains_key("text")
+                    || object.contains_key("textGone")
+                {
+                    return Err("Invalid wait condition");
+                }
+            } else if !object.contains_key("text") && !object.contains_key("textGone") {
+                return Err("A wait condition is required");
+            }
+        }
+        "edge_console_messages" => {
+            if let Some(level) = object.get("level")
+                && !matches!(level.as_str(), Some("log" | "warn" | "error"))
+            {
+                return Err("Invalid level");
+            }
+        }
+        "edge_network_requests" => string("filter", 2_048, false)?,
+        "edge_type" => {
+            string("selector", 2_048, true)?;
+            string("text", 100_000, true)?;
+            if let Some(value) = object.get("submit")
+                && !value.is_boolean()
+            {
+                return Err("Invalid submit");
+            }
+        }
+        "edge_press_key" => string("key", 100, true)?,
+        "edge_fill_form" => {
+            let fields = object
+                .get("fields")
+                .and_then(Value::as_array)
+                .ok_or("fields is required")?;
+            if fields.len() > 100 {
+                return Err("Too many fields");
+            }
+            for field in fields {
+                let field = field.as_object().ok_or("Invalid field")?;
+                let selector = field
+                    .get("selector")
+                    .and_then(Value::as_str)
+                    .ok_or("Invalid selector")?;
+                let value = field
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or("Invalid value")?;
+                if selector.is_empty() || selector.len() > 2_048 || value.len() > 100_000 {
+                    return Err("Invalid field");
+                }
+                if let Some(name) = field.get("name")
+                    && (!name.is_string() || name.as_str().unwrap_or("").len() > 200)
+                {
+                    return Err("Invalid field name");
+                }
+            }
+        }
+        "edge_scroll" => {
+            if let Some(value) = number("deltaY", false)?
+                && value.abs() > 100_000.0
+            {
+                return Err("Invalid deltaY");
+            }
+        }
+        "edge_get_tabs"
+        | "edge_get_active_tab"
+        | "edge_read_active_tab"
+        | "edge_take_screenshot" => {}
+        _ => return Err("Unknown tool"),
+    }
+    Ok(())
 }

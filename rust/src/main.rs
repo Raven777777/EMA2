@@ -72,7 +72,11 @@ async fn run(port: u16) {
             std::process::exit(1);
         }
     };
-    tracing::info!("EMA2 listening on http://127.0.0.1:{}/mcp (MCP) and ws://127.0.0.1:{}/ (extension)", cfg.port, cfg.port);
+    tracing::info!(
+        "EMA2 listening on http://127.0.0.1:{}/mcp (MCP) and ws://127.0.0.1:{}/ (extension)",
+        cfg.port,
+        cfg.port
+    );
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!("server error: {e}");
     }

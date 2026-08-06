@@ -22,8 +22,11 @@ impl Config {
         let keepalive_ms = std::env::var("EDGE_MCP_KEEPALIVE_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10000);
-        let token = std::env::var("EDGE_MCP_TOKEN").ok().filter(|v| !v.is_empty());
+            .unwrap_or(10000)
+            .max(1);
+        let token = std::env::var("EDGE_MCP_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty());
         let output_dir = std::env::var("EDGE_MCP_OUTPUT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("output"));

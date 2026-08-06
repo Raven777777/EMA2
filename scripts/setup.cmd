@@ -4,10 +4,6 @@ rem Requires the Rust toolchain (cargo on PATH, or D:\Rust\cargo.cmd).
 setlocal
 
 set "ROOT=%~dp0.."
-if exist "%ROOT%\bin\ema2.exe" (
-  echo bin\ema2.exe already exists. Rebuild? Run: cd rust ^&^& cargo build --release
-  exit /b 0
-)
 
 set "CARGO=cargo"
 where cargo >nul 2>nul || set "CARGO=D:\Rust\cargo.cmd"

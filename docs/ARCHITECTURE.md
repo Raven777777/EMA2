@@ -58,7 +58,7 @@ HTTP 响应 <──────────────────────�
 | `mcp.rs` | MCP 协议处理：initialize / tools/list / tools/call / ping |
 | `relay.rs` | 扩展 WS 连接循环 + 10s 保活 ping |
 | `state.rs` | 共享状态：扩展发送通道、pending 待响应映射、SSE 会话通道 |
-| `tools.rs` | 9 个浏览器工具的 schema 定义 |
+| `tools.rs` | 18 个浏览器工具的 schema 定义 |
 | `config.rs` | 端口（默认 8765）/ 保活间隔，`EDGE_MCP_PORT` 等 env 覆盖 |
 
 ## 依赖

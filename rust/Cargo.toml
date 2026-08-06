@@ -14,7 +14,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
 async-stream = "0.3"
-tower-http = { version = "0.6", features = ["compression-gzip"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "limit"] }
 base64 = "0.22"
 
 [profile.release]

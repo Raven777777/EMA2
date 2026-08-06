@@ -13,7 +13,7 @@ AI 客户端 ──MCP over HTTP──> ema2.exe (单进程) ──WebSocket─�
 - **单进程、单 exe（约 1.5 MB）**：Rust 实现，一个常驻进程同时承担 MCP 服务与浏览器桥接
 - **MCP over HTTP**：标准 Streamable HTTP + legacy SSE 双传输，opencode `type: remote` 直连
 - **控制真实浏览器**：真实指纹、真实登录态，无头检测失效，不依赖 CDP 调试端口
-- **9 个工具**：读页面 / 读标签页 / 列标签页 / 新建关闭 / 导航 / 点击 / 执行 JS
+- **18 个工具**：读页面 / 读标签页 / 列标签页 / 新建关闭 / 导航 / 点击 / 执行 JS，以及等待、截图、表单和页面交互工具
 - **MV3 保活**：定时 ping，防止 Edge 扩展 service worker 闲置回收断连
 - **安全**：只绑定 `127.0.0.1`
 
@@ -30,7 +30,7 @@ EMA2/
 │       ├── mcp.rs               # MCP 协议处理
 │       ├── relay.rs             # 扩展 WS 连接 + 保活
 │       ├── state.rs             # 共享状态（扩展连接/待响应映射）
-│       └── tools.rs             # 9 个工具定义
+│       └── tools.rs             # 18 个工具定义
 ├── extension/                   # Edge 浏览器扩展 (MV3)
 ├── scripts/
 │   ├── setup.cmd                # cargo build --release → bin/
@@ -38,7 +38,6 @@ EMA2/
 │   └── stop-bridge.cmd          # 停止中继
 ├── examples/
 │   ├── opencode.json.example    # opencode remote MCP 配置
-│   └── claude_desktop_config.json.example
 ├── docs/ARCHITECTURE.md
 ├── README.md
 └── LICENSE
@@ -49,7 +48,7 @@ EMA2/
 ### 前置要求
 
 - **Microsoft Edge**（新版）
-- **Rust 工具链**（仅构建需要；运行只需 `bin/ema2.exe`）
+- **Rust 工具链**（仅构建和测试需要；运行只需 `bin/ema2.exe`）
 
 ### 1. 启动中继
 
@@ -122,7 +121,7 @@ scripts\start-bridge.cmd     # 或直接运行 bin\ema2.exe run
 |------|------|------|
 | `EDGE_MCP_PORT` | 8765 | 监听端口 |
 | `EDGE_MCP_KEEPALIVE_MS` | 10000 | MV3 保活 ping 间隔 |
-| `EDGE_MCP_TOKEN` | 无 | 启用后 MCP HTTP 需 `Authorization: Bearer <token>` |
+| `EDGE_MCP_TOKEN` | 无 | 启用后 MCP HTTP 需 `Authorization: Bearer <token>`；扩展 WS 地址需追加 `?token=<token>` |
 | `EDGE_MCP_OUTPUT_DIR` | `./output` | 截图输出目录 |
 
 ## 命令行
@@ -143,12 +142,12 @@ curl -X POST -H "Content-Type: application/json" \
   http://127.0.0.1:8765/mcp
 
 # 2. 工具列表
-curl -X POST -H "Content-Type: application/json" \
+curl -X POST -H "Content-Type: application/json" -H "Mcp-Session-Id: <session-id-from-step-1>" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   http://127.0.0.1:8765/mcp
 
 # 3. 调用工具（打开新标签页 / 读取标签页文本）
-curl -X POST -H "Content-Type: application/json" \
+curl -X POST -H "Content-Type: application/json" -H "Mcp-Session-Id: <session-id-from-step-1>" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"edge_new_tab","arguments":{"url":"https://www.bing.com"}}}' \
   http://127.0.0.1:8765/mcp
 ```
@@ -156,8 +155,9 @@ curl -X POST -H "Content-Type: application/json" \
 Node.js 示例（读取网页正文）：
 
 ```js
+// sessionId is the Mcp-Session-Id response header from initialize.
 const res = await fetch('http://127.0.0.1:8765/mcp', {
-  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  method: 'POST', headers: { 'Content-Type': 'application/json', 'Mcp-Session-Id': sessionId },
   body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
     params: { name: 'edge_read_active_tab', arguments: {} } }),
 });
@@ -170,6 +170,37 @@ console.log(j.result.content[0].text);
 ```bash
 scripts\setup.cmd     # 或 cd rust && cargo build --release，产物复制到 bin/
 ```
+
+验证 Rust 服务和扩展脚本：
+
+```bash
+cd rust
+cargo test
+cargo build --release
+cd ..
+node --check extension\background.js
+```
+
+`cargo test` 当前用于验证项目可编译和测试入口；浏览器工具需要加载 Edge 扩展后才能进行端到端调用。
+
+## 天气查询脚本
+
+`scripts/weather.js` 通过 EMA2 MCP 控制真实 Edge，在 Google 查询天气并读取结果，不直接调用天气 API。需要先启动中继并确保扩展已连接：
+
+```bash
+node scripts/weather.js "Tokyo"
+node scripts/weather.js "New York"
+node scripts/weather.js "Shanghai" --json
+```
+
+作为模块复用：
+
+```js
+const { queryWeather } = require('./scripts/weather.js');
+const weather = await queryWeather('Tokyo');
+```
+
+可通过 `EMA2_MCP_URL` 和 `EDGE_MCP_TOKEN` 覆盖 MCP 地址和鉴权；浏览器控制请求超时为 30 秒。
 
 ## 常见问题
 

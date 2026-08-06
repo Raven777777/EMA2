@@ -14,7 +14,7 @@ use crate::state::RelayState;
 pub async fn handle_extension_ws(socket: WebSocket, state: Arc<RelayState>) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    *state.ext_tx.lock().unwrap() = Some(tx);
+    let generation = state.register_extension(tx);
     tracing::info!("extension connected");
 
     loop {
@@ -22,7 +22,7 @@ pub async fn handle_extension_ws(socket: WebSocket, state: Arc<RelayState>) {
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        on_extension_message(&state, &text);
+                        on_extension_message(&state, generation, &text);
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -39,11 +39,11 @@ pub async fn handle_extension_ws(socket: WebSocket, state: Arc<RelayState>) {
         }
     }
 
-    *state.ext_tx.lock().unwrap() = None;
+    state.unregister_extension(generation);
     tracing::info!("extension disconnected");
 }
 
-fn on_extension_message(state: &Arc<RelayState>, text: &str) {
+fn on_extension_message(state: &Arc<RelayState>, generation: u64, text: &str) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return,
@@ -52,10 +52,15 @@ fn on_extension_message(state: &Arc<RelayState>, text: &str) {
     if method == "bridge/hello" || method == "pong" {
         return;
     }
+    if v.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || (v.get("result").is_none() && v.get("error").is_none())
+    {
+        tracing::warn!("ignored invalid extension response");
+        return;
+    }
     if let Some(id) = v.get("id") {
-        if let Some(sender) = state.pending.lock().unwrap().remove(id) {
-            let _ = sender.send(v);
-        }
+        let id = id.clone();
+        state.complete_pending(&id, generation, v);
     }
 }
 
@@ -66,11 +71,7 @@ pub fn spawn_keepalive(state: Arc<RelayState>, cfg: Config) {
         interval.tick().await; // 跳过首次立即触发
         loop {
             interval.tick().await;
-            if let Some(tx) = state.ext_tx.lock().unwrap().clone() {
-                let _ = tx.send(Message::Text(
-                    r#"{"jsonrpc":"2.0","method":"ping"}"#.to_string().into(),
-                ));
-            }
+            state.send_keepalive();
         }
     });
 }

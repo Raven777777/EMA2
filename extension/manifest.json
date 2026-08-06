@@ -3,7 +3,7 @@
   "name": "EMA2 - Edge MCP Agent",
   "version": "1.0.0",
   "description": "Connects Edge browser to AI assistants via MCP (WebSocket bridge). Part of the EMA2 project.",
-  "permissions": ["tabs", "activeTab", "scripting", "debugger", "storage"],
+  "permissions": ["tabs", "activeTab", "scripting", "debugger", "storage", "alarms"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
