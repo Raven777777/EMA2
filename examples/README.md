@@ -3,13 +3,14 @@
 EMA2 本身只是「MCP over HTTP ↔ Edge 扩展」的桥，**不含业务脚本**；
 任何语言用 HTTP POST 就能驱动真实浏览器。这个目录放脚本示例。
 
-v1.4 工具面只有 9 个：`tabs / open / read / snapshot / act / wait / js / observe / shot`，
+v1.7 工具面有 11 个：`tabs / open / read / snapshot / act / wait / js / observe / files / shot / batch`，
 输出是行式紧凑文本，错误是 `error=<code> msg=... hint=...`。
+参数与输出协议见 [../docs/TOOLS.md](../docs/TOOLS.md)。
 
 ## 前置条件
 
 1. 启动中继：`scripts\start-bridge.cmd`（或 `bin\ema2.exe run`）
-2. Edge 已加载 `extension/`（v1.4），且 `bin\ema2.exe status` 显示 `"extension_connected": true`
+2. Edge 已加载 `extension/`（v1.7），且 `bin\ema2.exe status` 显示 `"extension_connected": true`
 3. 若中继设了 `EDGE_MCP_TOKEN`，扩展侧也要配同一个 token，并在运行脚本的终端里导出同名环境变量
 
 ## scrape_baike.py —— 抓百度百科并输出 Markdown
@@ -35,7 +36,7 @@ EDGE_MCP_TOKEN=xxx python examples/scrape_baike.py Python
 | `--keep-refs` | 保留 `[1]` 这类引用角标（默认去掉） |
 | `--json` | 额外输出原始结构化数据 `.json` |
 
-脚本内部的 v1.4 调用顺序：
+脚本内部的 v1.7 调用顺序：
 
 ```
 initialize                         → 拿到 Mcp-Session-Id
@@ -44,6 +45,16 @@ wait        {selector:".J-lemma-content", timeout}
 js          {code, budget:200000}   → 页面主世界结构化抽取，返回紧凑 JSON
 tabs        {action:"close", tabId} → 清理标签页
 ```
+
+## weather.js —— 查天气
+
+```bash
+node examples/weather.js "Tokyo"
+node examples/weather.js "New York" --json
+node examples/weather.js "Shanghai" --keep-tab
+```
+
+内部走 `open → wait → read → tabs close`，默认读完关闭标签页。
 
 ## 直接调用 MCP 的最小示例（curl）
 

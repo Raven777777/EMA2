@@ -4,7 +4,7 @@
 /output/
 /rust/output/
 examples/output/
-/backup/
+*.har
 *.log
 .DS_Store
 Thumbs.db

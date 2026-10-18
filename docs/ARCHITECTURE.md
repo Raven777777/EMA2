@@ -1,4 +1,4 @@
-# EMA2 (Rust) 架构说明 · v1.7
+# EMA2 (Rust) 架构说明 · v1.7.5
 
 ## 总览
 
@@ -24,8 +24,10 @@ WebSocket 桥接，让 AI 直接控制真实浏览器（真实指纹、真实登
                                              真实浏览器（页面/登录态）
 ```
 
-v1.4 是**面向 AI 的重新设计**，与 v1.3 的工具名不兼容（18 → 9 个工具）；
-v1.5 在其上补了深度 DOM 遍历、文件能力与扩展自刷新（9 → 10 个工具）。
+v1.4 是**面向 AI 的重新设计**，与 v1.3 的工具名不兼容；
+v1.5–v1.7 逐步补上深度 DOM、文件、网络、并发与视觉兜底。
+当前为 **v1.7.5：11 个工具**（参数与输出协议见 [TOOLS.md](TOOLS.md)，
+版本历史见 [CHANGELOG.md](CHANGELOG.md)）。
 
 ## 组件
 
@@ -36,10 +38,10 @@ v1.5 在其上补了深度 DOM 遍历、文件能力与扩展自刷新（9 → 1
 | `mcp.rs` | 协议：版本协商、tools、工具调用、截图落盘、工具错误封装 |
 | `relay.rs` | 扩展 WS 连接、`hello`→`welcome` 握手、保活 |
 | `state.rs` | 扩展连接（generation + sender）、pending 映射、会话/事件流 |
-| `tools.rs` | 9 个工具的**唯一**注册表（schema + 校验 + 超时） |
+| `tools.rs` | 11 个工具的**唯一**注册表（schema + 校验 + 超时） |
 | `config.rs` | 端口/保活/token/输出目录 |
 
-## 工具面（9 个）
+## 工具面（11 个）
 
 ```
 tabs     list/current/new/close/activate
@@ -47,7 +49,7 @@ open     url → 新标签或指定 tab 导航
 read     md|text|html，selector 限定，budget/cursor
 snapshot 交互元素 + heading → [eN] ref
 act      click/type/fill/select/press/hover/scroll/submit/back/forward/reload
-         + steps[] 批量（可跨导航）
+         + steps[] 批量（可跨导航）+ waitFor 等响应
 wait     text / textGone / selector / time / idle
 js       MAIN world 执行（debugger，await 支持）
 observe  console/network 增量（since = 上次 next）
@@ -58,7 +60,7 @@ shot     PNG；默认落盘回路径，inline=true 回图片
 设计要点：
 
 - **schema 只写一次**：`tools/list`、白名单、校验、超时都由 `TOOLS` 派生
-- **工具名短**：模型每轮都要看这 9 个名字
+- **工具名短**：模型每轮都要看这 11 个名字
 - **粗粒度**：用 `action` 枚举合并同类操作，减少工具数量与选择成本
 
 ## 输出协议（AI 优先）
