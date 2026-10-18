@@ -1,24 +1,33 @@
 {
-  "manifest_version": 3,
-  "name": "EMA2 - Edge MCP Agent",
-  "version": "1.0.0",
-  "description": "Connects Edge browser to AI assistants via MCP (WebSocket bridge). Part of the EMA2 project.",
-  "permissions": ["tabs", "activeTab", "scripting", "debugger", "storage", "alarms"],
-  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_icon": {
+      "128": "icons/icon128.png",
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png"
+    },
+    "default_title": "EMA2 - Edge MCP Agent"
+  },
   "background": {
     "service_worker": "background.js"
   },
-  "action": {
-    "default_title": "EMA2 - Edge MCP Agent",
-    "default_icon": {
-      "16": "icons/icon16.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
-    }
-  },
+  "description": "Connects Edge browser to AI assistants via MCP (WebSocket bridge). Part of the EMA2 project.",
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "icons": {
+    "128": "icons/icon128.png",
     "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
-  }
+    "48": "icons/icon48.png"
+  },
+  "manifest_version": 3,
+  "name": "EMA2 - Edge MCP Agent",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "debugger",
+    "storage",
+    "alarms"
+  ],
+  "version": "1.7.5"
 }

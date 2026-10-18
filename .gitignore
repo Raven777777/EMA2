@@ -1,4 +1,14 @@
 /rust/target/
+
+# 本地运行产物
+/output/
+/rust/output/
+examples/output/
+/backup/
 *.log
 .DS_Store
 Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
