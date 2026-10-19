@@ -79,7 +79,7 @@ bin/            ema2.exe（当前源码构建，v1.8.0）
 extension/      Edge MV3 扩展（background.js + manifest）
 rust/           Rust 中继源码（MCP HTTP + WebSocket bridge）
 scripts/        setup / start / stop / bridge.ps1 进程管理
-tests/          Node VM/jsdom 与 PowerShell 回归测试
+tests/          Node VM/jsdom / PowerShell 回归 + 真实 Edge 验收
 examples/       调用示例（weather.js、scrape_baike.py）
 docs/           TOOLS / ARCHITECTURE / CHANGELOG / TESTING
 ```
@@ -139,9 +139,14 @@ cargo clippy --locked --all-targets -- -D warnings
 
 # Windows 启动/停止脚本自检
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bridge.ps1 -SelfTest
+
+# 真实 Edge/MV3 验收（隔离 profile，约 2 分钟）
+npm run test:edge
 ```
 
-说明：这些是 Node VM/jsdom 与 Rust/PowerShell 回归检查，不等同于真实 Edge 集成测试。
+说明：Node VM/jsdom 与 Rust/PowerShell 是快速回归；`test:edge` 使用独立临时 profile
+启动真实 Edge，16 个场景覆盖 F01–F13 主流程、files、shot 和扩展重连。
+真实 Edge 验收已在 Edge 155.0.4283.62 上 16/16 通过。
 `scripts\start-bridge.cmd` / `stop-bridge.cmd` 只管理当前项目 `bin\ema2.exe` 且精确匹配端口；
 陌生进程占用端口时会报错退出，不会强杀。
 
@@ -150,7 +155,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bridge.ps1 -SelfTest
 - 网络 body 是受限预览（≤800 字符），HAR 是采样；不是完整抓包代理
 - `js`（debugger 上下文）直接发起的 fetch 可能只以 `status=-1` 的资源条目出现；页面自身请求正常抓取
 - `act waitFor` 不把 hook 安装前的历史回填（`status=-1`）当作成功响应，会回 `observation_gap`
-- 跨域 iframe 不可遍历；`download-dir` 在 Edge 上不可设（返回明确错误）
+- 跨域 iframe 不可遍历；同源 iframe / shadow root 的截图坐标仍有待更多实机覆盖
+- `download-dir` 在 Edge 上不可设（返回明确错误）
 - `shot` 只截活动 tab；后台 tab 会返回 `tab_not_active`
 - 合成 `press` 不提供浏览器原生 Tab/组合键默认行为
 - 视觉兜底是"编号图 + 坐标"，不含 OCR

@@ -27,6 +27,8 @@
 - 示例固定传 `tabId`；文档同步 ref 生命周期、脱敏、截图活动页、超时/分页和 HAR 采样边界
 - 测试：49 个 Rust 单元测试、19 项 Node VM/jsdom 回归、PowerShell 进程管理自检；
   `cargo clippy -- -D warnings` 通过；覆盖矩阵见 `docs/TESTING.md`
+- 真实 Edge/MV3 验收：Edge 155.0.4283.62 隔离 profile，16/16 场景通过；
+  新增 `npm run test:edge` 与 `tests/integration/edge-acceptance.cjs`
 
 ## v1.7.5 — 最终版
 

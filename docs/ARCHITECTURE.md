@@ -272,6 +272,9 @@ cargo clippy --locked --all-targets -- -D warnings
 npm install
 npm run test:js
 
+# 真实 Edge/MV3 验收：16 场景（隔离 profile）
+npm run test:edge
+
 # Windows 进程管理自检与外部分占用者保护
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bridge.ps1 -SelfTest
 ```
@@ -281,4 +284,5 @@ wait 与 batch 超时预算、pending 代际隔离与取消释放、token、事�
 会话 GC、截图落盘/失败、Host/Origin/Content-Type 拦截、notification 202；
 扩展侧覆盖 F01–F13 的网络非阻塞、敏感信息、文档作用域 ref、debugger deadline、
 截图活动页、观测分页、Markdown、动作结果、press 目标、跨文档网络水位和参数边界。
-这些是 Node VM/jsdom 回归，不等于真实 Edge 集成测试。
+真实 Edge 验收已在 Edge 155.0.4283.62 上 16/16 通过（独立临时 profile）；
+详见 [TESTING.md](TESTING.md)。
