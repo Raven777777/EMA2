@@ -60,6 +60,49 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// SSE 生成器被客户端丢弃时也会执行 Drop：清理不再依赖生成器循环自然结束。
+struct SessionStreamCleanup {
+    state: Arc<RelayState>,
+    session_id: String,
+    stream_id: Option<u64>,
+    legacy: bool,
+}
+
+impl SessionStreamCleanup {
+    fn event_stream(state: Arc<RelayState>, session_id: String, stream_id: u64) -> Self {
+        Self {
+            state,
+            session_id,
+            stream_id: Some(stream_id),
+            legacy: false,
+        }
+    }
+
+    fn legacy(state: Arc<RelayState>, session_id: String) -> Self {
+        Self {
+            state,
+            session_id,
+            stream_id: None,
+            legacy: true,
+        }
+    }
+}
+
+impl Drop for SessionStreamCleanup {
+    fn drop(&mut self) {
+        if self.legacy {
+            self.state
+                .sse_senders
+                .lock()
+                .unwrap()
+                .remove(&self.session_id);
+        } else if let Some(stream_id) = self.stream_id {
+            self.state
+                .unregister_event_stream(&self.session_id, stream_id);
+        }
+    }
+}
+
 /// 判断 Host / `host:port` / `[::1]:port` 是否指向本机。
 fn host_is_loopback(authority: &str) -> bool {
     let authority = authority.rsplit('@').next().unwrap_or(authority).trim();
@@ -251,13 +294,12 @@ async fn mcp_stream(State(state): State<Arc<RelayState>>, headers: HeaderMap) ->
     let session_id = session_id.to_owned();
     let cleanup_state = state.clone();
     let stream = async_stream::stream! {
+        let _cleanup = SessionStreamCleanup::event_stream(cleanup_state, session_id, stream_id);
         while let Some(value) = receiver.recv().await {
             if let Ok(event) = Event::default().event("message").json_data(value) {
                 yield Ok::<Event, Infallible>(event);
             }
         }
-        // 只注销自己这条流：同一 session 重连后旧流的清理不会误删新流。
-        cleanup_state.unregister_event_stream(&session_id, stream_id);
     };
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -283,13 +325,13 @@ async fn legacy_sse(State(state): State<Arc<RelayState>>, headers: HeaderMap) ->
     let cleanup_state = state.clone();
     let cleanup_id = session_id.clone();
     let stream = async_stream::stream! {
+        let _cleanup = SessionStreamCleanup::legacy(cleanup_state, cleanup_id);
         yield Ok::<Event, Infallible>(Event::default().event("endpoint").data(endpoint));
         while let Some(value) = rx.recv().await {
             if let Ok(event) = Event::default().event("message").json_data(value) {
                 yield Ok::<Event, Infallible>(event);
             }
         }
-        cleanup_state.sse_senders.lock().unwrap().remove(&cleanup_id);
     };
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -391,13 +433,15 @@ async fn status(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::router;
+    use super::{SessionStreamCleanup, router};
     use crate::state::RelayState;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use std::path::PathBuf;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
     use tower::ServiceExt;
 
     fn state(token: Option<&str>) -> std::sync::Arc<RelayState> {
@@ -641,5 +685,35 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn stream_cleanup_guard_removes_event_stream_when_dropped() {
+        let state = state(None);
+        let session = state.create_mcp_session();
+        let (stream_id, _rx) = state.register_event_stream(&session).unwrap();
+        {
+            let _guard =
+                SessionStreamCleanup::event_stream(state.clone(), session.clone(), stream_id);
+            assert_eq!(state.event_stream_count(), 1);
+        }
+        assert_eq!(state.event_stream_count(), 0);
+    }
+
+    #[test]
+    fn stream_cleanup_guard_removes_legacy_session_when_dropped() {
+        let state = state(None);
+        let session = state.new_legacy_session_id();
+        let (tx, _rx) = mpsc::unbounded_channel::<Value>();
+        state
+            .sse_senders
+            .lock()
+            .unwrap()
+            .insert(session.clone(), (Instant::now(), tx));
+        {
+            let _guard = SessionStreamCleanup::legacy(state.clone(), session.clone());
+            assert_eq!(state.legacy_session_count(), 1);
+        }
+        assert_eq!(state.legacy_session_count(), 0);
     }
 }

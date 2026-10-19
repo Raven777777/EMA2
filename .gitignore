@@ -12,3 +12,6 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+
+# Node test deps
+node_modules/

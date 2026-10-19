@@ -2,9 +2,9 @@
 'use strict';
 
 /**
- * EMA2 v1.4 示例：通过 MCP 控制真实 Edge，在 Google 查天气并读取结果。
+ * EMA2 v1.8 示例：通过 MCP 控制真实 Edge，在 Google 查天气并读取结果。
  *
- * v1.4 工具面（9 个）：tabs / open / read / snapshot / act / wait / js / observe / shot
+ * v1.8 工具面（11 个）：tabs / open / read / snapshot / act / wait / js / observe / files / shot / batch
  * 输出是行式紧凑文本，错误是 `error=<code> msg=... hint=...`。
  */
 
@@ -84,11 +84,11 @@ async function queryWeather(location, options = {}) {
   const tabId = Number(field(opened, 'id'));
 
   let warning;
-  try { await callTool('wait', { text: place, timeout: 30 }, sessionId, nextId++); }
+  try { await callTool('wait', { tabId, text: place, timeout: 30 }, sessionId, nextId++); }
   catch (error) { warning = error.message; }
 
   try {
-    const text = await callTool('read', { mode: 'md', budget: 12000 }, sessionId, nextId++);
+    const text = await callTool('read', { tabId, mode: 'md', budget: 12000 }, sessionId, nextId++);
     return {
       location: place,
       url,

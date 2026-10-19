@@ -1,4 +1,4 @@
-//! v1.7 工具注册表（11 个粗粒度工具，面向 AI）。
+//! v1.8 工具注册表（11 个粗粒度工具，面向 AI）。
 //!
 //! 约定：
 //! - 输出行式紧凑文本（`key=value` / TSV / `[ref]`），不 pretty-print JSON
@@ -19,9 +19,15 @@ pub struct Tool {
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const ACT_TIMEOUT: Duration = Duration::from_secs(60);
-pub const LONG_TIMEOUT: Duration = Duration::from_secs(90);
+pub const LONG_TIMEOUT: Duration = Duration::from_secs(120);
 pub const PAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单次工具调用的产品总时长上限；超出时在调用前明确拒绝，而不是让中继伪装成超时。
+pub const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+const RELAY_MARGIN_SECS: f64 = 15.0;
+/// 扩展侧 debugger 任务本身的执行上限（全局串行队列）。
+const DEBUGGER_TASK_SECS: f64 = 60.0;
 const MAX_BUDGET: u64 = 200_000;
+const MAX_WAIT_SECS: f64 = 300.0;
 
 pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     vec![
@@ -32,7 +38,7 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["list", "current", "new", "close", "activate"] },
-                    "tabId": { "type": "number" },
+                    "tabId": { "type": "integer", "minimum": 0 },
                     "url": { "type": "string" },
                     "active": { "type": "boolean" }
                 }
@@ -44,8 +50,8 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string" },
-                    "tabId": { "type": "number" },
+                    "url": { "type": "string", "maxLength": 8192 },
+                    "tabId": { "type": "integer", "minimum": 0 },
                     "wait": { "type": "string", "enum": ["load", "dom", "none"] }
                 },
                 "required": ["url"]
@@ -57,26 +63,26 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tabId": { "type": "number" },
+                    "tabId": { "type": "integer", "minimum": 0 },
                     "mode": { "type": "string", "enum": ["md", "text", "html"] },
-                    "selector": { "type": "string" },
+                    "selector": { "type": "string", "maxLength": 2048 },
                     "main": { "type": "boolean" },
-                    "budget": { "type": "number" },
-                    "cursor": { "type": "number" }
+                    "budget": { "type": "integer", "minimum": 200, "maximum": 200000 },
+                    "cursor": { "type": "integer", "minimum": 0 }
                 }
             }),
         },
         Tool {
             name: "snapshot",
-            description: "Ref snapshot `[e12] button \"X\"`. filter/ near=<ref> scope; refs go stale after navigation.",
+            description: "Ref snapshot `[e12@doc] button \"X\"`. filter/ near=<ref> scope; refs are document-scoped and go stale after navigation.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tabId": { "type": "number" },
+                    "tabId": { "type": "integer", "minimum": 0 },
                     "filter": { "type": "string", "enum": ["interactive", "full", "links", "buttons", "form"] },
-                    "near": { "type": "string" },
-                    "budget": { "type": "number" },
-                    "cursor": { "type": "number" }
+                    "near": { "type": "string", "maxLength": 32 },
+                    "budget": { "type": "integer", "minimum": 200, "maximum": 200000 },
+                    "cursor": { "type": "integer", "minimum": 0 }
                 }
             }),
         },
@@ -86,26 +92,43 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tabId": { "type": "number" },
+                    "tabId": { "type": "integer", "minimum": 0 },
                     "action": { "type": "string", "enum": ["click", "type", "fill", "select", "press", "hover", "scroll", "submit", "back", "forward", "reload"] },
-                    "ref": { "type": "string" },
-                    "selector": { "type": "string" },
+                    "ref": { "type": "string", "maxLength": 32 },
+                    "selector": { "type": "string", "maxLength": 2048 },
                     "target": { "type": "string" },
-                    "text": { "type": "string" },
-                    "value": { "type": "string" },
-                    "key": { "type": "string" },
-                    "deltaY": { "type": "number" },
-                    "fields": { "type": "array", "items": { "type": "object" } },
-                    "steps": { "type": "array", "items": { "type": "object" } },
+                    "text": { "type": "string", "maxLength": 100000 },
+                    "value": { "type": "string", "maxLength": 100000 },
+                    "key": { "type": "string", "maxLength": 100 },
+                    "deltaY": { "type": "number", "minimum": -100000, "maximum": 100000 },
+                    "submit": { "type": "boolean" },
+                    "fields": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "ref": { "type": "string", "maxLength": 32 },
+                                "selector": { "type": "string", "maxLength": 2048 },
+                                "target": { "type": "string", "maxLength": 200 },
+                                "value": { "type": "string", "maxLength": 100000 }
+                            },
+                            "required": ["value"]
+                        }
+                    },
+                    "steps": {
+                        "type": "array", "minItems": 1, "maxItems": 20,
+                        "items": { "type": "object", "required": ["action"] }
+                    },
                     "waitFor": {
                         "type": "object",
                         "properties": {
-                            "url": { "type": "string" },
-                            "status": { "type": "number" },
-                            "timeout": { "type": "number" }
+                            "url": { "type": "string", "maxLength": 2048 },
+                            "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+                            "timeout": { "type": "number", "minimum": 0, "maximum": 30 }
                         }
                     }
-                }
+                },
+                "anyOf": [{ "required": ["action"] }, { "required": ["steps"] }]
             }),
         },
         Tool {
@@ -114,13 +137,13 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tabId": { "type": "number" },
-                    "text": { "type": "string" },
+                    "tabId": { "type": "integer", "minimum": 0 },
+                    "text": { "type": "string", "maxLength": 100000 },
                     "textGone": { "type": "string" },
-                    "selector": { "type": "string" },
-                    "time": { "type": "number" },
+                    "selector": { "type": "string", "maxLength": 2048 },
+                    "time": { "type": "number", "minimum": 0, "maximum": 300 },
                     "idle": { "type": "boolean" },
-                    "timeout": { "type": "number" }
+                    "timeout": { "type": "number", "minimum": 0, "maximum": 300 }
                 }
             }),
         },
@@ -130,9 +153,9 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "code": { "type": "string" },
-                    "tabId": { "type": "number" },
-                    "budget": { "type": "number" }
+                    "code": { "type": "string", "maxLength": 100000 },
+                    "tabId": { "type": "integer", "minimum": 0 },
+                    "budget": { "type": "integer", "minimum": 200, "maximum": 200000 }
                 },
                 "required": ["code"]
             }),
@@ -144,15 +167,15 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
                 "type": "object",
                 "properties": {
                     "kind": { "type": "string", "enum": ["console", "network"] },
-                    "tabId": { "type": "number" },
-                    "since": { "type": "number" },
+                    "tabId": { "type": "integer", "minimum": 0 },
+                    "since": { "type": "integer", "minimum": 0 },
                     "level": { "type": "string", "enum": ["log", "warn", "error"] },
-                    "filter": { "type": "string" },
-                    "bodyFilter": { "type": "string" },
-                    "wait": { "type": "number" },
+                    "filter": { "type": "string", "maxLength": 2048 },
+                    "bodyFilter": { "type": "string", "maxLength": 512 },
+                    "wait": { "type": "number", "minimum": 0, "maximum": 10 },
                     "bodies": { "type": "boolean" },
                     "har": { "type": "boolean" },
-                    "budget": { "type": "number" }
+                    "budget": { "type": "integer", "minimum": 200, "maximum": 200000 }
                 },
                 "required": ["kind"]
             }),
@@ -164,12 +187,12 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["upload", "download-dir"] },
-                    "tabId": { "type": "number" },
-                    "ref": { "type": "string" },
-                    "selector": { "type": "string" },
-                    "target": { "type": "string" },
-                    "paths": { "type": "array", "items": { "type": "string" } },
-                    "dir": { "type": "string" }
+                    "tabId": { "type": "integer", "minimum": 0 },
+                    "ref": { "type": "string", "maxLength": 32 },
+                    "selector": { "type": "string", "maxLength": 2048 },
+                    "target": { "type": "string", "maxLength": 200 },
+                    "paths": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "type": "string" } },
+                    "dir": { "type": "string", "maxLength": 4096 }
                 },
                 "required": ["action"]
             }),
@@ -180,9 +203,10 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tabId": { "type": "number" },
+                    "tabId": { "type": "integer", "minimum": 0 },
                     "inline": { "type": "boolean" },
-                    "annotate": { "type": "boolean" }
+                    "annotate": { "type": "boolean" },
+                    "format": { "type": "string", "enum": ["png", "jpeg"] }
                 }
             }),
         },
@@ -193,9 +217,12 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
                 "type": "object",
                 "properties": {
                     "tool": { "type": "string", "enum": ["read", "snapshot", "js", "wait"] },
-                    "tabIds": { "type": "array", "items": { "type": "number" } },
+                    "tabIds": {
+                        "type": "array", "minItems": 1, "maxItems": 8,
+                        "items": { "type": "integer", "minimum": 0 }
+                    },
                     "args": { "type": "object" },
-                    "concurrency": { "type": "number" }
+                    "concurrency": { "type": "integer", "minimum": 1, "maximum": 4 }
                 },
                 "required": ["tool", "tabIds"]
             }),
@@ -225,18 +252,7 @@ pub fn contains(name: &str) -> bool {
 /// 中继等待扩展响应的超时（必须大于扩展侧自身的等待上限）。
 pub fn timeout_for(name: &str, arguments: &Value) -> Duration {
     match name {
-        "wait" => {
-            let secs = arguments
-                .get("time")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                .clamp(0.0, 300.0);
-            if secs > 0.0 {
-                Duration::from_secs_f64(secs + 10.0)
-            } else {
-                PAGE_WAIT_TIMEOUT + Duration::from_secs(15)
-            }
-        }
+        "wait" => Duration::from_secs_f64(wait_seconds(arguments) + RELAY_MARGIN_SECS),
         "act" => {
             let wait = arguments
                 .pointer("/waitFor/timeout")
@@ -246,22 +262,62 @@ pub fn timeout_for(name: &str, arguments: &Value) -> Duration {
             ACT_TIMEOUT + Duration::from_secs_f64(wait)
         }
         "js" | "shot" | "files" => LONG_TIMEOUT,
-        "batch" => {
-            // batch 里跑 wait(time=N) 时，预算要覆盖 N 秒
-            if arguments.get("tool").and_then(Value::as_str) == Some("wait") {
-                let secs = arguments
-                    .pointer("/args/time")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 300.0);
-                if secs > 0.0 {
-                    return Duration::from_secs_f64(secs + 15.0);
-                }
-            }
-            LONG_TIMEOUT
-        }
+        "batch" => Duration::from_secs_f64(
+            batch_budget_seconds(arguments).min(MAX_CALL_TIMEOUT.as_secs_f64()),
+        ),
         _ => DEFAULT_TIMEOUT,
     }
+}
+
+/// 已校验/已应用默认值后的 wait 实际秒数：time 优先，否则 timeout（默认 30）。
+fn wait_seconds(arguments: &Value) -> f64 {
+    if let Some(time) = arguments.get("time").and_then(Value::as_f64) {
+        return time.clamp(0.0, MAX_WAIT_SECS);
+    }
+    arguments
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .unwrap_or(PAGE_WAIT_TIMEOUT.as_secs_f64())
+        .clamp(0.0, MAX_WAIT_SECS)
+}
+
+fn batch_tab_count(arguments: &Value) -> usize {
+    arguments
+        .get("tabIds")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn batch_concurrency(arguments: &Value) -> f64 {
+    arguments
+        .get("concurrency")
+        .and_then(Value::as_f64)
+        .unwrap_or(2.0)
+        .clamp(1.0, 4.0)
+}
+
+/// batch 的总预算 = 执行波次 × 单次最长耗时 + 余量。
+///
+/// js 走全局 debugger 串行队列，所以有效并发固定为 1，不能直接使用声明并发。
+fn batch_budget_seconds(arguments: &Value) -> f64 {
+    let tool = arguments
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tabs = batch_tab_count(arguments) as f64;
+    if tabs <= 0.0 {
+        return LONG_TIMEOUT.as_secs_f64();
+    }
+    let declared = batch_concurrency(arguments);
+    let effective = if tool == "js" { 1.0 } else { declared };
+    let waves = (tabs / effective).ceil();
+    let per_call = match tool {
+        "wait" => wait_seconds(arguments.get("args").unwrap_or(&Value::Null)),
+        "js" => DEBUGGER_TASK_SECS,
+        _ => DEFAULT_TIMEOUT.as_secs_f64(),
+    };
+    waves * per_call + RELAY_MARGIN_SECS
 }
 
 pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
@@ -474,9 +530,29 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 return Err("args must be an object".into());
             }
             if let Some(concurrency) = number_arg(object, "concurrency", false)?
-                && !(1.0..=4.0).contains(&concurrency)
+                && (!(1.0..=4.0).contains(&concurrency) || concurrency.fract() != 0.0)
             {
-                return Err("concurrency must be between 1 and 4".into());
+                return Err("concurrency must be an integer between 1 and 4".into());
+            }
+            // 内层参数复用子工具自己的验证器：batch 不能绕过 wait.time=300 等限制。
+            if let Some(inner) = object.get("args") {
+                let inner = inner.as_object().expect("checked above");
+                let tool = object
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .expect("required above");
+                let mut merged = inner.clone();
+                merged.insert("tabId".into(), json!(0));
+                validate_arguments(tool, &Value::Object(merged))
+                    .map_err(|error| format!("args: {error}"))?;
+            }
+            let budget = batch_budget_seconds(&Value::Object(object.clone()));
+            if budget > MAX_CALL_TIMEOUT.as_secs_f64() {
+                return Err(format!(
+                    "batch estimated budget {:.0}s exceeds the {}s call limit; reduce tabIds, raise concurrency, or split the batch",
+                    budget,
+                    MAX_CALL_TIMEOUT.as_secs()
+                ));
             }
         }
         _ => return Err(format!("unknown tool: {name}")),
@@ -500,6 +576,25 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
     string_arg(object, "text", 100_000, false, true)?;
     string_arg(object, "value", 100_000, false, true)?;
     string_arg(object, "key", 100, false, false)?;
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if action == "press"
+        && !object
+            .get("key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.trim().is_empty())
+    {
+        return Err("key is required for press".into());
+    }
+    if action == "fill"
+        && object
+            .get("fields")
+            .is_none_or(|fields| matches!(fields, Value::Null))
+    {
+        return Err("fill requires fields[]".into());
+    }
     if let Some(delta) = number_arg(object, "deltaY", false)?
         && delta.abs() > 100_000.0
     {
@@ -677,7 +772,7 @@ mod tests {
         assert_eq!(tool_list().as_array().unwrap().len(), 11);
         let schema_chars = tool_list().to_string().len();
         assert!(
-            schema_chars < 5_000,
+            schema_chars < 6_000,
             "tool schema grew to {schema_chars} chars; keep it compact"
         );
         for tool in TOOLS.iter() {
@@ -761,6 +856,9 @@ mod tests {
         );
         assert!(validate_arguments("act", &json!({ "action": "teleport" })).is_err());
         assert!(validate_arguments("act", &json!({ "action": "fill", "fields": [] })).is_err());
+        assert!(validate_arguments("act", &json!({ "action": "fill" })).is_err());
+        assert!(validate_arguments("act", &json!({ "action": "press" })).is_err());
+        assert!(validate_arguments("act", &json!({ "action": "press", "key": "Enter" })).is_ok());
         assert!(
             validate_arguments(
                 "act",
@@ -909,17 +1007,92 @@ mod tests {
             )
             .is_err()
         );
+        // 内层参数必须复用子工具校验，不能绕过公开范围。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1], "args": { "time": 40 }
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1], "args": { "time": 3600 }
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1], "args": { "time": -1 }
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1], "args": { "time": 1, "text": "x" }
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "js", "tabIds": [1], "args": {}
+                })
+            )
+            .is_err()
+        );
+        // 8 tab × 300s 超过单次调用总上限：执行前拒绝。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1,2,3,4,5,6,7,8], "concurrency": 1,
+                    "args": { "time": 300 }
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1,2,3,4,5,6,7,8], "concurrency": 1,
+                    "args": { "time": 40 }
+                })
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn timeout_budget() {
         assert_eq!(
             timeout_for("wait", &json!({ "text": "x" })),
-            PAGE_WAIT_TIMEOUT + Duration::from_secs(15)
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            timeout_for("wait", &json!({ "text": "x", "timeout": 60 })),
+            Duration::from_secs(75)
         );
         assert_eq!(
             timeout_for("wait", &json!({ "time": 120 })),
-            Duration::from_secs(130)
+            Duration::from_secs(135)
+        );
+        assert_eq!(
+            timeout_for("wait", &json!({ "time": 0 })),
+            Duration::from_secs(15)
         );
         assert_eq!(timeout_for("act", &json!({})), ACT_TIMEOUT);
         assert_eq!(
@@ -927,10 +1100,56 @@ mod tests {
             ACT_TIMEOUT + Duration::from_secs(10)
         );
         assert_eq!(timeout_for("js", &json!({})), LONG_TIMEOUT);
+        assert_eq!(timeout_for("shot", &json!({})), LONG_TIMEOUT);
         assert_eq!(timeout_for("batch", &json!({})), LONG_TIMEOUT);
         assert_eq!(
-            timeout_for("batch", &json!({ "tool": "wait", "args": { "time": 40 } })),
+            timeout_for(
+                "batch",
+                &json!({ "tool": "wait", "tabIds": [1, 2], "args": { "time": 40 } })
+            ),
             Duration::from_secs(55)
+        );
+        // 8 tab / 并发 1/2/4：波次 × 单次 40s + 15s 余量。
+        assert_eq!(
+            timeout_for(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1,2,3,4,5,6,7,8], "concurrency": 1,
+                    "args": { "time": 40 }
+                })
+            ),
+            Duration::from_secs(335)
+        );
+        assert_eq!(
+            timeout_for(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1,2,3,4,5,6,7,8], "concurrency": 2,
+                    "args": { "time": 40 }
+                })
+            ),
+            Duration::from_secs(175)
+        );
+        assert_eq!(
+            timeout_for(
+                "batch",
+                &json!({
+                    "tool": "wait", "tabIds": [1,2,3,4,5,6,7,8], "concurrency": 4,
+                    "args": { "time": 40 }
+                })
+            ),
+            Duration::from_secs(95)
+        );
+        // js 受全局 debugger 串行队列限制：声明并发 4 时仍按 1 计算波次。
+        assert_eq!(
+            timeout_for(
+                "batch",
+                &json!({
+                    "tool": "js", "tabIds": [1, 2], "concurrency": 4,
+                    "args": { "code": "1+1" }
+                })
+            ),
+            Duration::from_secs(135)
         );
         assert_eq!(timeout_for("tabs", &json!({})), DEFAULT_TIMEOUT);
     }

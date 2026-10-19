@@ -188,21 +188,6 @@ fn extract_image(content: &Value) -> Option<(String, String)> {
     None
 }
 
-fn replace_content(response: &mut Value, text: String, is_error: bool) {
-    let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) else {
-        return;
-    };
-    result.insert(
-        "content".to_owned(),
-        json!([{ "type": "text", "text": text }]),
-    );
-    if is_error {
-        result.insert("isError".to_owned(), Value::Bool(true));
-    } else {
-        result.remove("isError");
-    }
-}
-
 fn image_extension(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" => "jpg",

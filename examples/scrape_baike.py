@@ -266,10 +266,10 @@ def scrape(client: Ema2Client, entry: str, wait: float, keep_tab: bool, max_char
     print(f"· 打开标签页 {tab_id}: {url}")
     try:
         try:
-            client.call_tool("wait", {"selector": ".J-lemma-content, #J-lemma-main-wrapper", "timeout": wait})
+            client.call_tool("wait", {"tabId": int(tab_id), "selector": ".J-lemma-content, #J-lemma-main-wrapper", "timeout": wait})
         except McpError as exc:
             raise McpError(f"等待词条渲染失败：{exc}") from None
-        data = client.call_tool_json("js", {"code": EXTRACT_JS, "budget": 200_000})
+        data = client.call_tool_json("js", {"tabId": int(tab_id), "code": EXTRACT_JS, "budget": 200_000})
     finally:
         if keep_tab:
             print(f"· 保留标签页 {tab_id}（--keep-tab）")

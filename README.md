@@ -1,4 +1,4 @@
-# EMA2 — Edge MCP Agent 2 (Rust) · v1.7.5
+# EMA2 — Edge MCP Agent 2 (Rust) · v1.8.0
 
 让 AI 直接接管你**正在使用的真实 Edge 浏览器**：真实指纹、真实登录态、不依赖 CDP 调试端口。
 
@@ -20,6 +20,7 @@ AI 客户端 ──MCP over HTTP──> ema2.exe (单进程) ──WebSocket─�
 
 ```bash
 # 1) 启动中继（Windows）
+scripts\setup.cmd                # 首次/更新源码后：重建 bin\ema2.exe
 scripts\start-bridge.cmd          # 或 bin\ema2.exe run
 
 # 2) 加载扩展
@@ -60,7 +61,7 @@ chrome.storage.local.set({ token: 'change-me' })   // 扩展会自动追加 ?tok
 | `tabs` | 列出 / 当前 / 新建 / 关闭 / 激活标签页 |
 | `open` | 新标签打开 URL 或让指定 tab 导航（返回 `net_hook=on`） |
 | `read` | 读页面为 `md\|text\|html`，默认正文提取，支持 selector/budget/cursor |
-| `snapshot` | ref 快照 `[e12] button "X"`，支持 `filter` 与 `near=<ref>` |
+| `snapshot` | ref 快照 `[e12@doc] button "X"`，支持 `filter` 与 `near=<ref>` |
 | `act` | click/type/fill/select/press/hover/scroll/submit/back/forward/reload，`steps[]` 批量，`waitFor` 等响应 |
 | `wait` | 等 text / textGone / selector / time / idle |
 | `js` | 页面主世界执行 JS（支持 await） |
@@ -70,6 +71,18 @@ chrome.storage.local.set({ token: 'change-me' })   // 扩展会自动追加 ?tok
 | `batch` | 多标签并发 read/snapshot/js/wait |
 
 完整参数、输出格式与错误码见 **[docs/TOOLS.md](docs/TOOLS.md)**。
+
+## 目录结构
+
+```text
+bin/            ema2.exe（当前源码构建，v1.8.0）
+extension/      Edge MV3 扩展（background.js + manifest）
+rust/           Rust 中继源码（MCP HTTP + WebSocket bridge）
+scripts/        setup / start / stop / bridge.ps1 进程管理
+tests/          Node VM/jsdom 与 PowerShell 回归测试
+examples/       调用示例（weather.js、scrape_baike.py）
+docs/           TOOLS / ARCHITECTURE / CHANGELOG / TESTING
+```
 
 ## 配置（环境变量）
 
@@ -85,7 +98,7 @@ chrome.storage.local.set({ token: 'change-me' })   // 扩展会自动追加 ?tok
 ```bash
 bin\ema2.exe run [--port N]     # 启动常驻中继
 bin\ema2.exe status             # 健康检查（自动带 token；异常退出码 1）
-bin\ema2.exe reload             # 改完 extension/ 用：bump 版本 + 扩展重载
+bin\ema2.exe reload             # 改完 extension/ 用：先校验服务，再 bump 版本 + 扩展重载
 ```
 
 ## 示例
@@ -110,12 +123,36 @@ bin\ema2.exe reload             # 改完 extension/ 用：bump 版本 + 扩展�
 | [docs/TOOLS.md](docs/TOOLS.md) | 工具参数、输出协议、错误码、典型调用循环 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 协议、ref 模型、网络 hook、MV3 生命周期等内部实现 |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | 版本变更记录 |
+| [docs/TESTING.md](docs/TESTING.md) | 测试矩阵、命令、真实 Edge 验收边界 |
 | [examples/README.md](examples/README.md) | 示例脚本用法 |
+
+## 测试
+
+```bash
+# 扩展/脚本回归（19 项，Node 24 + jsdom devDependency）
+npm install
+npm run test:js
+
+# Rust 中继（49 个单元测试）
+cd rust && cargo test --locked --offline
+cargo clippy --locked --all-targets -- -D warnings
+
+# Windows 启动/停止脚本自检
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bridge.ps1 -SelfTest
+```
+
+说明：这些是 Node VM/jsdom 与 Rust/PowerShell 回归检查，不等同于真实 Edge 集成测试。
+`scripts\start-bridge.cmd` / `stop-bridge.cmd` 只管理当前项目 `bin\ema2.exe` 且精确匹配端口；
+陌生进程占用端口时会报错退出，不会强杀。
 
 ## 已知限制
 
+- 网络 body 是受限预览（≤800 字符），HAR 是采样；不是完整抓包代理
 - `js`（debugger 上下文）直接发起的 fetch 可能只以 `status=-1` 的资源条目出现；页面自身请求正常抓取
+- `act waitFor` 不把 hook 安装前的历史回填（`status=-1`）当作成功响应，会回 `observation_gap`
 - 跨域 iframe 不可遍历；`download-dir` 在 Edge 上不可设（返回明确错误）
+- `shot` 只截活动 tab；后台 tab 会返回 `tab_not_active`
+- 合成 `press` 不提供浏览器原生 Tab/组合键默认行为
 - 视觉兜底是"编号图 + 坐标"，不含 OCR
 - Windows 上传路径必须是绝对路径（`C:/dir/a.pdf`）
 

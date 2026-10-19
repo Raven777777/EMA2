@@ -189,11 +189,38 @@ fn bump_extension_version() -> Option<String> {
 }
 
 /// 请求中继让扩展重新加载（开发时改完 extension/ 用这个，不用手点 Edge）。
+///
+/// 先检查中继与扩展是否在线，再改 manifest 版本；服务不通时不能污染仓库内的版本号。
 fn reload_extension(port: Option<u16>) {
     let port = port
         .or_else(config::env_port)
         .unwrap_or(config::DEFAULT_PORT);
     let token = config::env_token();
+    match request(port, "GET", "/status", token.as_deref()) {
+        Ok((status, body)) if status.contains(" 200 ") => {
+            let connected = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value.get("extension_connected").and_then(|v| v.as_bool()))
+                .unwrap_or(false);
+            if !connected {
+                println!("extension is not connected; manifest version was not changed.");
+                std::process::exit(1);
+            }
+        }
+        Ok((status, _body)) => {
+            println!("cannot verify EMA2 /status: {status}");
+            if status.contains(" 401 ") {
+                println!("hint: set EDGE_MCP_TOKEN (same value as the relay) and retry.");
+            }
+            std::process::exit(1);
+        }
+        Err(error) => {
+            println!(
+                "cannot reach EMA2 on 127.0.0.1:{port}: {error}; manifest version was not changed."
+            );
+            std::process::exit(1);
+        }
+    }
     if let Some(version) = bump_extension_version() {
         println!("extension version -> {version}");
     }
