@@ -52,7 +52,7 @@ total=2 shown=2 next=none
 - 文件类结果：`path=<绝对路径>` 单独一行，后跟 `bytes=` 等元信息。
 - 图片默认落盘；`--inline` 才回图片内容（CLI 输出 `data:image/png;base64,...`）。
 - `type` 追加到现有值，`fill` 覆盖整个值；两者只回写入状态和字符数，不回显输入值。
-  密码框的 value 不参与 snapshot 名称。
+  密码框的 value，以及 textarea / contenteditable 的用户输入，都不参与 snapshot 名称。
 
 ## 错误码
 
@@ -101,6 +101,7 @@ total=2 shown=2 next=none
 | `input_prevented` | 页面 cancel 了 `beforeinput`（自己接管输入） | 用 `js` 或 `press` 逐键输入 |
 | `click_failed` | 点击触发时页面抛错 | 看 console，或换目标 |
 | `action_failed` | 动作没有返回结果/执行失败 | 重新 `snapshot` 后重试 |
+| `helpers_missing` | 页面 helper 未安装（注入丢失） | 重试 `snapshot`/`read`；持续失败则重载页面 |
 | `no_form` | submit 目标不在 form 内 | 用 click 提交按钮，或 press Enter |
 | `no_pending_action` | `await` 没有可等待的 act 上下文 | 先 `act`；或改用 `wait text/selector/time/idle` |
 | `wait_timeout` | `wait`/`await` 条件超时 | 检查条件或提高 timeout |
@@ -217,6 +218,8 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 - 返回前会确认**目标文档已经接位**（`location.href` + `readyState` 双条件），
   正常返回时 `url`/`title` 属于新页面；重定向到别的地址同样算到达。若超时则明确输出
   `load=pending`，不要把此时的旧标题当成新页面。
+- 新标签的 `about:blank` / `edge://newtab` 以及浏览器错误页不算到达；同 URL 的 `--replace` 会用
+  `performance.timeOrigin` 确认 reload 后的新文档，不会被旧文档的 `complete` 提前骗过。
 - `--timeout` 超时不再被静默忽略：会输出 `load=pending timeout=Ns` 和 hint；中继预算也跟着
   `waitTimeout` 走（默认 15s，最大 60s），不会再用固定 30s 提前掐断。
 
@@ -258,7 +261,7 @@ ema2 snapshot [--tab ID] [--filter interactive|full|links|buttons|form] \
 - 额外属性里的 URL 截到 40 字符（`…` 结尾）；需要完整地址用 `--filter links`（不截断）或 `read`/`js`。
 - `--filter full` 额外带 `#1/#2` 标题；`--near REF` 限定在该元素最近的 `form/section/article/dialog/table/ul/main/nav` 内。
 - 头部带 `refs= roots= doc= visual=`；纯视觉页面会给 `hint` 建议用 `shot --annotate`。
-- 密码框即使有值，名称也只来自 label/ARIA/placeholder/alt/title 等元数据，绝不使用 value。
+- 密码框即使有值，名称也只来自 label/ARIA/placeholder/alt/title 等元数据；textarea / contenteditable 的用户输入同样不会进入名称。
 
 实测（10 个结构差异大的站点，2500 预算）：压缩后一次调用能看到的可操作元素
 wikipedia 32→49、jd 28→47、taobao 27→45、bing 33→46、hn 36→47，x.com 从 2 次翻页降到 1 次。
@@ -274,6 +277,10 @@ ema2 act --script run.ema2                    # 脚本文件
 动作：`click | type | fill | select | press | hover | scroll | submit | back | forward | reload`
 
 定位（三选一）：裸写 `ref`（snapshot 给的）优先，其次 `--selector`，再 `--target "button:提交"`。
+`--selector/--target/--key/--delta-y/--submit` 只属于单步调用；`--steps`/`--script` 里改用脚本写法
+（`selector=` / `target=` / `press <key>` / `submit` 步骤；像素滚动用 `js`）。
+单步动作也会拒绝与该动作不匹配的 flag（例如 `back --selector`、`type --key`）。
+以 `-` 开头的文本用 `--` 分隔：`ema2 act type e1 -- -5`。
 
 | 动作 | 位置参数 | flag |
 |---|---|---|
@@ -432,7 +439,7 @@ ema2 observe console [--tab ID] [--since SEQ] [--level log|warn|error] [--filter
 ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter RE] [--bodies=false] [--har PATH]
 ```
 
-- console：增量日志；首次安装 hook（`open`/`act` 也会自动装）。`--wait` 会先等待再读取；
+- console：增量日志；首次安装 hook（`open`/`act` 也会自动装）。`--wait` 会先安装 hook 再等待，等待期间的新日志也会被记录；
   `--har` 只适用于 network（console 传 `--har` 会报 `invalid_argument`）。
 - network：hook `fetch`/`XMLHttpRequest`，真实 `status` + **受限**响应预览。
   - 预览在后台读取 `response.clone()`，最多 8KB/1.5s，不阻塞页面；事件流/二进制跳过。
@@ -445,7 +452,7 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
   - `--body-filter` 只匹配已就绪的 body；命中的 pending 条目记入 `seqs=` 而不参与匹配。
   - `--body-filter` 限 512 字符，拒绝量词嵌套（`(a+)+`）与量词组内分支（`(a|a)+`）这类
     会指数回溯的形态，返回 `invalid_regex`。
-  - `--har PATH`：导出 HAR 1.2（采样/预览，不是完整抓包），落盘并回 `path=` + `entries=N`。
+  - `--har PATH`：导出 HAR 1.2（采样/预览，不是完整抓包），JSON 不经过文本预算截断，落盘并回 `path=` + `entries=N`。
 
 ## files
 
@@ -489,6 +496,7 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
 - 工具 flag 会与每个目标合并后复用子命令 validator：`ema2 batch wait --time 3600 --tab-ids 1,2`
   会在执行前拒绝；urls 模式下 `--wait` 可以传给 open，`--replace`/`--reuse` 会被拒绝。
 - 预算按 `ceil(目标数/并发) × 单次最长耗时 + open 成本 + 15s`；js 因全局 debugger 串行按有效并发 1 计算。
+  `tool=open` 的单次耗时跟随内层 `waitTimeout`（默认 15s），不会再被固定 30s 提前掐断。
 - 估算超过 600s 时在执行前报 `invalid_argument`，请减少目标、提高并发或拆分 batch。
 
 ## 典型调用循环

@@ -55,6 +55,7 @@ FIXTURE_HOME = """<!doctype html>
 <input id="text" name="q" type="text" placeholder="query">
 <input id="num" type="number" name="num">
 <input id="file" type="file" name="upload">
+<textarea id="secret" name="secret">verify-secret-value</textarea>
 <div id="out">idle</div>
 <script>
   document.getElementById('btn').addEventListener('click', function () {
@@ -215,7 +216,7 @@ class Runner:
 def static_contract_check() -> bool:
     js = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
     docs = (ROOT / "docs" / "TOOLS.md").read_text(encoding="utf-8")
-    codes = sorted(set(re.findall(r"fail\('([a-z_]+)'", js)))
+    codes = sorted(set(re.findall(r"fail\('([a-z_]+)'", js)) | set(re.findall(r"code: '([a-z_]+)'", js)))
     missing = [code for code in codes if f"`{code}`" not in docs]
     print(f"PASS  static: {len(codes)} error codes documented" if not missing else "FAIL  static: error codes")
     if missing:
@@ -323,6 +324,11 @@ def main() -> int:
 
         snapshot = runner.expect_ok("snapshot refs", runner.run("snapshot"), "button", "textbox")
         runner.check("snapshot has refs", re.search(r"refs=[1-9]", snapshot) is not None, snapshot)
+        runner.check(
+            "snapshot does not leak textarea value",
+            "verify-secret-value" not in snapshot,
+            snapshot[:1200],
+        )
 
         click = runner.expect_ok("act click button", runner.run("act", "click", "--selector", "#btn"), "settle=done")
         acted = runner.run("js", "return document.getElementById('out').textContent")
@@ -331,6 +337,18 @@ def main() -> int:
         nav = runner.expect_ok("act click link navigates", runner.run("act", "click", "--selector", "#link"), "settle=done")
         runner.check("link changed url", "second.html" in nav, nav)
         runner.run("open", f"{base}/")
+
+        # 同 URL 的 --replace 必须等 reload 后的新文档，不能被旧文档的 complete 骗过。
+        origin_before = runner.run("js", "return String(performance.timeOrigin)")
+        replaced = runner.run("open", f"{base}/", "--replace")
+        origin_after = runner.run("js", "return String(performance.timeOrigin)")
+        runner.check(
+            "open same URL --replace reloads the document",
+            replaced.returncode == 0 and "status=200" in (replaced.stdout or "")
+            and origin_before.stdout.strip() != origin_after.stdout.strip(),
+            (replaced.stdout or "") + (replaced.stderr or "")
+            + f" origin_before={origin_before.stdout.strip()} origin_after={origin_after.stdout.strip()}",
+        )
 
         status = runner.run("status")
         runner.check(
@@ -360,6 +378,15 @@ def main() -> int:
         )
         num_value = runner.run("js", "return document.getElementById('num').value")
         runner.check("number field value is 42", "42" in (num_value.stdout or ""), (num_value.stdout or "") + (num_value.stderr or ""))
+
+        neg = runner.run("act", "type", "--selector", "#text", "--", "-5")
+        runner.check(
+            "act type accepts hyphen text after --",
+            neg.returncode == 0 and "ok=type" in (neg.stdout or "") + (neg.stderr or ""),
+            (neg.stdout or "") + (neg.stderr or ""),
+        )
+        neg_value = runner.run("js", "return document.getElementById('text').value")
+        runner.check("hyphen text reached input", "-5" in (neg_value.stdout or ""), (neg_value.stdout or "") + (neg_value.stderr or ""))
 
         # 运行时 SyntaxError 不能被当成编译错误重跑；副作用只能发生一次。
         runner.expect_error(
@@ -479,9 +506,22 @@ def main() -> int:
 
         runner.run("js", "console.error('verify-boom')")
         console = runner.run("observe", "console", "--level", "error")
-        runner.check("observe console", "verify-boom" in (console.stdout or ""), (console.stdout or "") + (console.stderr or "")[:400])
+        console_out = (console.stdout or "") + (console.stderr or "")
+        runner.check("observe console", "verify-boom" in console_out, console_out[:400])
+        console_next = re.search(r"^total=\d+ shown=\d+ next=(\d+|none)", console_out, re.M)
+        runner.check("console observe reports next", console_next is not None, console_out[:400])
 
         runner.run("js", "fetch('/api').then(r => r.detail)")
+        time.sleep(0.8)
+        runner.run("observe", "network", "--filter", "/api", "--since", "0")
+        if console_next:
+            console_again = runner.run("observe", "console", "--level", "error", "--since", console_next.group(1))
+            console_again_out = (console_again.stdout or "") + (console_again.stderr or "")
+            runner.check(
+                "console since is not reset by a network observe",
+                console_again.returncode == 0 and "reset=1" not in console_again_out,
+                console_again_out[:600],
+            )
         time.sleep(0.8)
         network = runner.run("observe", "network", "--filter", "/api")
         runner.check("observe network", "200" in (network.stdout or "") and "/api" in (network.stdout or ""), (network.stdout or "")[:600])

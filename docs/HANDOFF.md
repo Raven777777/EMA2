@@ -5,9 +5,9 @@
 ## 当前版本
 
 ```text
-exe        2.2.1
-extension  2.2.1
-helper     11
+exe        2.2.2
+extension  2.2.2
+helper     12
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
@@ -92,7 +92,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前 Rust 测试：**65 passed**。
+当前 Rust 测试：**68 passed**。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -112,7 +112,7 @@ cargo test
 - `[e<seq>@<doc>]`，`doc` 是 `d1/d2…`
 - 完整 ref 校验 document；短 ref 只在当前文档内解析
 - 导航/reload/换 tab 后旧完整 ref 必须 `stale_ref`
-- 密码框 value 不进入 snapshot 名称
+- 密码框 value、textarea/contenteditable 用户输入不进入 snapshot 名称
 
 ### act / settle / await
 
@@ -127,6 +127,8 @@ cargo test
 - `open` 和新的 act 会清掉旧 lastAct 上下文
 - `open --timeout` 超时返回 `load=pending`，中继预算跟随 `waitTimeout`
 - 脚本里的 `waitFor` 是独立步骤，在原行执行；失败时保留已完成步骤
+- `--selector/--target/--key/--delta-y/--submit` 只用于单步；`--steps/--script` 里用对应脚本写法
+- 副作用动作（click/type/fill/press/scroll/submit/back/forward/reload）的 `executeScript` 不自动重试
 
 ### read
 
@@ -145,6 +147,9 @@ cargo test
 - `files download-dir` 固定返回 `download_dir_unsupported`
 - `batch` 内层参数放在 `args`；内层校验复用子工具 validator
 - `js` 全局 debugger 串行；attach 非超时失败自动重试一次；运行时 SyntaxError 不重跑
+- `observe console --wait` 先装 hook 再等待；console/network 的 document epoch 分开记录
+- HAR 导出是完整 JSON，不经过 20 万字符文本上限
+- 扩展返回 JSON-RPC error 时 daemon 返回 `extension_error`，不能变成空成功
 - `server` 重复启动输出 `relay=already_running`，退出 0
 - `server stop` 已停止时输出 `relay=not_running`，退出 0
 
@@ -229,7 +234,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
 4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
-5. `python scripts/verify.py` —— 53 项真机检查，跑不过就别改行为
+5. `python scripts/verify.py` —— 59 项真机检查，跑不过就别改行为
 6. 打开一个真实网站，跑 `open → snapshot → act → read`
 7. 修改行为前先问：这是通用原语，还是网站特例？
 8. 任何动作相关改动，必须真机验证“成功就是真的成功”

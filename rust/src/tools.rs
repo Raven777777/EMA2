@@ -180,13 +180,18 @@ fn batch_budget_seconds(arguments: &Value) -> f64 {
     let declared = batch_concurrency(arguments);
     let effective = if tool == "js" { 1.0 } else { declared };
     let waves = (tabs / effective).ceil();
-    let per_call = match tool {
-        "wait" => wait_seconds(arguments.get("args").unwrap_or(&Value::Null)),
-        "js" => DEBUGGER_TASK_SECS,
-        _ => DEFAULT_TIMEOUT.as_secs_f64(),
-    };
+    let inner = arguments.get("args").unwrap_or(&Value::Null);
     let opens = batch_url_count(arguments) as f64;
-    let open_cost = if opens > 0.0 {
+    // `open` 本身没有“内层工具”：等待文档接位 + 装 hook/focus 的耗时就是单次预算。
+    // 不能再用 PAGE_WAIT_TIMEOUT 固定值，否则 --waitTimeout 60 会先被中继超时打断。
+    let (per_call, open_cost) = match tool {
+        "wait" => (wait_seconds(inner), opens > 0.0),
+        "open" => (open_wait_seconds(inner) + 12.0, false),
+        "js" => (DEBUGGER_TASK_SECS, opens > 0.0),
+        _ => (DEFAULT_TIMEOUT.as_secs_f64(), opens > 0.0),
+    };
+    // 复合模式（urls + read/snapshot/js/wait）每个目标多一次 open；open 模式已计入 per_call。
+    let open_cost = if open_cost {
         (opens / effective).ceil() * (PAGE_WAIT_TIMEOUT.as_secs_f64() + 2.0)
     } else {
         0.0
@@ -610,6 +615,21 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
     {
         return Err("key is required for press".into());
     }
+    if action != "press" && object.get("key").is_some_and(|value| !value.is_null()) {
+        return Err("key is only supported by press".into());
+    }
+    if action != "scroll" && object.get("deltaY").is_some_and(|value| !value.is_null()) {
+        return Err("deltaY is only supported by scroll".into());
+    }
+    if matches!(action, "scroll" | "back" | "forward" | "reload")
+        && ["selector", "target"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return Err(format!(
+            "{action} does not support selector/target locators"
+        ));
+    }
     if action == "fill"
         && object
             .get("fields")
@@ -950,6 +970,26 @@ mod tests {
         assert!(validate_arguments("act", &json!({ "action": "fill" })).is_err());
         assert!(validate_arguments("act", &json!({ "action": "press" })).is_err());
         assert!(validate_arguments("act", &json!({ "action": "press", "key": "Enter" })).is_ok());
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "action": "click", "ref": "e1", "key": "Enter" })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "action": "click", "ref": "e1", "deltaY": 10 })
+            )
+            .is_err()
+        );
+        assert!(validate_arguments("act", &json!({ "action": "back", "selector": "#x" })).is_err());
+        assert!(
+            validate_arguments("act", &json!({ "action": "scroll", "target": "button:x" }))
+                .is_err()
+        );
+        assert!(validate_arguments("act", &json!({ "action": "scroll", "deltaY": -10 })).is_ok());
         assert!(
             validate_arguments(
                 "act",
@@ -1329,6 +1369,19 @@ mod tests {
             )
             .is_err()
         );
+        // 8 个慢页面顺序 open：预算跟随 waitTimeout 后仍在 600s 内。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "open",
+                    "urls": ["https://a/","https://b/","https://c/","https://d/","https://e/","https://f/","https://g/","https://h/"],
+                    "concurrency": 1,
+                    "args": { "waitTimeout": 60 }
+                })
+            )
+            .is_ok()
+        );
         // tabIds 与 urls 不能混用；open 不能只给 tabIds。
         assert!(
             validate_arguments(
@@ -1428,6 +1481,17 @@ mod tests {
         assert_eq!(timeout_for("js", &json!({})), LONG_TIMEOUT);
         assert_eq!(timeout_for("shot", &json!({})), LONG_TIMEOUT);
         assert_eq!(timeout_for("batch", &json!({})), LONG_TIMEOUT);
+        // batch open 的单次预算必须跟随内层 waitTimeout，而不是固定 30s。
+        assert_eq!(
+            timeout_for(
+                "batch",
+                &json!({
+                    "tool": "open", "urls": ["https://a/"],
+                    "args": { "waitTimeout": 60 }
+                })
+            ),
+            Duration::from_secs(87)
+        );
         assert_eq!(
             timeout_for(
                 "batch",
@@ -1502,13 +1566,17 @@ mod tests {
         let js = include_str!("../../extension/background.js");
         let docs = include_str!("../../docs/TOOLS.md");
         let mut codes: Vec<String> = Vec::new();
-        let mut rest = js;
-        while let Some(index) = rest.find("fail('") {
-            rest = &rest[index + "fail('".len()..];
-            let end = rest.find("'").unwrap_or(0);
-            let code = &rest[..end];
-            if !code.is_empty() && !codes.iter().any(|known| known == code) {
-                codes.push(code.to_owned());
+        for marker in ["fail('", "code: '"] {
+            let mut rest = js;
+            while let Some(index) = rest.find(marker) {
+                rest = &rest[index + marker.len()..];
+                let end = rest.find("'").unwrap_or(0);
+                let code = &rest[..end];
+                let looks_like_error_code =
+                    !code.is_empty() && code.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_');
+                if looks_like_error_code && !codes.iter().any(|known| known == code) {
+                    codes.push(code.to_owned());
+                }
             }
         }
         assert!(

@@ -153,7 +153,7 @@ CLI 参数
   落 `chrome.storage.local`，浏览器重启后继续递增，避免新旧文档撞号；
 - 完整 ref 校验 `doc` 必须等于当前文档；短 ref（`e12`）只在当前文档内解析；
 - 导航/reload/换 tab 后旧完整 ref 返回 `stale_ref`；
-- 密码框名称只来自 label/ARIA/placeholder/alt/title，绝不读 value。
+- 密码框名称只来自 label/ARIA/placeholder/alt/title，绝不读 value；textarea/contenteditable 的用户输入同样不进入名称。
 
 ## read 正文清洁
 
@@ -175,7 +175,7 @@ CLI 参数
 - 响应预览通过 `response.clone()` 后台读取，最多 8KB / 1.5s，不阻塞页面；
 - `observe network --bodies=false` 真正关闭 body clone；
 - `bodyFilter` 限 512 字符，拒绝嵌套量词/量词组内分支等指数回溯形态；
-- `--har` 导出 HAR 1.2 采样，不是完整抓包；
+- `--har` 导出 HAR 1.2 采样，不是完整抓包；JSON 不经过普通文本预算截断；
 - console hook 记录 log/info/warn/error/debug，支持增量 `--since` 和 `--filter`。
 
 ## js 的两条通道

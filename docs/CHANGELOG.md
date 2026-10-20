@@ -1,5 +1,33 @@
 # 变更记录
 
+## v2.2.2 — 状态隔离、输出完整性与参数真实性
+
+第二轮代码 review 的收口，全部围绕“不要静默成功 / 不要丢状态”。
+
+- **observe 状态隔离**：console（`c-*`）与 network（`n-*`）的 document epoch 分开记录。
+  以前交替 `observe console` / `observe network --since N` 会误判导航并把 `since` 重置为 0。
+- **HAR 不再被截断**：`observe network --har` 用 `content[]` 返回完整 JSON，
+  不再经过 `capText` 的 20 万字符上限；大 HAR 现在是可解析文件而不是带 `truncated=1` 的坏 JSON。
+- **observe console --wait**：先安装 hook 再等待，等待期间产生的日志不会漏掉。
+- **snapshot 隐私**：名称不再回退到 `textarea` / `contenteditable` 的用户输入文本（helper 12）。
+- **文档句柄恢复**：已安装 helper 但句柄丢失时会补发；`storage.local` 读取失败不再永久缓存 0。
+- **副作用只执行一次**：`click/type/fill/press/scroll/submit/back/forward/reload` 的
+  `executeScript` 不再自动重试，避免导航瞬间失败后把 `type` 追加两次或 back 两次。
+- **waitFor 抗导航**：轮询期间 `executeScript` 瞬时失败会继续等待，不会把整次 act 判失败。
+- **open 文档判定**：新标签的 `edge://newtab` 等内置页不算到达；同 URL 的 `open --replace`
+  用 `performance.timeOrigin` 确认 reload 后的新文档，不再被旧文档的 `complete` 骗过。
+- **act console hook**：导航后的新文档会补装 console hook，后续 `observe console` 仍可见。
+- **act --submit**：页面已 `preventDefault` 接管 Enter 时不再额外 `requestSubmit`，避免重复提交。
+- **CLI act 参数真实性**：`--steps/--script` 拒绝 `--selector/--target/--key/--delta-y/--submit`；
+  单步动作也拒绝与动作不匹配的 flag，不再静默忽略。脚本里的 `selector=`/`target=`
+  只允许用于能定位的动作；`--` 之后的 token 一律当位置参数（`type e1 -- -5`）。
+- **ref 校验**：CLI 的完整 ref 后缀收紧为 `d<digits>`，与页面 helper 一致。
+- **daemon 错误映射**：扩展返回 JSON-RPC `error` 时返回 `extension_error`，
+  不再变成 HTTP 200 + `result=null` 的静默成功。
+- **shutdown**：`notify_one` 保留 permit，避免 handler 早于 graceful future 注册时丢掉关闭信号。
+- **batch open 预算**：`tool=open` 的单次预算跟随内层 `waitTimeout`，不会再被固定 30s 提前掐断。
+- 版本：exe/扩展 2.2.2；helper 12；`cargo test` 68 passed；真机 verify 59 项。
+
 ## v2.2.1 — 动作可信度、请求限制与超时预算
 
 一轮代码 review + 真实 Edge 复现后的收口。重点不是新工具，而是把“返回 ok 但实际没发生/发生了却看不到”修掉。

@@ -302,6 +302,24 @@ async fn cmd(
             );
         }
     };
+    // JSON-RPC 层错误（未知 method / 扩展内部异常）没有 result；不能把它当成空成功。
+    if let Some(error) = response.get("error") {
+        let code = error
+            .get("code")
+            .and_then(Value::as_i64)
+            .map(|code| format!(" {code}"))
+            .unwrap_or_default();
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("extension returned a JSON-RPC error");
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "extension_error",
+            &format!("extension returned JSON-RPC error{code}: {message}"),
+            "reload the extension and retry; check `ema2 status`",
+        );
+    }
 
     // 工具结果（含 isError 的业务错误）走 200；CLI 负责 stderr + 退出码。
     let inline = arguments
@@ -366,7 +384,9 @@ async fn handle_shutdown(
     if let Some(response) = check_origin_and_host(&headers) {
         return response;
     }
-    shutdown.notify_waiters();
+    // notify_one 会保留一个 permit：即使 handler 早于 graceful future 的首次 poll，
+    // shutdown 也不会丢；notify_waiters 在没有已注册 waiter 时是空操作。
+    shutdown.notify_one();
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -385,6 +405,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Notify;
     use tower::ServiceExt;
 
@@ -557,11 +578,71 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_triggers_the_notify() {
-        let (app, _) = app();
+        let state = RelayState::new(PathBuf::from("target/test-output"), 7744);
+        let shutdown = Arc::new(Notify::new());
+        let app = router(state, shutdown.clone());
         let response = app.oneshot(post("/shutdown", json!({}))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["stopping"], true);
+        // permit 必须保留给随后才被 poll 的 graceful future。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), shutdown.notified())
+                .await
+                .is_ok(),
+            "shutdown notification was lost"
+        );
+    }
+
+    /// JSON-RPC 错误没有 result；daemon 必须报错，而不是返回 200 + null 让 CLI 静默成功。
+    #[tokio::test]
+    async fn cmd_maps_json_rpc_error_to_extension_error() {
+        let (_app, state) = app();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let generation = state.register_extension(tx);
+
+        let call = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let app = router(state.clone(), Arc::new(Notify::new()));
+                app.oneshot(post(
+                    "/cmd",
+                    json!({ "tool": "tabs", "args": { "action": "list" } }),
+                ))
+                .await
+                .unwrap()
+            })
+        };
+        let reply = tokio::spawn(async move {
+            use axum::extract::ws::Message;
+            let Some(Message::Text(text)) = rx.recv().await else {
+                panic!("expected a forwarded tools/call");
+            };
+            let forwarded: Value = serde_json::from_str(&text).unwrap();
+            let id = forwarded["id"].clone();
+            state.complete_pending(
+                &id,
+                generation,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": "Method not found" }
+                }),
+            );
+        });
+        let response = call.await.unwrap();
+        reply.await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "extension_error");
+        assert!(
+            body["msg"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Method not found"),
+            "{}",
+            body
+        );
     }
 
     /// 工具执行成功路径：注册一个假扩展连接，/cmd 必须透传它的 result。

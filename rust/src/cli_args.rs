@@ -900,7 +900,14 @@ fn check_ref_token(token: &str) -> Result<(), String> {
     let body = text.strip_prefix(['e', 'E']).unwrap_or(text);
     let ok = body.split_once('@').map_or_else(
         || body.parse::<u64>().is_ok(),
-        |(seq, doc)| seq.parse::<u64>().is_ok() && doc.len() > 1 && doc.starts_with('d'),
+        |(seq, doc)| {
+            // 与页面 helper 的 /^e(\d+)(?:@(d\d+))?$/ 保持一致：
+            // `e12@dfoo` 不是合法完整 ref，不能在 CLI 被放过后才报 stale_ref。
+            seq.parse::<u64>().is_ok()
+                && doc.strip_prefix('d').is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        },
     );
     if ok {
         return Ok(());
@@ -922,10 +929,22 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
     let mut script_path: Option<String> = None;
     let mut port_override: Option<u16> = None;
     let mut positional: Vec<String> = Vec::new();
+    let mut positional_only = false;
 
     let mut index = 0;
     while index < tokens.len() {
         let token = tokens[index].as_str();
+        // `--` 之后一律当位置参数：让 `type e1 -- -5` 能输入负号开头的文本。
+        if positional_only {
+            positional.push(token.to_owned());
+            index += 1;
+            continue;
+        }
+        if token == "--" {
+            positional_only = true;
+            index += 1;
+            continue;
+        }
         // 值型 flag：取下一个 token；缺失时报错而不是 panic。
         let next_value = |name: &str| -> Result<String, String> {
             tokens
@@ -1001,6 +1020,21 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                 positional
             ));
         }
+        // 这些 flag 只对单步调用有意义；静默忽略会让调用方以为已经提交/输入。
+        let ignored = [
+            selector.is_some().then_some("--selector"),
+            target.is_some().then_some("--target"),
+            key.is_some().then_some("--key"),
+            delta_y.is_some().then_some("--delta-y"),
+            submit_flag.then_some("--submit"),
+        ];
+        let ignored: Vec<&str> = ignored.into_iter().flatten().collect();
+        if !ignored.is_empty() {
+            return Err(format!(
+                "act: {} cannot be used with --steps/--script; encode the equivalent step in the script (selector=/target=/press/submit)",
+                ignored.join("/")
+            ));
+        }
         let parsed = parse_act_script(&source)?;
         let mut steps = parsed["steps"].as_array().cloned().unwrap_or_default();
         if let Some(wait_for) = &wait_for {
@@ -1033,6 +1067,19 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                 "act: --submit is only supported by type; use action=submit or click the submit button"
                     .into(),
             );
+        }
+        if key.is_some() && action != "press" {
+            return Err("act: --key is only supported by press".into());
+        }
+        if delta_y.is_some() && action != "scroll" {
+            return Err("act: --delta-y is only supported by scroll".into());
+        }
+        if matches!(action.as_str(), "scroll" | "back" | "forward" | "reload")
+            && (selector.is_some() || target.is_some())
+        {
+            return Err(format!(
+                "act {action}: --selector/--target are not supported by this action"
+            ));
         }
         let rest: Vec<String> = positional[1..].to_vec();
         if let Some(wait_for) = &wait_for {
@@ -1288,6 +1335,13 @@ pub fn parse_act_script(source: &str) -> Result<Value, String> {
                 break;
             }
             let script_error = |message: String| format!("script line {}: {message}", number + 1);
+            if matches!(action.as_str(), "scroll" | "back" | "forward" | "reload")
+                && (step.get("selector").is_some() || step.get("target").is_some())
+            {
+                return Err(script_error(format!(
+                    "{action}: selector=/target= are not supported by this action"
+                )));
+            }
             match action.as_str() {
                 "click" | "hover" | "submit" => {
                     if rest.len() > 1 {
@@ -1756,6 +1810,11 @@ click target=\"button:提交\"
         assert!(parse_act_script("await").is_err());
         assert!(parse_act_script("await 10s extra").is_err());
         assert!(parse_act_script("await 301s").is_err());
+
+        // selector=/target= 只在能定位的动作上有意义。
+        assert!(parse_act_script("back selector=#x").is_err());
+        assert!(parse_act_script("scroll target=button:x").is_err());
+        assert!(parse_act_script("click selector=#x").is_ok());
     }
 
     #[test]
@@ -1960,6 +2019,57 @@ click target=\"button:提交\"
         assert!(error.contains("not a ref"), "{error}");
         assert!(build_act(&["click".into(), "e12@d1".into()]).is_ok());
         assert!(build_act(&["click".into(), "[e12@d1]".into()]).is_ok());
+        // 文档后缀必须是 d<digits>，与页面 helper 的 parseRef 一致。
+        assert!(build_act(&["click".into(), "e12@dfoo".into()]).is_err());
+        assert!(build_act(&["click".into(), "e12@d1x".into()]).is_err());
+        assert!(build_act(&["click".into(), "e12@d".into()]).is_err());
+    }
+
+    #[test]
+    fn act_double_dash_allows_hyphen_text() {
+        let call = build_act(&["type".into(), "e1".into(), "--".into(), "-5".into()]).unwrap();
+        assert_eq!(args_of(&call)["text"], "-5");
+        assert_eq!(args_of(&call)["ref"], "e1");
+
+        let call = build_act(&[
+            "fill".into(),
+            "--selector".into(),
+            "#x".into(),
+            "--".into(),
+            "--literal".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["fields"][0]["value"], "--literal");
+
+        // 还是不能把拼错的 flag 当 ref。
+        assert!(build_act(&["click".into(), "--at".into(), "1,2".into()]).is_err());
+    }
+
+    #[test]
+    fn act_rejects_flags_that_cannot_apply() {
+        // 单步里放错动作的 flag：不能静默忽略。
+        assert!(build_act(&["click".into(), "e1".into(), "--key".into(), "Enter".into()]).is_err());
+        assert!(
+            build_act(&["click".into(), "e1".into(), "--delta-y".into(), "10".into()]).is_err()
+        );
+        assert!(build_act(&["back".into(), "--selector".into(), "#x".into()]).is_err());
+        assert!(build_act(&["scroll".into(), "--target".into(), "button:x".into()]).is_err());
+
+        // 多步脚本里的 flag 必须写在脚本行上，否则调用方会误以为已提交/定位。
+        assert!(build_act(&["--steps".into(), "type e1 hi".into(), "--submit".into()]).is_err());
+        assert!(
+            build_act(&[
+                "--script".into(),
+                "x.ema2".into(),
+                "--selector".into(),
+                "#x".into()
+            ])
+            .is_err()
+        );
+
+        // 合法组合仍然可用。
+        assert!(build_act(&["press".into(), "e1".into(), "--key".into(), "Enter".into()]).is_ok());
+        assert!(build_act(&["scroll".into(), "--delta-y".into(), "-100".into()]).is_ok());
     }
 
     #[test]
