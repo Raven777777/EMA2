@@ -1,5 +1,33 @@
 # 变更记录
 
+## v2.2.1 — 动作可信度、请求限制与超时预算
+
+一轮代码 review + 真实 Edge 复现后的收口。重点不是新工具，而是把“返回 ok 但实际没发生/发生了却看不到”修掉。
+
+- **act scroll**：`scroll up` 不再向下滚，`down N` 按 N 屏执行；原本扩展完全忽略 `text`。
+- **js 副作用只执行一次**：运行时 `SyntaxError`（如 `JSON.parse('{')`）不再被当成编译错误重跑；
+  debugger 与 scripting 两条路径都改为 compile-only 探测。
+- **上传限制对齐**：axum `Json` 的默认 2MB `DefaultBodyLimit` 放开到 8MB；
+  扩展 WS 入站上限从 2MB 提到 8MB；CLI/validator/文档统一为 5 MiB 原始载荷。
+  413 明确返回 `payload_too_large`，不再误报 `relay_not_running`。
+- **act waitFor**：脚本里的 `waitFor` 成为独立步骤，在所在行执行；失败时保留已完成的 `stepN`，
+  不再把整次 act 伪装成“什么都没发生”。
+- **fill/type 校验**：`input[type=number]` 等会清洗值的控件不再假成功，返回 `value_rejected`。
+- **SPA 链接 settle**：只改 DOM 不导航的链接在约 1s 后 `settle=done` + `nav=none`，
+  不再 pending 3s 并谎报 “still navigating”；`javascript:`/download/`#` 链接不重试。
+- **open 超时**：`--timeout` 真正生效，中继预算跟随 `waitTimeout`；超时输出 `load=pending`。
+  单次 `executeScript` 卡住不再拖垮整个 open。
+- **多步 act 预算**：每步最多 3s 的隐式 settle 也计入 600s 上限。
+- **观察/读取健壮性**：read 进入 open shadow root；页面导航中读 console/network 返回 `page_changed`
+  而不是 internal；XHR hook 不再因对象复用累积重复记录。
+- **session tab**：写入串行化，load 失败可重试；`newTabsSince` 只自动登记 opener 明确的标签，
+  避免把用户手动开的 tab 关进 `tabs close --session`。
+- **server stop**：/health 超时不再直接判定“已停止”，会先检查 PID/TCP 并走强制结束兜底。
+- **CLI**：多余位置参数（`type e15 hello world`）明确报错；`--submit` 仅用于 `type`。
+- **错误码/文档**：补 `relay_error`、`payload_too_large`、`page_changed`、截图/HAR 错误码；
+  `files` 段落去重；`HANDOFF/TESTING` 计数同步。
+- 版本：exe/扩展 2.2.1；helper 11；`cargo test` 65 passed；真机 verify 53 项通过。
+
 ## v2.1.7 — markdown 段落边界
 
 - 修 `read --mode md` 把连续 `<p>` 粘成一段的回归（v2.1.6 重写 markdown 渲染时引入：

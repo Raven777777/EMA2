@@ -1,5 +1,5 @@
 /**
- * EMA2 Edge 扩展 · v2.0（AI 专用浏览器接口）
+ * EMA2 Edge 扩展 · v2.2（AI 专用浏览器接口）
  * -------------------------------------------
  * 设计前提：这是给 AI 用的浏览器，不是给人用的自动化工具。
  *   - 输出一律行式紧凑文本（key=value / TSV / [ref]），不 pretty-print JSON
@@ -17,7 +17,7 @@ const DEFAULT_PORT = 7744;
 const DEFAULT_WS_URL = `ws://127.0.0.1:${DEFAULT_PORT}`;
 const RECONNECT_ALARM = 'ema2-reconnect';
 const WATCHDOG_ALARM = 'ema2-watchdog';
-const MAX_INCOMING_CHARS = 2 * 1024 * 1024;
+const MAX_INCOMING_CHARS = 8 * 1024 * 1024;
 const MAX_MESSAGE_CHARS = 48 * 1024 * 1024;
 const MAX_OUTPUT_CHARS = 200000;
 const DEFAULT_BUDGET = 4000;
@@ -33,6 +33,7 @@ const MAX_BATCH_TABS = 8;
 const LAST_ACT_KEY = 'ema2_last_act';
 const LAST_ACT_TTL_MS = 5 * 60 * 1000;
 const SETTLE_NAV_MS = 3000;
+const SETTLE_NAV_IDLE_MS = 1500;
 const SETTLE_PAGE_MS = 800;
 const SETTLE_NONE_MS = 100;
 
@@ -51,6 +52,8 @@ const SESSION_TABS_KEY = 'ema2_session_tabs';
 // 浏览器重启即清空，正好是本会话的自然边界。
 let sessionTabs = [];
 let sessionTabsLoaded = false;
+let sessionTabsLoad = null;
+let sessionWriteChain = Promise.resolve();
 let lastActContext = null;
 
 class ToolError extends Error {
@@ -387,22 +390,37 @@ function truncationHint(toolName, total, shown, next, cursor, unit) {
 /** 会话标签登记：open/batch 打开的标签按顺序记下来，供复用与批量关闭使用。 */
 async function loadSessionTabs() {
   if (sessionTabsLoaded) return sessionTabs;
-  sessionTabsLoaded = true;
-  try {
-    const store = chrome.storage && chrome.storage.session;
-    if (!store) return sessionTabs;
-    const stored = (await store.get(SESSION_TABS_KEY)) || {};
-    const ids = stored[SESSION_TABS_KEY];
-    if (Array.isArray(ids)) sessionTabs = ids.filter(id => Number.isInteger(id) && id >= 0);
-  } catch (_) { /* storage.session 不可用：退化为进程内登记 */ }
+  if (!sessionTabsLoad) {
+    sessionTabsLoad = (async () => {
+      try {
+        const store = chrome.storage && chrome.storage.session;
+        if (!store) {
+          sessionTabsLoaded = true;
+          return;
+        }
+        const stored = (await store.get(SESSION_TABS_KEY)) || {};
+        const ids = stored[SESSION_TABS_KEY];
+        if (Array.isArray(ids)) sessionTabs = ids.filter(id => Number.isInteger(id) && id >= 0);
+        sessionTabsLoaded = true;
+      } catch (_) { /* storage.session 暂时不可用：下次调用再试，不把失败缓存成空数组 */ }
+    })();
+  }
+  await sessionTabsLoad;
+  sessionTabsLoad = null;
   return sessionTabs;
 }
 
+/** 写入串行化：open/act/batch 并发登记时，后写不能覆盖先写。 */
 async function persistSessionTabs() {
-  try {
-    const store = chrome.storage && chrome.storage.session;
-    if (store) await store.set({ [SESSION_TABS_KEY]: sessionTabs });
-  } catch (_) { /* 忽略：内存登记仍然可用 */ }
+  const snapshot = [...sessionTabs];
+  const write = sessionWriteChain.then(async () => {
+    try {
+      const store = chrome.storage && chrome.storage.session;
+      if (store) await store.set({ [SESSION_TABS_KEY]: snapshot });
+    } catch (_) { /* 忽略：内存登记仍然可用 */ }
+  });
+  sessionWriteChain = write;
+  return write;
 }
 
 async function rememberSessionTab(tabId) {
@@ -469,11 +487,27 @@ async function tabsTool(args) {
   if (action === 'list') {
     const tabs = await chrome.tabs.query({});
     const lines = tabs.map(tabLine);
+    const budget = normalizeBudget(args.budget);
+    const cursor = normalizeCursor(args.cursor);
+    const total = lines.length;
+    const from = Math.min(cursor, total);
+    const out = [];
+    let used = 0;
+    let index = from;
+    while (index < total) {
+      const line = lines[index];
+      if (out.length && used + line.length + 1 > budget) break;
+      out.push(line);
+      used += line.length + 1;
+      index++;
+    }
     await loadSessionTabs();
     const live = sessionTabs.filter(id => tabs.some(tab => tab.id === id));
+    const parts = [out.join('\n')];
     // 会话标签单独一行，不混进 TSV 行数，避免 total 计到非标签行。
-    if (live.length) lines.push(`session_tabs=${live.join(',')}`);
-    return lines.join('\n') + '\n' + footer(tabs.length, tabs.length, null);
+    if (live.length) parts.push(`session_tabs=${live.join(',')}`);
+    parts.push(footer(total, out.length, index < total ? index : null));
+    return parts.filter(Boolean).join('\n');
   }
   if (action === 'current') {
     const tab = await activeTab();
@@ -579,17 +613,27 @@ async function openTool(args) {
     // 新标签必须让用户看得见：窗口提到前台（测试也依赖前台语义）。
     try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* ignore */ }
   }
+  let loaded = true;
+  let docTimeout = 0;
   if (wait !== 'none') {
-    const docTimeout = Math.min(60000, Math.max(1000, Number(args.waitTimeout || 15) * 1000));
-    await waitForDocument(tab.id, args.url, previousUrl, wait === 'load' ? 'complete' : 'interactive', docTimeout);
+    docTimeout = Math.min(60000, Math.max(1000, Number(args.waitTimeout || 15) * 1000));
+    // executeScript 在导航中的标签页上可能长时间不返回；waitForDocument 内部有
+    // deadline，但单个探测也要能被外层硬截止打断，否则 --timeout 形同虚设。
+    loaded = await within(
+      waitForDocument(tab.id, args.url, previousUrl, wait === 'load' ? 'complete' : 'interactive', docTimeout),
+      docTimeout + 1000,
+      false,
+    );
   }
-  const current = await chrome.tabs.get(tab.id);
+  let current;
+  try { current = await chrome.tabs.get(tab.id); }
+  catch (_) { fail('tab_not_found', `tab ${tab.id} was closed during open`, 'call tabs to list ids'); }
   // 等页面稳定后自动装网络 hook，这样后续 fetch/XHR 都能被 observe network 看到。
   await sleep(250);
   let hook = false;
-  try { hook = await ensureNetworkHook(tab.id); } catch (_) { hook = false; }
-  try { await ensureConsoleHook(tab.id); } catch (_) { /* ignore */ }
-  const timing = wait === 'none' ? null : await navigationTiming(tab.id);
+  try { hook = await within(ensureNetworkHook(tab.id), 3000, false); } catch (_) { hook = false; }
+  try { await within(ensureConsoleHook(tab.id), 3000, false); } catch (_) { /* ignore */ }
+  const timing = wait === 'none' ? null : await within(navigationTiming(tab.id), 2500, null);
   const status = !timing ? 'pending' : timing.status > 0 ? String(timing.status) : 'unknown';
   const lines = [
     `id=${current.id}`,
@@ -599,8 +643,12 @@ async function openTool(args) {
     `reuse=${reuse}`,
     `net_hook=${hook ? 'on' : 'off'}`,
   ];
+  if (!loaded) {
+    lines.push(`load=pending timeout=${Math.round(docTimeout / 1000)}s`);
+    lines.push('hint=the document did not reach the requested readyState in time; it may still be loading (try `wait idle` or read again)');
+  }
   if (timing && timing.redirects > 0) lines.push(`redirects=${timing.redirects}`);
-  const focused = await runInTab(tab.id, () => document.hasFocus(), []).catch(() => false);
+  const focused = await within(runInTab(tab.id, () => document.hasFocus(), []), 2000, false);
   lines.push(`focused=${focused ? 1 : 0}`);
   if (!focused) {
     lines.push('hint=the browser window is not focused; call `ema2 tabs activate ' + tab.id
@@ -648,9 +696,15 @@ async function waitForDocument(tabId, targetUrl, previousUrl, state, timeoutMs) 
       );
     } catch (_) { /* 导航中：旧文档已销毁、新文档未就绪 */ }
     if (info) {
-      const arrived = reloadingSamePage
-        ? samePageTarget(info.href, previousUrl || targetUrl)
-        : !samePageTarget(info.href, previousUrl);
+      let arrived;
+      if (!previousUrl) {
+        // 新标签的初始 about:blank 不能算“已到达”，否则 open 会提前返回。
+        arrived = !!info.href && info.href !== 'about:blank' && !info.href.startsWith('about:');
+      } else {
+        arrived = reloadingSamePage
+          ? samePageTarget(info.href, previousUrl || targetUrl)
+          : !samePageTarget(info.href, previousUrl);
+      }
       const readyOk = state === 'interactive'
         ? info.ready === 'interactive' || info.ready === 'complete'
         : info.ready === 'complete';
@@ -749,7 +803,7 @@ async function runInTab(tabId, func, args, world, attempts = 2) {
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 10) return { installed: false };
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 11) return { installed: false };
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
   const shortUrl = (url) => {
     try { const u = new URL(url); return (u.pathname + u.search).slice(0, 80); } catch (_) { return String(url).slice(0, 80); }
@@ -1139,6 +1193,7 @@ function installHelpers() {
       const tag = el.tagName;
       if (!tag || SKIP.test(tag)) return '';
       if (!isReadVisible(el)) return '';
+      if (el.shadowRoot) return [...el.shadowRoot.childNodes].map(inline).join('');
       if (tag === 'BR') return '\n';
       if (tag === 'A') {
         const text = clean(el.innerText || el.textContent || '');
@@ -1172,6 +1227,12 @@ function installHelpers() {
         const tag = child.tagName;
         if (!tag || SKIP.test(tag)) continue;
         if (!isReadVisible(child)) continue;
+        if (child.shadowRoot) {
+          flush();
+          walk(child.shadowRoot);
+          flush();
+          continue;
+        }
         if (!child.innerText && !child.querySelector('img,picture,video')) continue;
         if (/^H[1-4]$/.test(tag)) {
           const text = clean(child.innerText);
@@ -1210,7 +1271,8 @@ function installHelpers() {
         buffer += inline(child);
       }
     };
-    walk(root);
+    if (root && root.shadowRoot) walk(root.shadowRoot);
+    else walk(root);
     flush();
     return blocks.join('\n\n');
   };
@@ -1237,6 +1299,12 @@ function installHelpers() {
         if (!tag || SKIP.test(tag)) continue;
         if (tag === 'BR') { flush(); continue; }
         if (!isReadVisible(child)) continue;
+        if (child.shadowRoot) {
+          flush();
+          walk(child.shadowRoot);
+          flush();
+          continue;
+        }
         if (!child.innerText) continue;
         if (BLOCK.test(tag)) {
           flush();
@@ -1247,7 +1315,8 @@ function installHelpers() {
         walk(child);
       }
     };
-    walk(root);
+    if (root && root.shadowRoot) walk(root.shadowRoot);
+    else walk(root);
     flush();
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   };
@@ -1354,6 +1423,15 @@ function installHelpers() {
     if (tag === 'SELECT' && String(el.value) !== String(value == null ? '' : value)) {
       return { ok: false, code: 'value_not_available', message: 'select has no matching option' };
     }
+    // number/date/range 等控件会清洗值（例如 "abc" -> ""）；不能把 setter 没抛错当成写入成功。
+    if ((tag === 'INPUT' || tag === 'TEXTAREA')
+        && String(el.value) !== String(value == null ? '' : value)) {
+      return {
+        ok: false,
+        code: 'value_rejected',
+        message: 'the control normalized the value (type/maxlength/range?)',
+      };
+    }
     return { ok: true };
   };
 
@@ -1361,7 +1439,7 @@ function installHelpers() {
     snapshot, markdown, plainText, mainRoot, find, refOf, clean, candidates,
     collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent, setValue,
   };
-  window.__ema2_helpers_version = 10;
+  window.__ema2_helpers_version = 11;
   return { installed: true };
 }
 
@@ -1396,7 +1474,8 @@ async function nextDocHandle() {
   await ensureDocSeq();
   docHandleSeq += 1;
   try {
-    chrome.storage.local.set({ [DOC_SEQ_KEY]: docHandleSeq });
+    // await：service worker 在写入前被回收会让序号回绕，旧 ref 就可能在新文档上通过校验。
+    await chrome.storage.local.set({ [DOC_SEQ_KEY]: docHandleSeq });
   } catch (_) { /* 没有 storage 就只在内存里递增 */ }
   return 'd' + docHandleSeq;
 }
@@ -1530,7 +1609,17 @@ function performActionInPage(spec) {
       const anchor = tag === 'a' && !!(el.href || el.getAttribute('href'));
       const submitter = (tag === 'button' && (!el.type || el.type === 'submit'))
         || (tag === 'input' && (el.type === 'submit' || el.type === 'image'));
-      const effect = anchor || (submitter && !!form) ? 'nav' : 'page';
+      const rawHref = anchor ? String(el.getAttribute('href') || '') : '';
+      const lowerHref = rawHref.trim().toLowerCase();
+      // 只有 http(s)/相对导航链接才值得按“导航”等待/重试；
+      // javascript:、mailto:、纯 # 锚点、download 都不是页面导航。
+      const navigable = anchor
+        && !el.hasAttribute('download')
+        && !lowerHref.startsWith('javascript:')
+        && !lowerHref.startsWith('mailto:')
+        && !lowerHref.startsWith('tel:')
+        && !lowerHref.startsWith('#');
+      const effect = navigable || (submitter && !!form) ? 'nav' : 'page';
       const nextUrl = anchor ? (el.href || el.getAttribute('href') || '') : (submitter && form ? form.action || '' : '');
       // 纯 el.click() 只产生一个 click 事件：没有 pointer/mouse 序列，聚焦还是静默的，
       // 密码管理器这类靠 focusin/pointerdown 出浮层的扩展完全看不到这次点击。
@@ -1563,9 +1652,10 @@ function performActionInPage(spec) {
         return { found: true, ok: false, code: 'click_failed', message: String(error && error.message || error) };
       }
       const info = ref ? `ref=${ref}` : target ? `target=${target}` : `selector=${selector}`;
-      // kind 只影响 settle 后的重试策略：链接可安全重试，按钮不行。
-      const kind = anchor ? 'anchor' : submitter ? 'submit' : 'node';
-      return { found: true, ok: true, info, effect, nextUrl, kind };
+      // canRetry 只影响 settle 后的重试策略：只有可导航链接允许安全重试，
+      // javascript:/download/# 链接和按钮都不重试，避免副作用执行两次。
+      const kind = navigable ? 'anchor' : submitter ? 'submit' : 'node';
+      return { found: true, ok: true, info, effect, nextUrl, kind, canRetry: navigable };
     }
     case 'type': {
       const text = spec.text === undefined ? '' : String(spec.text);
@@ -1582,17 +1672,25 @@ function performActionInPage(spec) {
       }
       let effect = 'none';
       let nextUrl = '';
+      let submitted = false;
       if (spec.submit) {
         el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
         const form = el.closest && el.closest('form');
         if (form && form.requestSubmit) {
           form.requestSubmit();
+          submitted = true;
           effect = 'nav';
           nextUrl = form.action || '';
         }
       }
       // 只返回写入长度；输入内容（尤其是密码）绝不进入工具输出。
-      return { found: true, ok: true, info: `wrote=1 chars=${text.length}${spec.submit ? ' submit=1' : ''}`, effect, nextUrl };
+      return {
+        found: true,
+        ok: true,
+        info: `wrote=1 chars=${text.length}${spec.submit ? ` submit=${submitted ? 1 : 0}` : ''}`,
+        effect,
+        nextUrl,
+      };
     }
     case 'select': {
       if (el.tagName !== 'SELECT') {
@@ -1846,6 +1944,7 @@ function installNetworkHook() {
   XMLHttpRequest.prototype.send = function (...args) {
     const meta = this.__ema2 || {};
     meta.start = performance.now();
+    // once: XHR 对象被复用时不会累积 loadend 监听器，避免一个请求产生多条记录。
     this.addEventListener('loadend', () => {
       let body = '';
       let previewState = 'off';
@@ -1867,7 +1966,7 @@ function installNetworkHook() {
         ms: Math.round(performance.now() - (meta.start || performance.now())),
         body, preview: previewState,
       });
-    });
+    }, { once: true });
     return originalSend.apply(this, args);
   };
   return true;
@@ -1947,13 +2046,22 @@ async function clearLastAct() {
   } catch (_) { /* ignore */ }
 }
 
-/** 动作期间新建的标签（同窗口或 opener 指向动作所在 tab）。 */
+/**
+ * 动作期间新建的标签。
+ *
+ * openerTabId 明确指向动作 tab 的最可靠；noopener/target=_blank 会丢失 opener，
+ * 只能退化为“同窗口 + 新出现 + 当前 active”。后者只用于定位结果，
+ * 不会自动登记进 session（避免用户手动开的 tab 被 `tabs close --session` 关掉）。
+ */
 function newTabsSince(context, tabs) {
   const known = new Set(context.tabIds || []);
-  return tabs.filter(tab => !known.has(tab.id)
-    && tab.id !== context.tabId
-    && (tab.openerTabId === context.tabId
-      || (context.windowId != null && tab.windowId === context.windowId)));
+  const original = tabs.find(tab => tab.id === context.tabId);
+  return tabs
+    .filter(tab => !known.has(tab.id) && tab.id !== context.tabId)
+    .filter(tab => tab.openerTabId === context.tabId
+      || (context.windowId != null && tab.windowId === context.windowId
+        && tab.active && original && !original.active))
+    .map(tab => ({ tab, safe: tab.openerTabId === context.tabId }));
 }
 
 function actionChangedKeys(baseline, state) {
@@ -1986,10 +2094,11 @@ async function waitForActionEffect(context, timeoutMs) {
     let tabs = [];
     try { tabs = await chrome.tabs.query({}); } catch (_) { /* ignore */ }
     const created = newTabsSince(context, tabs);
-    for (const tab of created) {
+    for (const item of created) {
+      const tab = item.tab;
       if (!newTabIds.includes(tab.id)) {
         newTabIds.push(tab.id);
-        await rememberSessionTab(tab.id);
+        if (item.safe) await rememberSessionTab(tab.id);
       }
     }
     if (newTabIds.length) {
@@ -2037,11 +2146,31 @@ async function waitForActionEffect(context, timeoutMs) {
     const complete = tabInfo.status === 'complete' || tabInfo.status === undefined;
 
     if (context.expect === 'nav') {
-      if (started && complete && quietFor >= 250 && url) {
-        return {
-          settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
-          url, title, changed,
-        };
+      const navEvidence = changed.includes('url') || changed.includes('doc')
+        || newTabIds.length > 0 || tabInfo.status === 'loading';
+      const pageActivity = changed.length > 0;
+      if (complete && url) {
+        if (navEvidence && started && quietFor >= 250) {
+          return {
+            settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
+            url, title, changed,
+          };
+        }
+        // SPA 链接可能只改 DOM/标题、不导航：1s 内没有新动静就按“无导航”结算，
+        // 交给 act 输出 nav=none，而不是一直 pending 到 3s 并谎报“still navigating”。
+        if (pageActivity && quietFor >= 600 && elapsed >= 1000) {
+          return {
+            settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
+            url, title, changed,
+          };
+        }
+        // 完全没有动静的链接/按钮：给一次重试机会（只有 canRetry 的链接会重试）。
+        if (!pageActivity && elapsed >= SETTLE_NAV_IDLE_MS) {
+          return {
+            settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
+            url, title, changed,
+          };
+        }
       }
     } else if (context.expect === 'page') {
       if (changed.length && quietFor >= 250) {
@@ -2050,7 +2179,8 @@ async function waitForActionEffect(context, timeoutMs) {
           url, title, changed,
         };
       }
-      if (!changed.length && elapsed >= 400) {
+      // 轮询是 120ms 一步；阈值留出一步，避免刚好在 timeout 边界退出成 pending。
+      if (!changed.length && elapsed >= SETTLE_PAGE_MS - 120) {
         return {
           settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
           url, title, changed,
@@ -2178,11 +2308,13 @@ async function actTool(args) {
   // 动作前装 hook，并记录网络水位 {document epoch, seq}；不同文档的 seq 不可比较。
   try { await ensureNetworkHook(tab.id); } catch (_) { /* non-http page */ }
   const netBaseline = await networkMark(tab.id);
+  let lastActionNetBaseline = netBaseline;
   try { await ensureConsoleHook(tab.id); } catch (_) { /* ignore */ }
   const results = [];
   const newTabIds = [];
   let lastSettle = null;
   let stoppedAt = null;
+  let okCount = 0;
 
   for (let index = 0; index < steps.length; index++) {
     const step = steps[index];
@@ -2192,11 +2324,30 @@ async function actTool(args) {
       try {
         const text = await awaitPendingAction({ timeout: step.timeout, tabId: tab.id });
         results.push(`step${index + 1} ${text}`);
+        okCount++;
         if (lastSettle) lastSettle = { ...lastSettle, settled: true };
         await sleep(80);
       } catch (error) {
-        if (error instanceof ToolError && batch) {
-          error.message = `steps[${index + 1}] await: ${error.message}`;
+        if (error instanceof ToolError) {
+          if (batch) error.message = `steps[${index + 1}] await: ${error.message}`;
+          error.lines = [...(error.lines || []), ...results];
+        }
+        throw error;
+      }
+      continue;
+    }
+
+    if (step.action === 'waitFor') {
+      try {
+        const waitTabId = (lastSettle && lastSettle.targetTabId) || tab.id;
+        const text = await waitForResponse(waitTabId, step, lastActionNetBaseline);
+        results.push(`step${index + 1} ${text}`);
+        okCount++;
+        await sleep(60);
+      } catch (error) {
+        if (error instanceof ToolError) {
+          if (batch) error.message = `steps[${index + 1}] waitFor: ${error.message}`;
+          error.lines = [...(error.lines || []), ...results];
         }
         throw error;
       }
@@ -2206,25 +2357,29 @@ async function actTool(args) {
     const stepBefore = await pageState(tab.id);
     let tabsBefore = [];
     try { tabsBefore = await chrome.tabs.query({}); } catch (_) { /* ignore */ }
+    // waitFor 要匹配“上一步动作”产生的响应，baseline 必须在该动作之前取。
+    lastActionNetBaseline = await networkMark(tab.id);
     let outcome;
     try {
       await ensureHelpers(tab.id);
       outcome = await runStepWithRetry(tab, step);
     } catch (error) {
       await clearLastAct();
-      if (error instanceof ToolError && batch) {
-        error.message = `steps[${index + 1}] ${step.action}: ${error.message}`;
+      if (error instanceof ToolError) {
+        if (batch) error.message = `steps[${index + 1}] ${step.action}: ${error.message}`;
+        error.lines = [...(error.lines || []), ...results];
       }
       throw error;
     }
 
     let settled = await settleAfterAction(tab, step, outcome, stepBefore, tabsBefore);
-    // 链接点了但没导航：只对 <a> 安全重试一次（按钮不重试，避免点赞/提交执行两次）。
-    if (outcome.kind === 'anchor' && outcome.effect === 'nav') {
-      const navMissing = settled.settle.settled
-        && !settled.settle.changed.includes('url')
+    // 链接点了但没导航：只对可导航的 <a> 安全重试一次；
+    // DOM/title 已经有变化说明动作生效，绝不重试（避免 SPA/JS 处理器执行两次）。
+    if (outcome.canRetry && outcome.effect === 'nav' && settled.settle.settled) {
+      const firstChanged = settled.settle.changed || [];
+      const navMissing = !firstChanged.includes('url')
         && !(settled.settle.newTabIds || []).length;
-      if (navMissing) {
+      if (navMissing && firstChanged.length === 0) {
         await sleep(250);
         const retryBefore = await pageState(tab.id);
         let retryTabs = [];
@@ -2232,12 +2387,12 @@ async function actTool(args) {
         const retryOutcome = await runStepWithRetry(tab, step);
         const retrySettled = await settleAfterAction(tab, step, retryOutcome, retryBefore, retryTabs);
         if (!retrySettled.settle.settled
-            || retrySettled.settle.changed.includes('url')
+            || retrySettled.settle.changed.length
             || (retrySettled.settle.newTabIds || []).length) {
           outcome = retryOutcome;
           settled = retrySettled;
-          results.push('retried=1 reason=anchor_did_not_navigate');
         }
+        results.push('retried=1 reason=anchor_did_not_navigate');
       }
     }
     const settle = settled.settle;
@@ -2248,6 +2403,7 @@ async function actTool(args) {
     }
     const pending = !settle.settled;
     results.push(`step${index + 1} ok=${step.action}${outcome.info ? ` ${outcome.info}` : ''}${pending ? ' settle=pending' : ''}`);
+    okCount++;
 
     if (pending && batch) {
       const next = steps[index + 1];
@@ -2262,7 +2418,15 @@ async function actTool(args) {
   const summaryTabId = (lastSettle && lastSettle.targetTabId) || tab.id;
   let waitInfo = '';
   if (args.waitFor) {
-    waitInfo = await waitForResponse(summaryTabId, args.waitFor, netBaseline);
+    try {
+      waitInfo = await waitForResponse(summaryTabId, args.waitFor, lastActionNetBaseline);
+    } catch (error) {
+      if (error instanceof ToolError) {
+        // 动作已经执行了；把已完成的步骤带在错误下面，避免 AI 以为整次调用都没发生。
+        error.lines = [...(error.lines || []), ...results];
+      }
+      throw error;
+    }
   }
   try { await ensureNetworkHook(summaryTabId); } catch (_) { /* non-http page */ }
 
@@ -2278,7 +2442,7 @@ async function actTool(args) {
   if (before.doc && after.doc && before.doc !== after.doc) changed.push('doc');
   if (newTabIds.length) changed.push('new_tab');
 
-  const lines = [...results, `ok=${results.length}/${steps.length}`];
+  const lines = [...results, `ok=${okCount}/${steps.length}`];
   if (stoppedAt !== null) lines.push(`stopped=${stoppedAt} reason=pending`);
   if (lastSettle) {
     lines.push(`settle=${lastSettle.settled ? 'done' : 'pending'} ms=${lastSettle.elapsedMs || 0} expect=${lastSettle.expect}`);
@@ -2453,13 +2617,18 @@ function mapActionResult(step, result) {
     fail('target_not_found', `target not found: ${step.ref || step.selector || step.target || '(none)'}`, 'use snapshot refs, or target="role:name"', result.candidates);
   }
   if (!result.ok) {
-    fail(result.code || 'action_failed', result.message || `${step.action} failed`, result.hint || 'inspect the page and retry with a fresh snapshot');
+    const details = (result.fields || [])
+      .filter(item => !item.ok)
+      .map(item => `${item.target}: ${item.code || 'failed'}${item.message ? ' - ' + item.message : ''}`);
+    fail(result.code || 'action_failed', result.message || `${step.action} failed`,
+      result.hint || 'inspect the page and retry with a fresh snapshot', details);
   }
   return {
     info: result.info || '',
     effect: result.effect || 'none',
     nextUrl: result.nextUrl || '',
     kind: result.kind || '',
+    canRetry: !!result.canRetry,
   };
 }
 
@@ -2475,12 +2644,22 @@ async function runStep(tab, step) {
     return { info: '', effect: 'nav', nextUrl: '' };
   }
   if (action === 'scroll') {
-    const info = await runInTab(tab.id, (delta) => {
+    const pixels = typeof step.deltaY === 'number' ? step.deltaY : null;
+    let pages = null;
+    if (pixels === null) {
+      const match = /^(up|down)(?:\s+(\d+))?$/i.exec(String(step.text || '').trim());
+      const direction = match && match[1].toLowerCase() === 'up' ? -1 : 1;
+      const count = match ? Math.max(1, Number(match[2] || 1)) : 1;
+      pages = direction * count;
+    }
+    const info = await runInTab(tab.id, (deltaPixels, pageCount) => {
       const before = window.scrollY;
-      const dy = typeof delta === 'number' ? delta : Math.round(window.innerHeight * 0.8);
+      const dy = typeof deltaPixels === 'number'
+        ? deltaPixels
+        : Math.round(pageCount * window.innerHeight * 0.8);
       if (dy !== 0) window.scrollBy(0, dy);
       return 'scroll=' + before + '->' + window.scrollY;
-    }, [typeof step.deltaY === 'number' ? step.deltaY : null]);
+    }, [pixels, pages]);
     return { info: info || '', effect: 'none', nextUrl: '' };
   }
 
@@ -2827,15 +3006,26 @@ function withDebugger(tabId, run, options = {}) {
   return task;
 }
 
-/** Runtime.evaluate 的语法错误（编译期）与运行时抛出的 SyntaxError 都带 className=SyntaxError。 */
-function isSyntaxErrorDetails(details) {
-  if (!details) return false;
-  const exception = details.exception || {};
-  return exception.className === 'SyntaxError' || /\bSyntaxError\b/.test(details.text || '');
+/** 只编译、不执行；用来区分“编译期语法错误”和“运行时 SyntaxError”。 */
+async function compileProbe(tabId, expression) {
+  try {
+    const response = await chrome.debugger.sendCommand({ tabId }, 'Runtime.compileScript', {
+      expression,
+      sourceURL: 'ema2://probe',
+      persistScript: false,
+    });
+    if (response && response.exceptionDetails) {
+      const details = response.exceptionDetails;
+      return { ok: false, message: details.text || (details.exception && details.exception.description) || 'syntax error' };
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, message: String((error && error.message) || error) };
+  }
 }
 
-function jsErrorHint(details) {
-  if (isSyntaxErrorDetails(details)) {
+function jsErrorHint(syntax) {
+  if (syntax) {
     return 'syntax error: send an expression (`document.title`) or a statement body with optional top-level return/await; unbalanced brackets or a stray `{ }` block are the usual causes';
   }
   return 'runtime error: the code parsed but threw; read the page first (snapshot/read) or guard with try/catch';
@@ -2864,36 +3054,41 @@ async function jsTool(args) {
 
 async function jsViaDebugger(tabId, args) {
   return withDebugger(tabId, async () => {
-    let result = await evaluateInTab(tabId, args.code);
-    // 顶层 return / 多条语句不是合法表达式：按 async 函数体再跑一次，
-    // 与常见 codemode 沙箱的语义保持一致。
-    if (result.exceptionDetails && isSyntaxErrorDetails(result.exceptionDetails)) {
-      result = await evaluateInTab(tabId, `(async () => {\n${args.code}\n})()`);
-      if (result.exceptionDetails) {
-        const details = result.exceptionDetails;
-        const message = details.exception && details.exception.description || details.text || 'JS error';
-        fail('js_exception', oneLine(message).slice(0, 300), jsErrorHint(details));
+    // Runtime.compileScript 需要先启用 Runtime domain（evaluate 本身不需要）。
+    await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
+    // 先用 Runtime.compileScript 只做编译探测：表达式能编译就只执行一次；
+    // 运行时抛出的 SyntaxError 不是编译错误，绝不能重跑（否则副作用执行两次）。
+    // compileScript 对标的是“脚本”，顶层 return 可能被接受；套一层括号才能确认是表达式。
+    const expressionSource = String(args.code).trim().replace(/;+\s*$/, '');
+    const asExpression = await compileProbe(tabId, `(${expressionSource}
+)`);
+    let result;
+    let ranAsBody = false;
+    if (asExpression.ok) {
+      result = await evaluateInTab(tabId, args.code);
+    } else {
+      const wrapped = `(async () => {\n${args.code}\n})()`;
+      const asBody = await compileProbe(tabId, wrapped);
+      if (!asBody.ok) {
+        fail('js_exception', oneLine(asBody.message || 'syntax error').slice(0, 300), jsErrorHint(true));
       }
-      const wrappedValue = result.result ? result.result.value : undefined;
-      const budget = normalizeBudget(args.budget === undefined ? 8000 : args.budget);
-      const text = wrappedValue === undefined ? 'undefined' : stringifyValue(wrappedValue);
-      const slice = sliceText(text, budget, 0);
-      const lines = [slice.text];
-      if (slice.next != null) lines.push(footer(slice.total, slice.text.length, slice.next));
-      if (wrappedValue === undefined) {
-        lines.push('note=ran as an async function body; add `return <value>` to get a value back');
-      }
-      return lines.join('\n');
+      ranAsBody = true;
+      result = await evaluateInTab(tabId, wrapped);
     }
     if (result.exceptionDetails) {
       const details = result.exceptionDetails;
       const message = details.exception && details.exception.description || details.text || 'JS error';
-      fail('js_exception', oneLine(message).slice(0, 300), jsErrorHint(details));
+      fail('js_exception', oneLine(message).slice(0, 300), jsErrorHint(false));
     }
     const value = result.result ? result.result.value : undefined;
     const budget = normalizeBudget(args.budget === undefined ? 8000 : args.budget);
     const slice = sliceText(value === undefined ? 'undefined' : stringifyValue(value), budget, 0);
-    return slice.text + (slice.next == null ? '' : '\n' + footer(slice.total, slice.text.length, slice.next));
+    const lines = [slice.text];
+    if (slice.next != null) lines.push(footer(slice.total, slice.text.length, slice.next));
+    if (ranAsBody && value === undefined) {
+      lines.push('note=ran as an async function body; add `return <value>` to get a value back');
+    }
+    return lines.join('\n');
   });
 }
 
@@ -2907,23 +3102,40 @@ async function injectMainWorld(tabId, source) {
     func: async (src) => {
       // eslint-disable-next-line no-eval
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      // 只编译、不执行地探测表达式；编译成功才 eval，运行时异常不再重跑。
+      let expressionCompiles = false;
       try {
-        return { __ema2: 1, ok: true, value: await (0, eval)(src) };
-      } catch (error) {
-        if (error instanceof SyntaxError) {
-          try {
-            return { __ema2: 1, ok: true, value: await new AsyncFunction(src)() };
-          } catch (bodyError) {
-            return { __ema2: 1, ok: false, error: String((bodyError && bodyError.stack) || bodyError) };
-          }
+        // eslint-disable-next-line no-new-func
+        new Function('return (' + src + '\n)');
+        expressionCompiles = true;
+      } catch (_) { /* statement body */ }
+      if (expressionCompiles) {
+        try {
+          return { __ema2: 1, ok: true, value: await (0, eval)(src) };
+        } catch (error) {
+          return { __ema2: 1, ok: false, error: String((error && error.stack) || error) };
         }
+      }
+      let bodyError = null;
+      try {
+        new AsyncFunction(src);
+      } catch (error) {
+        bodyError = error;
+      }
+      if (bodyError) {
+        return { __ema2: 1, ok: false, syntax: true, error: String((bodyError && bodyError.stack) || bodyError) };
+      }
+      try {
+        return { __ema2: 1, ok: true, value: await new AsyncFunction(src)() };
+      } catch (error) {
         return { __ema2: 1, ok: false, error: String((error && error.stack) || error) };
       }
     },
   });
   const payload = results && results[0] ? results[0].result : undefined;
   if (payload && typeof payload === 'object' && payload.__ema2 === 1) return payload;
-  return { ok: true, value: payload };
+  // 信封丢失说明注入没有真正跑（frame 切走/被 CSP 拦），不能当成 undefined 成功。
+  return { ok: false, error: 'scripting fallback produced no result (frame changed?)', syntax: false };
 }
 
 /// debugger 被占时的降级：MAIN world 注入，参数/输出语义与 `js` 一致，额外给一行 via=scripting。
@@ -2941,7 +3153,7 @@ async function jsViaScripting(tabId, args, attachError) {
   }
   if (!payload.ok) {
     fail('js_exception', oneLine(payload.error || 'JS error').slice(0, 300),
-      'runtime error: the code parsed but threw; read the page first (snapshot/read) or guard with try/catch');
+      jsErrorHint(!!payload.syntax));
   }
   const value = payload.value;
   const text = value === undefined ? 'undefined' : stringifyValue(value);
@@ -3081,6 +3293,9 @@ async function batchTool(args) {
   if (urls.length) {
     // 复合模式的内层参数属于目标工具；open 自身只接受 wait/replace/reuse。
     validateBatchInner(toolName, inner);
+    if (inner.replace !== undefined || inner.reuse !== undefined || inner.tabId !== undefined) {
+      fail('invalid_argument', 'urls mode always opens new tabs; replace/reuse/tabId are not allowed', 'remove those flags or use tabIds mode');
+    }
     if (inner.wait !== undefined && !['load', 'dom', 'none'].includes(inner.wait)) {
       fail('invalid_argument', 'wait must be load|dom|none', 'fix the inner arguments');
     }
@@ -3204,11 +3419,11 @@ async function shotTool(args) {
   if (args.annotate) {
     await ensureHelpers(tab.id);
     docBefore = await runInTab(tab.id, () => window.__ema2_helpers.docEpoch(), []);
-    marks = await runInTab(tab.id, () => {
+    marks = (await runInTab(tab.id, () => {
       const helpers = window.__ema2_helpers;
       helpers.snapshot('interactive', 20000, 0);
       return helpers.marks();
-    }, []);
+    }, [])) || [];
     marksText = marks.map(mark => `[${mark.ref}] ${mark.role} "${mark.name}" @${mark.x},${mark.y} ${mark.w}x${mark.h}`).join('\n');
   }
   let dataUrl;
@@ -3220,7 +3435,7 @@ async function shotTool(args) {
   // 截图过程中用户/页面可能切换活动标签页：目标变了就明确失败，不把别的页标成目标页。
   await requireActiveShotTab(tab);
   if (args.annotate) {
-    const docAfter = await runInTab(tab.id, () => window.__ema2_helpers.docEpoch(), []);
+    const docAfter = await runInTab(tab.id, () => window.__ema2_helpers.docEpoch(), []).catch(() => null);
     if (docAfter !== docBefore) {
       fail('tab_changed', 'the target document changed while taking the screenshot', 'retry after the page stops navigating');
     }
@@ -3231,7 +3446,7 @@ async function shotTool(args) {
     const mime = 'image/' + (format === 'png' ? 'png' : 'jpeg');
     return { content: [{ type: 'image', data: match[2], mimeType: mime }] };
   }
-  const dpr = await runInTab(tab.id, () => window.devicePixelRatio || 1, []);
+  const dpr = await runInTab(tab.id, () => window.devicePixelRatio || 1, []).catch(() => 1);
   const annotated = await annotateScreenshot(dataUrl, marks, dpr, format);
   const content = [];
   if (marks.length) content.push({ type: 'text', text: marksText + '\nmarks=' + marks.length });
@@ -3254,9 +3469,26 @@ function paginateRecords(records, budget) {
 
 const BODY_FILTER_MAX_CHARS = 512;
 const BODY_FILTER_TEXT_MAX_CHARS = 2000;
-// 灾难性回溯的两个典型来源：量词套量词 `(a+)+`、量词组内再分支 `(a|a)+`。
+// 灾难性回溯的典型来源：量词套量词 `(a+)+`、量词组内重复/前缀分支 `(a|a)+` / `(aa|a)+`。
 const BODY_FILTER_NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*{](?:[^()\\]|\\.)*\)\s*[+*{]/;
-const BODY_FILTER_QUANTIFIED_ALTERNATION = /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*[+*{]/;
+
+/** 只在同一量词组的 alternatives 相等或互为前缀时拒绝，避免误伤 `(GET|POST)+`。 */
+function hasRiskyQuantifiedAlternation(pattern) {
+  const group = /\(([^()]*)\)\s*[+*{]/g;
+  let match;
+  while ((match = group.exec(pattern))) {
+    const body = match[1];
+    if (!body.includes('|')) continue;
+    const alternatives = body.split('|').map(part => part.trim()).filter(Boolean);
+    if (alternatives.length < 2) continue;
+    for (const left of alternatives) {
+      for (const right of alternatives) {
+        if (left === right || left.startsWith(right) || right.startsWith(left)) return true;
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * 编译 `bodyFilter`，并拒绝已知会指数回溯的形态。
@@ -3270,7 +3502,7 @@ function compileBodyFilter(source) {
   if (pattern.length > BODY_FILTER_MAX_CHARS) {
     fail('invalid_regex', `bodyFilter is limited to ${BODY_FILTER_MAX_CHARS} chars`, 'shorten the pattern');
   }
-  if (BODY_FILTER_NESTED_QUANTIFIER.test(pattern) || BODY_FILTER_QUANTIFIED_ALTERNATION.test(pattern)) {
+  if (BODY_FILTER_NESTED_QUANTIFIER.test(pattern) || hasRiskyQuantifiedAlternation(pattern)) {
     fail('invalid_regex', 'bodyFilter uses a quantified group that can backtrack exponentially',
       'rewrite it without nested quantifiers, e.g. use two separate filters or a plain substring');
   }
@@ -3293,6 +3525,10 @@ async function observeTool(args) {
   const budget = normalizeBudget(args.budget === undefined ? 3000 : args.budget);
 
   if (kind === 'console') {
+    if (args.har) {
+      fail('invalid_argument', '--har only applies to network observations', 'use `observe network --har PATH`');
+    }
+    if (args.wait) await sleep(Math.min(10000, Math.round(args.wait * 1000)));
     await ensureConsoleHook(tab.id);
     const knownDoc = observedDocs.get(tab.id);
     const currentDoc = await runInTab(tab.id, () => window.__ema2_console_epoch || '', [], 'MAIN');
@@ -3313,7 +3549,8 @@ async function observeTool(args) {
         reset,
         firstSeq: all.length ? all[0].seq : seq + 1,
       };
-    }, [args.level || 'error', since, forceReset, args.filter || null], 'MAIN');
+    }, [args.level || 'error', since, forceReset, args.filter || null], 'MAIN').catch(() => null);
+    if (!data) fail('page_changed', 'the page navigated while reading console entries', 'retry after the page settles');
     if (data.epoch) observedDocs.set(tab.id, data.epoch);
     const records = data.entries.map(e => ({
       seq: e.seq,
@@ -3357,7 +3594,8 @@ async function observeTool(args) {
           status: entry.status, ms: entry.ms, body: entry.body, preview: entry.preview || 'done',
         })),
       };
-    }, [since, args.filter || null, forceReset], 'MAIN');
+    }, [since, args.filter || null, forceReset], 'MAIN').catch(() => null);
+    if (!data) fail('page_changed', 'the page navigated while reading network entries', 'retry after the page settles');
     if (data.epoch) observedDocs.set(tab.id, data.epoch);
     let items = data.items;
     let pendingSeqs = [];
@@ -3449,7 +3687,8 @@ async function readTool(args) {
       header: 'url=' + location.href + '\ntitle=' + helpers.clean(document.title)
         + (mainSelector ? '\nmain=' + mainSelector : ''),
     };
-  }, [mode, selector || null, useMain]);
+  }, [mode, selector || null, useMain]).catch(() => null);
+  if (!data) fail('page_changed', 'the page navigated while reading content', 'retry after the page settles');
   if (data.missing) {
     fail('selector_not_found', `selector not found: ${selector}`, 'call snapshot to see available refs/roles');
   }
@@ -3538,6 +3777,14 @@ async function executeTool(name, args) {
 }
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+/** 给一个可能卡在 executeScript 里的 Promise 加外层期限；超时返回 fallback，原 Promise 继续但不再阻塞调用方。 */
+function within(promise, ms, fallback) {
+  return Promise.race([
+    Promise.resolve(promise).catch(() => fallback),
+    sleep(Math.max(1, ms)).then(() => fallback),
+  ]);
+}
 
 /** 旧版本留下的 token / 配对字段在 v2 全部作废；8765 迁移到 7744。 */
 async function migrateSettings() {

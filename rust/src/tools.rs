@@ -1,4 +1,4 @@
-//! v2.0 工具注册表（11 个粗粒度工具，面向 AI 的 CLI 子命令）。
+//! v2.2 工具注册表（11 个粗粒度工具，面向 AI 的 CLI 子命令）。
 //!
 //! 约定：
 //! - 输出行式紧凑文本（`key=value` / TSV / `[ref]`），不 pretty-print JSON
@@ -35,18 +35,76 @@ pub fn contains(name: &str) -> bool {
 pub fn timeout_for(name: &str, arguments: &Value) -> Duration {
     match name {
         "wait" => Duration::from_secs_f64(wait_seconds(arguments) + RELAY_MARGIN_SECS),
-        "act" => {
-            let wait = arguments
-                .pointer("/waitFor/timeout")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                .clamp(0.0, 30.0);
-            ACT_TIMEOUT + Duration::from_secs_f64(wait + act_await_seconds(arguments))
+        "open" => {
+            if arguments.get("wait").and_then(Value::as_str) == Some("none") {
+                DEFAULT_TIMEOUT
+            } else {
+                // 扩展按 waitTimeout 等文档接位，再装 hook。默认 15s；
+                // 预算必须跟着 waitTimeout 走，否则 --timeout 45 会先被 30s 中继超时打断。
+                Duration::from_secs_f64(open_wait_seconds(arguments) + RELAY_MARGIN_SECS)
+            }
         }
+        "act" => Duration::from_secs_f64(act_budget_seconds(arguments)),
         "js" | "shot" | "files" => LONG_TIMEOUT,
         "batch" => batch_budget(arguments).min(MAX_CALL_TIMEOUT),
         _ => DEFAULT_TIMEOUT,
     }
+}
+
+/// open 等待文档接位的秒数（默认 15，已由参数校验限制在 1..60）。
+fn open_wait_seconds(arguments: &Value) -> f64 {
+    arguments
+        .get("waitTimeout")
+        .and_then(Value::as_f64)
+        .unwrap_or(15.0)
+        .clamp(1.0, 60.0)
+}
+
+/// act 的脚本 await 与逐步骤 waitFor 时长总和。
+fn act_wait_seconds(arguments: &Value) -> f64 {
+    let top_level = if arguments
+        .get("waitFor")
+        .is_some_and(|value| !value.is_null())
+    {
+        arguments
+            .pointer("/waitFor/timeout")
+            .and_then(Value::as_f64)
+            .unwrap_or(10.0)
+            .clamp(0.0, 30.0)
+    } else {
+        0.0
+    };
+    let steps = arguments
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|step| step.get("action").and_then(Value::as_str) == Some("waitFor"))
+                .map(|step| {
+                    step.get("timeout")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(10.0)
+                        .clamp(0.0, 30.0)
+                })
+                .sum::<f64>()
+        })
+        .unwrap_or(0.0);
+    top_level + steps
+}
+
+/// act 的完整预算：固定执行上限 + 每步最多 3s 的隐式 settle + 显式等待。
+/// 20 步脚本光 settle 就可能 60s，不能只靠 ACT_TIMEOUT。
+fn act_budget_seconds(arguments: &Value) -> f64 {
+    let steps = arguments
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(1);
+    ACT_TIMEOUT.as_secs_f64()
+        + steps as f64 * 3.0
+        + act_wait_seconds(arguments)
+        + act_await_seconds(arguments)
 }
 
 /// batch 的实际预算（未截断）：`timeout_for` 与参数校验共用这一个入口。
@@ -66,7 +124,7 @@ fn wait_seconds(arguments: &Value) -> f64 {
         .clamp(0.0, MAX_WAIT_SECS)
 }
 
-/// act 脚本里 `await 10s` 的时长总和；这些等待会叠加到工具总预算。
+// act 脚本里 `await 10s` 的时长总和；这些等待会叠加到工具总预算。
 fn act_await_seconds(arguments: &Value) -> f64 {
     arguments
         .get("steps")
@@ -76,6 +134,7 @@ fn act_await_seconds(arguments: &Value) -> f64 {
                 .iter()
                 .filter(|step| step.get("action").and_then(Value::as_str) == Some("await"))
                 .filter_map(|step| step.get("timeout").and_then(Value::as_f64))
+                .map(|seconds| seconds.clamp(0.0, MAX_WAIT_SECS))
                 .sum()
         })
         .unwrap_or(0.0)
@@ -159,6 +218,8 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 false,
             )?;
             tab_id(object)?;
+            budget_arg(object)?;
+            cursor_arg(object)?;
             let has_many = tab_ids_arg(object)?;
             enum_arg(object, "scope", &["session"], false)?;
             if has_many && object.get("tabId").is_some_and(|v| !v.is_null()) {
@@ -239,18 +300,10 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                     };
                     validate_action(step).map_err(|error| format!("steps[{index}]: {error}"))?;
                 }
-                let wait = object
-                    .get("waitFor")
-                    .and_then(|wait_for| wait_for.get("timeout"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 30.0);
-                let budget = ACT_TIMEOUT.as_secs_f64()
-                    + wait
-                    + act_await_seconds(&Value::Object(object.clone()));
+                let budget = act_budget_seconds(&Value::Object(object.clone()));
                 if budget > MAX_CALL_TIMEOUT.as_secs_f64() {
                     return Err(format!(
-                        "act budget {:.0}s exceeds the {}s call limit; reduce await durations or split the script",
+                        "act budget {:.0}s exceeds the {}s call limit; reduce steps/await durations or split the script",
                         budget,
                         MAX_CALL_TIMEOUT.as_secs()
                     ));
@@ -400,9 +453,9 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                             .map_err(|e| format!("files[{index}]: {e}"))?;
                         let data = file.get("data").and_then(Value::as_str).unwrap_or_default();
                         total += data.len();
-                        if total > 6_500_000 {
+                        if total > 7_000_000 {
                             return Err(
-                                "files payload exceeds 6.5MB of base64; upload fewer/smaller files"
+                                "files payload exceeds 7MB of base64; upload fewer/smaller files"
                                     .into(),
                             );
                         }
@@ -469,9 +522,19 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             // 内层参数复用子工具自己的验证器：batch 不能绕过 wait.time=300 等限制。
             if let Some(inner) = object.get("args") {
                 let inner = inner.as_object().expect("checked above");
+                if has_urls
+                    && ["replace", "reuse", "tabId"]
+                        .iter()
+                        .any(|key| inner.get(*key).is_some_and(|value| !value.is_null()))
+                {
+                    return Err(
+                        "urls mode always opens new tabs; replace/reuse/tabId are not allowed in batch args"
+                            .into(),
+                    );
+                }
                 let mut merged = inner.clone();
                 if tool == "open" {
-                    // urls 模式下 url 由 batch 逐个注入，这里只校验 wait/replace/reuse。
+                    // urls 模式下 url 由 batch 逐个注入，这里只校验 wait 等其他参数。
                     merged.insert("url".into(), json!("https://placeholder.invalid/"));
                 } else {
                     merged.insert("tabId".into(), json!(0));
@@ -499,7 +562,7 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
         "action",
         &[
             "click", "type", "fill", "select", "press", "hover", "scroll", "submit", "back",
-            "forward", "reload", "await",
+            "forward", "reload", "await", "waitFor",
         ],
         true,
     )?;
@@ -518,6 +581,24 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
             && !(0.0..=300.0).contains(&timeout)
         {
             return Err("await timeout must be between 0 and 300 seconds".into());
+        }
+        return Ok(());
+    }
+    if action == "waitFor" {
+        let url = string_arg(object, "url", 2_048, false, true)?;
+        let status = number_arg(object, "status", false)?;
+        if let Some(status) = status
+            && !(100.0..=599.0).contains(&status)
+        {
+            return Err("waitFor.status must be between 100 and 599".into());
+        }
+        if let Some(timeout) = number_arg(object, "timeout", false)?
+            && !(0.0..=30.0).contains(&timeout)
+        {
+            return Err("waitFor.timeout must be between 0 and 30 seconds".into());
+        }
+        if !url && status.is_none() {
+            return Err("waitFor needs url= or status=".into());
         }
         return Ok(());
     }
@@ -546,6 +627,16 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
         .is_some_and(|v| !matches!(v, Value::Null | Value::Bool(_)))
     {
         return Err("submit must be a boolean".into());
+    }
+    if object
+        .get("submit")
+        .is_some_and(|v| matches!(v, Value::Bool(true)))
+        && action != "type"
+    {
+        return Err(
+            "submit=true is only supported by type; use action=submit or click the submit button"
+                .into(),
+        );
     }
     if let Some(fields) = object.get("fields").filter(|v| !matches!(v, Value::Null)) {
         let Some(fields) = fields.as_array() else {
@@ -907,6 +998,21 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "steps": [{ "action": "waitFor", "url": "api", "timeout": 5 }] })
+            )
+            .is_ok()
+        );
+        assert!(validate_arguments("act", &json!({ "steps": [{ "action": "waitFor" }] })).is_err());
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "action": "click", "ref": "e1", "submit": true })
+            )
+            .is_err()
+        );
         // 脚本 await 总量超过 600s 预算：执行前拒绝。
         let steps: Vec<Value> = (0..8)
             .map(|_| json!({ "action": "await", "timeout": 300 }))
@@ -1235,6 +1341,24 @@ mod tests {
         assert!(
             validate_arguments(
                 "batch",
+                &json!({
+                    "tool": "open", "urls": ["https://a.example/"], "args": { "replace": true }
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "open", "urls": ["https://a.example/"], "args": { "reuse": "session" }
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
                 &json!({ "tool": "read", "urls": ["file:///etc/passwd"] })
             )
             .is_err()
@@ -1284,10 +1408,22 @@ mod tests {
             timeout_for("wait", &json!({ "time": 0 })),
             Duration::from_secs(15)
         );
-        assert_eq!(timeout_for("act", &json!({})), ACT_TIMEOUT);
+        assert_eq!(
+            timeout_for("act", &json!({})),
+            ACT_TIMEOUT + Duration::from_secs(3)
+        );
         assert_eq!(
             timeout_for("act", &json!({ "waitFor": { "timeout": 10 } })),
-            ACT_TIMEOUT + Duration::from_secs(10)
+            ACT_TIMEOUT + Duration::from_secs(13)
+        );
+        assert_eq!(timeout_for("open", &json!({})), Duration::from_secs(30));
+        assert_eq!(
+            timeout_for("open", &json!({ "waitTimeout": 45 })),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            timeout_for("open", &json!({ "wait": "none", "waitTimeout": 60 })),
+            DEFAULT_TIMEOUT
         );
         assert_eq!(timeout_for("js", &json!({})), LONG_TIMEOUT);
         assert_eq!(timeout_for("shot", &json!({})), LONG_TIMEOUT);
@@ -1352,11 +1488,12 @@ mod tests {
                 &json!({
                     "steps": [
                         { "action": "click", "ref": "e1" },
-                        { "action": "await", "timeout": 10 }
+                        { "action": "await", "timeout": 10 },
+                        { "action": "waitFor", "url": "api", "timeout": 5 }
                     ]
                 })
             ),
-            ACT_TIMEOUT + Duration::from_secs(10)
+            ACT_TIMEOUT + Duration::from_secs(24)
         );
     }
     /// 错误码表是 AI 自我纠正的依据；新增 `fail('code'` 时文档必须同步。

@@ -28,20 +28,20 @@
 
 ```bash
 cd rust
-cargo test                          # 62 项：参数校验、超时预算、脚本解析、路由、落盘
+cargo test                          # 65 项：参数校验、超时预算、脚本解析、路由、落盘
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（28 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（53 项）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 
 `verify.py` 只用标准库，不引入 Node；它启动本机 fixture HTTP 服务，
 用真实 `ema2` CLI 驱动真实 Edge 打开它，覆盖
-open / snapshot / act（按钮+链接）/ read（md 链接·表格·列表）/ js / wait /
-observe console·network / shot / files upload / batch / 负例错误码，
+open / snapshot / act（按钮+链接+SPA+scroll）/ read（md 链接·表格·列表·shadow DOM）/ js /
+wait / observe console·network / shot / files upload（含 5 MiB 边界）/ batch / 负例错误码，
 并静态断言 `extension/background.js` 的每个 `fail('code'` 都写进了 `docs/TOOLS.md`。
 
 ## 真机验收
@@ -114,12 +114,16 @@ bin\ema2.exe status          # extension=connected
 | 21 | `ema2 batch read --urls "u1,u2"` | 两块，`---` 分隔，各自 `tab=` |
 | 22 | `ema2 batch open --urls "u1,u2"` | 并行开页，各自 `id=` |
 | 23 | `ema2 act --steps 'fill e2 "a"; type e2 "b"'` | 两步；type 追加 |
-| 24 | `ema2 act --script flow.ema2` | 逐行执行，`waitFor` 挂在整体 |
+| 24 | `ema2 act --script flow.ema2` | 逐行执行，`waitFor` 在所在行执行；失败保留已完成 steps |
 | 25 | `ema2 open url --replace` / `--reuse session` / `--tab ID` | `reuse=replace/session/tabId` |
-| 25a | `ema2 open url --timeout 30` | 慢页面也能等到文档接位 |
+| 25a | `ema2 open url --timeout 30` | 慢页面也能等到文档接位；超时输出 `load=pending` |
 | 26 | `ema2 tabs close --session` | 只关本会话 `open`/`tabs new` 的标签 |
 | 27 | `ema2 init` | `path=... action=created`；重复执行 `action=updated`，标记只有一份 |
 | 28 | `ema2 server stop` → `ema2 status` | `relay=stopped`；status 退出 2 |
+| 29 | `ema2 act scroll up/down N` | 方向正确，`down N` 约 N 屏 |
+| 30 | `ema2 read` on shadow DOM | 能看到 open shadow root 正文 |
+| 31 | `ema2 files upload` 5 MiB | 不再被 2MB axum 默认上限截断 |
+| 32 | 运行时 `SyntaxError` | `js_exception` 且副作用只执行一次 |
 
 错误路径：
 

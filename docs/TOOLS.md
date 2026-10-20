@@ -65,6 +65,8 @@ total=2 shown=2 next=none
 | `extension_not_connected` | server 在，扩展没连 | 查扩展 popup 端口是否 7744 |
 | `port_in_use` | 7744 被占用 | `ema2 server stop` 或换 `--port` |
 | `relay_start_failed` | daemon 没起来 | 看提示里的 `%TEMP%\ema2.log` |
+| `relay_error` | 已连上中继，但请求中途失败/响应不合法 | 检查 `ema2 status`；不要误以为 daemon 没起 |
+| `payload_too_large` | 请求体超过中继上限（含上传） | 减小上传文件或拆分调用 |
 | `shutdown_failed` | server 卡死且 PID 兜底失败 | 手动结束进程后重启 |
 | `extension_error` | 中继连不上扩展（兜底） | `ema2 status` |
 | `invalid_argument` | 参数不合法（含脚本内层参数） | 看本节参数说明 |
@@ -84,6 +86,7 @@ total=2 shown=2 next=none
 | `missing_target` | 缺 ref/selector/target | 三选一 |
 | `missing_key` | `press` 缺 key | 传键名 |
 | `too_many_files` | 上传文件超过 20 个 | 分批传 |
+| `page_changed` | 读取过程中页面已导航 | 等页面稳定后重试 |
 | `too_many_steps` | act 步数超过 20 | 拆成多次调用 |
 | `no_active_tab` | 没有活动标签页 | 先 `open` 或 `tabs new` |
 | `tab_not_found` | 标签页不存在/已关闭 | `tabs list` |
@@ -102,6 +105,9 @@ total=2 shown=2 next=none
 | `no_pending_action` | `await` 没有可等待的 act 上下文 | 先 `act`；或改用 `wait text/selector/time/idle` |
 | `wait_timeout` | `wait`/`await` 条件超时 | 检查条件或提高 timeout |
 | `response_timeout` | `act waitFor` 未等到响应 | 看 `observation_gap`，或调大 timeout |
+| `screenshot_too_large` / `screenshot_decode_failed` / `screenshot_empty` / `screenshot_not_saved` | 截图编码/落盘失败 | 检查输出目录、窗口可见性，或改用 `--inline` |
+| `har_not_saved` | HAR 落盘失败 | 检查 `--har` 路径与 `EMA2_OUTPUT_DIR` |
+| `result_too_large` | 扩展返回超过 WS 消息上限 | 用 budget/cursor，或不要 `shot --inline` |
 | `tab_not_active` | `shot` 目标不是活动 tab | 先 `tabs activate`；截图只截当前活动页 |
 | `tab_changed` | 截图过程中目标 document 变化 | 页面稳定后重试 |
 | `capture_failed` / `capture_empty` | `captureVisibleTab` 失败/空图 | 让窗口可见并保持前台 |
@@ -169,6 +175,7 @@ ema2 init
 
 ```bash
 ema2 tabs                          # list
+ema2 tabs list [--budget N] [--cursor N]
 ema2 tabs current
 ema2 tabs new <url> [--active]
 ema2 tabs close [<id>...]          # 或用 --session
@@ -177,7 +184,8 @@ ema2 tabs activate <id>
 ```
 
 - `list` → TSV：`id<TAB>*或-<TAB>title<TAB>url` + `total/shown/next`；
-  本会话由 `ema2 open` 打开的标签再追加一行 `session_tabs=<id,id>`。
+  `--budget`/`--cursor` 对标签行分页（默认 4000 字符），`next` 是下一条的行号。
+  本会话由 `ema2 open` 打开的标签再追加一行 `session_tabs=<id,id>`（不计入 total）。
 - `current` → `id/window/os/title/url`。
 - `new` → `id/url/window`（登记进会话）；`--active` 顺带激活。
 - `activate` → `active=<id> focused=1|0`：除了切 tab，还会 `chrome.windows.update{focused:true}`
@@ -187,6 +195,7 @@ ema2 tabs activate <id>
   - `--session` → 关掉本会话由 `open`/`tabs new` 打开的标签，返回 `closed=..|none` + `count=`。
 - 会话登记在 `chrome.storage.session`：service worker 被回收后仍在，浏览器重启即清空；
   用 `open --tab ID` / `--replace` 导航的用户标签**不**计入会话，`--session` 不会关掉它们。
+  动作打开但无法关联 opener 的标签（例如 `noopener`）只用于定位结果，不自动进 session，避免误关用户手动开的标签。
 
 ## open
 
@@ -206,7 +215,10 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 - `status=` 来自 `PerformanceNavigationTiming.responseStatus` 的真实主文档状态：
   `status=404` 这类错误页会额外给 `hint=http 404 ...`；`--wait none` 时是 `status=pending`。
 - 返回前会确认**目标文档已经接位**（`location.href` + `readyState` 双条件），
-  所以 `url`/`title` 一定属于新页面；重定向到别的地址同样算到达。
+  正常返回时 `url`/`title` 属于新页面；重定向到别的地址同样算到达。若超时则明确输出
+  `load=pending`，不要把此时的旧标题当成新页面。
+- `--timeout` 超时不再被静默忽略：会输出 `load=pending timeout=Ns` 和 hint；中继预算也跟着
+  `waitTimeout` 走（默认 15s，最大 60s），不会再用固定 30s 提前掐断。
 
 ## read
 
@@ -221,6 +233,7 @@ ema2 read [--tab ID] [--mode md|text|html] [--selector X] [--no-main] [--budget 
 - `text`/`md` 会跳过 `script/style/noscript/template/textarea/input/select/option`、
   nav/header/footer/aside/form 等页面壳，以及 `display:none`/`visibility:hidden`/
   `content-visibility` 的隐藏元素；`html` 仍是原始 HTML。
+- 正文遍历会进入 open shadow root（Web Component）；closed shadow root 仍不可见。
 - Markdown 按 `childNodes` 遍历，根节点直接文本、p/h1/pre、文本+块混排都不会漏字或重复。
 - `md` 是**有损**渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对URL)`，
   行内代码与 `strong/em` 保留；样式、合并单元格、脚本生成内容会丢，不要拿它当可回写的源文件。
@@ -265,18 +278,19 @@ ema2 act --script run.ema2                    # 脚本文件
 | 动作 | 位置参数 | flag |
 |---|---|---|
 | click | `[ref]` | `--selector` / `--target` |
-| type | `[ref] <text>` | `--selector` / `--target`；追加到现有值 |
+| type | `[ref] <text>` | `--selector` / `--target`；追加到现有值；`--submit` 提交所在 form |
 | fill | `[ref] <text>` | 同上；覆盖整个值 |
 | select | `[ref] <value>` | 同上 |
 | press | `[ref] <key>` | 同上 |
 | hover | `[ref]` | 同上 |
 | scroll | `down\|up <n>` | `--delta-y N` |
-| submit | `[ref]` | `--submit` |
+| submit | `[ref]` | — |
 | back/forward/reload | — | `--tab ID` |
 
 - 查找、控件校验、执行和结果检查在同一次页面注入内完成；目标被动态移除不会假成功。
 - **隐式 settle**：点击链接/提交表单/back/forward/reload 后最多等 3s，普通按钮最多 800ms，
-  其他动作不等待；页面提前稳定就提前返回。settle 超时**不算动作失败**，退出码仍为 0。
+  其他动作不等待；页面提前稳定就提前返回。SPA 链接只改 DOM 时约 1s 后按 `nav=none` 结算，
+  不再拖满 3s。settle 超时**不算动作失败**，退出码仍为 0。
 - settle 结果会带 `settle=done|pending`、`expect=nav|page|none`、`ms=`；
   pending 时还会给 `next_url=` 和 `hint=... ema2 await 10s ...`。
 - 动作打开新标签时会返回 `new_tab=<id>`，并自动登记进会话；`tabs close --session` 会清掉它。
@@ -285,8 +299,8 @@ ema2 act --script run.ema2                    # 脚本文件
 - `click` 会补齐指针事件序列（`pointerover/pointerdown/mousedown` → 聚焦 → `pointerup/mouseup`），
   最后用原生 `el.click()` 触发一次激活；靠 `focusin`/`pointerdown` 出浮层的密码管理器能看到这次点击。
   事件是合成的（`isTrusted=false`），校验 `isTrusted` 的站点仍会忽略。
-- 点了 `<a>` 但 URL/标签都没变时只对链接安全重试一次，输出 `retried=1`；
-  仍没导航则额外给 `nav=none` + hint（按钮不重试，避免提交/点赞执行两次）。
+- 可导航 `<a>` 点击后**完全没有变化**才安全重试一次，输出 `retried=1`；
+  DOM/标题已经变化（SPA handler）时不重试，直接 `nav=none`；按钮不重试，避免提交/点赞执行两次。
 - `type`/`fill` 写值前会发 `beforeinput`；页面 cancel 掉它时返回 `input_prevented`，
   说明该控件自己接管输入，改用 `js` 或逐键 `press`。
 - `press` 有定位时先聚焦目标再发键；无定位时使用当前焦点。键名支持组合写法 `Control+Shift+L`、`Meta+K`，
@@ -297,9 +311,12 @@ ema2 act --script run.ema2                    # 脚本文件
   输入法候选、右键菜单扩展因此能看到这次点击。事件是合成的（`isTrusted=false`），
   校验 `event.isTrusted` 的站点仍会忽略。
 - 目标未渲染时自动重试 3 次（约 1s）；`stale_ref` 不重试。
+- 位置参数必须完整：`type e15 hello world` 会报 `invalid_argument`，不会静默只输入 `hello`；含空格请加引号。
 - `waitFor`：动作后等匹配响应，命中回 `response=<status> <method> <path> <ms>`；
   跨导航时自动从新文档起点匹配；hook 安装前的历史请求只给 `observation_gap=status_unavailable`。
-  单步用 `ema2 act click e12 --wait-for "url=api/save status=200 timeout=5s"`，批量见脚本语法。
+  单步用 `ema2 act click e12 --wait-for "url=api/save status=200 timeout=5s"`（动作后等待）。
+  脚本里的 `waitFor` 是**独立步骤**，在它所在行执行；不再挪到整次调用末尾。
+  `waitFor` 失败时已经执行过的 `stepN` 会保留在错误输出下面，避免 AI 重试整条脚本。
 
 ### act 脚本语法（`.ema2`）
 
@@ -321,7 +338,7 @@ forward
 reload
 await 10s
 
-# waitFor 独立成行，挂在上一动作后
+# waitFor 是独立步骤，在所在行执行
 click e12
 waitFor url=api/save status=200 timeout=5s
 
@@ -340,7 +357,7 @@ click e30
 1. 首个 token 是 11 个动作之一，或脚本专用的 `await`。
 2. `ref` 裸写；`selector=` / `target=` 是命名参数（与裸写互斥）。
 3. 含空格的值用双引号包裹，引号内支持 `\"` 转义。
-4. `waitFor` 是独立行，挂在上一动作后；`timeout=` 接受 `500ms` / `5s`。
+4. `waitFor` 是独立步骤，在所在行执行（通常放在触发请求的动作之后）；`timeout=` 接受 `500ms` / `5s`。
 5. `await 10s` 等上一个动作的导航/页面稳定；如果上一步 `settle=pending` 且下一步不是 `await`，脚本会停止而不是在旧页面继续执行。
 
 最多 20 步，可跨导航；返回每步结果 + `settle/expect/next_url/new_tab/changed/url/title/new/console_errors`。
@@ -396,8 +413,10 @@ ema2 js --file script.js [...]
 
 在页面主世界执行（debugger，`awaitPromise`）。字符串原样返回，其余值紧凑 JSON。
 
-- **既可传表达式也可传语句体**：先按表达式执行；若报语法错误，再按 async 函数体执行一次，
-  因此顶层 `return`、`await`、`const a = 1; return a` 都能用。函数体没写 `return` 时返回 `undefined` 并提示 `note=ran as an async function body`。
+- **既可传表达式也可传语句体**：先用 `Runtime.compileScript` 做 compile-only 探测；
+  表达式能编译就只执行一次，否则按 async 函数体执行一次。因此顶层 `return`、`await`、
+  `const a = 1; return a` 都能用；运行时抛出的 `SyntaxError` 不会重跑。
+  函数体没写 `return` 时返回 `undefined` 并提示 `note=ran as an async function body`。
 - 错误 `hint` 区分两类：`syntax error: ...` 与 `runtime error: ...`。除语法错误外的异常不会重跑，避免副作用执行两次。
 - `debugger.attach` 被拒时先按 page target 的 `targetId` 重挂；仍失败则退到 MAIN world 注入，
   输出末尾多一行 `via=scripting`。降级路径的 `eval` 受页面 CSP 限制，严格 CSP 站点会返回
@@ -413,7 +432,8 @@ ema2 observe console [--tab ID] [--since SEQ] [--level log|warn|error] [--filter
 ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter RE] [--bodies=false] [--har PATH]
 ```
 
-- console：增量日志；首次安装 hook（`open`/`act` 也会自动装）。
+- console：增量日志；首次安装 hook（`open`/`act` 也会自动装）。`--wait` 会先等待再读取；
+  `--har` 只适用于 network（console 传 `--har` 会报 `invalid_argument`）。
 - network：hook `fetch`/`XMLHttpRequest`，真实 `status` + **受限**响应预览。
   - 预览在后台读取 `response.clone()`，最多 8KB/1.5s，不阻塞页面；事件流/二进制跳过。
   - `--bodies=false` 真正关闭新响应的 body clone/读取。
@@ -429,18 +449,14 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
 
 ## files
 
-上传走**页面侧 DataTransfer**：CLI 读文件字节随请求下发，扩展在页面里构造 `File`
-再赋给 `input.files`，因此不依赖 debugger（别的扩展占住 tab 时也能用）。
-单次 ≤20 个文件、载荷 ≤5 MiB；下载目录仍固定报 `download_dir_unsupported`（Edge 限制）。
-
-## files
-
 ```bash
 ema2 files upload <path...> [--ref R | --selector S | --target T] [--tab ID]
 ema2 files download-dir
 ```
 
-- `upload`：CDP `DOM.setFileInputFiles`；Windows 必须 `C:/...` 绝对路径（≤20 个）。
+- `upload` 走**页面侧 DataTransfer**：CLI 读文件字节随请求下发，扩展在页面里构造 `File`
+  再赋给 `input.files`，因此不依赖 debugger（别的扩展占住 tab 时也能用）。
+  单次 ≤20 个文件、原始载荷 ≤5 MiB；Windows 路径必须是 `C:/...` 绝对路径。
 - `download-dir`：只为返回明确错误——Edge 不允许扩展改下载目录，
   固定返回 `download_dir_unsupported`；请在 `edge://settings/downloads` 手动设置。
 
@@ -468,9 +484,10 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
 - `--tab-ids`：对已有标签并发执行目标工具，每块头部 `tab=<id>`。
 - `--urls`：先为每个 URL 打开新标签，再在该标签上执行目标工具，每块头部 `url=<url>` + `tab=<id>`；
   `tool=open` 时只打开（并行开多页）。**`open` + `read` 因此一次命令完成**，不再串行两次。
+  `--urls` 模式始终新开标签，内层 `--replace`/`--reuse`/`tabId` 会被拒绝。
 - `--tab-ids` 与 `--urls` 互斥；`tool=open` 只能配 `--urls`。
 - 工具 flag 会与每个目标合并后复用子命令 validator：`ema2 batch wait --time 3600 --tab-ids 1,2`
-  会在执行前拒绝；`--urls` 模式下的 `--wait`/`--replace`/`--reuse` 属于 open，不会被当成目标工具参数。
+  会在执行前拒绝；urls 模式下 `--wait` 可以传给 open，`--replace`/`--reuse` 会被拒绝。
 - 预算按 `ceil(目标数/并发) × 单次最长耗时 + open 成本 + 15s`；js 因全局 debugger 串行按有效并发 1 计算。
 - 估算超过 600s 时在执行前报 `invalid_argument`，请减少目标、提高并发或拆分 batch。
 

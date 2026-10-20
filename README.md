@@ -201,7 +201,7 @@ cargo fmt --check
 一键验收：
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（28 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（53 项）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 

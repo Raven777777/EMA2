@@ -53,6 +53,7 @@ FIXTURE_HOME = """<!doctype html>
 <pre id="code">const answer = 42;</pre>
 <button id="btn" type="button">change</button>
 <input id="text" name="q" type="text" placeholder="query">
+<input id="num" type="number" name="num">
 <input id="file" type="file" name="upload">
 <div id="out">idle</div>
 <script>
@@ -62,6 +63,47 @@ FIXTURE_HOME = """<!doctype html>
   });
 </script>
 </body></html>
+"""
+
+FIXTURE_TALL = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture tall</title>
+<style>body{margin:0;font:16px sans-serif}.spacer{height:3000px}</style></head>
+<body><h1>Tall</h1><div class="spacer" id="top">top</div>
+<button id="tall-btn" type="button">tall button</button>
+<div class="spacer" id="bottom">bottom</div></body></html>
+"""
+
+FIXTURE_SHADOW = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture shadow</title></head>
+<body><h1>Shadow</h1><div id="host"></div><p>light paragraph</p>
+<script>
+const root = document.getElementById('host').attachShadow({ mode: 'open' });
+root.innerHTML = '<p id="shadow-text">shadow paragraph unique-text</p><button>shadow button</button>';
+</script></body></html>
+"""
+
+FIXTURE_SPA = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture spa</title></head>
+<body><h1>SPA</h1><a id="spa" href="/second.html">spa link</a><div id="out">idle</div>
+<script>
+document.getElementById('spa').addEventListener('click', function (event) {
+  event.preventDefault();
+  document.getElementById('out').textContent = 'spa clicked';
+});
+</script></body></html>
+"""
+
+FIXTURE_WAIT = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture wait</title></head>
+<body><h1>Wait</h1><button id="fetch" type="button">fetch</button>
+<a id="go" href="/second.html">go</a><div id="out">idle</div>
+<script>
+document.getElementById('fetch').addEventListener('click', function () {
+  setTimeout(function () {
+    fetch('/api').then(function () { document.getElementById('out').textContent = 'fetched'; });
+  }, 200);
+});
+</script></body></html>
 """
 
 FIXTURE_SECOND = """<!doctype html>
@@ -90,6 +132,17 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._send(FIXTURE_SECOND.encode())
         elif path == "/api":
             self._send(json.dumps({"ok": True, "path": path}).encode(), "application/json")
+        elif path == "/tall.html":
+            self._send(FIXTURE_TALL.encode())
+        elif path == "/shadow.html":
+            self._send(FIXTURE_SHADOW.encode())
+        elif path == "/spa.html":
+            self._send(FIXTURE_SPA.encode())
+        elif path == "/wait.html":
+            self._send(FIXTURE_WAIT.encode())
+        elif path == "/slow":
+            time.sleep(3)
+            self._send(FIXTURE_HOME.encode())
         else:
             self.send_error(404)
 
@@ -279,6 +332,57 @@ def main() -> int:
         runner.check("link changed url", "second.html" in nav, nav)
         runner.run("open", f"{base}/")
 
+        status = runner.run("status")
+        runner.check(
+            "status tabs count stays numeric",
+            re.search(r"^tabs=\d+ active_tab=", status.stdout or "", re.M) is not None,
+            (status.stdout or "") + (status.stderr or ""),
+        )
+
+        tab_page = runner.run("tabs", "list", "--budget", "200")
+        tab_page_out = (tab_page.stdout or "") + (tab_page.stderr or "")
+        runner.check(
+            "tabs list supports budget paging",
+            tab_page.returncode == 0 and "total=" in tab_page_out and "next=" in tab_page_out,
+            tab_page_out[:800],
+        )
+
+        runner.expect_error(
+            "fill input[type=number] reports normalization",
+            runner.run("act", "fill", "--selector", "#num", "abc"),
+            "value_rejected",
+            4,
+        )
+        runner.expect_ok(
+            "fill input[type=number] writes valid value",
+            runner.run("act", "fill", "--selector", "#num", "42"),
+            "ok=fill",
+        )
+        num_value = runner.run("js", "return document.getElementById('num').value")
+        runner.check("number field value is 42", "42" in (num_value.stdout or ""), (num_value.stdout or "") + (num_value.stderr or ""))
+
+        # 运行时 SyntaxError 不能被当成编译错误重跑；副作用只能发生一次。
+        runner.expect_error(
+            "js runtime SyntaxError is not re-executed",
+            runner.run("js", "window.__ema2Side = (window.__ema2Side || 0) + 1; JSON.parse('{');"),
+            "js_exception",
+            4,
+        )
+        side = runner.run("js", "return window.__ema2Side || 0")
+        runner.check("js side effect ran once", "1" in (side.stdout or ""), (side.stdout or "") + (side.stderr or ""))
+
+        wait_fail = runner.run(
+            "act", "click", "--selector", "#btn",
+            "--wait-for", "url=does-not-exist status=200 timeout=1s",
+        )
+        wait_output = (wait_fail.stdout or "") + (wait_fail.stderr or "")
+        runner.check(
+            "waitFor failure keeps completed steps",
+            wait_fail.returncode == 4 and "error=response_timeout" in wait_output
+            and "step1 ok=click" in wait_output,
+            wait_output[:1200],
+        )
+
         md = runner.expect_ok("read md", runner.run("read", "--mode", "md", "--no-main"), "Fixture Home")
         runner.check("md keeps links", re.search(r"\]\(http[^)]+second\.html\)", md) is not None, md[:600])
         runner.check("md keeps table", "| key | value |" in md and "| alpha | 1 |" in md, md[:600])
@@ -293,6 +397,85 @@ def main() -> int:
         runner.expect_error("js throw is js_exception", runner.run("js", "throw new Error('boom')"), "js_exception", 4)
         runner.expect_ok("wait selector", runner.run("wait", "selector", "#btn"), "ok=selector=#btn")
         runner.expect_error("read missing selector", runner.run("read", "--selector", "#nope"), "selector_not_found", 4)
+
+        # shadow DOM 正文必须能被 read 看到。
+        runner.run("open", f"{base}/shadow.html")
+        shadow_read = runner.expect_ok(
+            "read shadow DOM text",
+            runner.run("read", "--no-main", "--mode", "text"),
+            "shadow paragraph unique-text",
+        )
+        shadow_snapshot = runner.expect_ok(
+            "snapshot shadow DOM controls",
+            runner.run("snapshot"),
+            "shadow button",
+        )
+        runner.check("shadow read keeps light DOM", "light paragraph" in shadow_read, shadow_read[:600])
+        runner.check("shadow snapshot has refs", "refs=" in shadow_snapshot, shadow_snapshot[:600])
+
+        # SPA 链接只改 DOM 不导航：应 settle=done + nav=none，而不是 pending。
+        runner.run("open", f"{base}/spa.html")
+        spa = runner.run("act", "click", "--selector", "#spa")
+        spa_out = (spa.stdout or "") + (spa.stderr or "")
+        runner.check(
+            "SPA anchor settles without false pending",
+            spa.returncode == 0 and "settle=done" in spa_out and "nav=none" in spa_out and "settle=pending" not in spa_out,
+            spa_out[:1200],
+        )
+        spa_text = runner.run("js", "return document.getElementById('out').textContent")
+        runner.check("SPA handler ran", "spa clicked" in (spa_text.stdout or ""), (spa_text.stdout or "") + (spa_text.stderr or ""))
+
+        # 多步脚本里的 waitFor 必须在它所在行执行，而不是等所有步骤结束。
+        wait_script = tmp / "wait.ema2"
+        wait_script.write_text(
+            'click selector="#fetch"\nwaitFor url=api status=200 timeout=3s\nclick selector="#go"\n',
+            encoding="utf-8",
+        )
+        runner.run("open", f"{base}/wait.html")
+        wait_act = runner.run("act", "--script", str(wait_script))
+        wait_act_out = (wait_act.stdout or "") + (wait_act.stderr or "")
+        runner.check(
+            "multi-step waitFor runs in place",
+            wait_act.returncode == 0 and "response=200" in wait_act_out and "url=" in wait_act_out and "second.html" in wait_act_out,
+            wait_act_out[:1600],
+        )
+
+        # scroll down/up 必须遵守方向和屏数。
+        runner.run("open", f"{base}/tall.html")
+        runner.run("js", "scrollTo(0, 0)")
+        runner.expect_ok("scroll down", runner.run("act", "scroll", "down", "2"), "scroll=")
+        down_state = runner.run("js", "return JSON.stringify({y: scrollY, h: innerHeight})")
+        try:
+            down = json.loads((down_state.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            down = {"y": 0, "h": 1}
+        runner.check(
+            "scroll down moves about two screens",
+            down["y"] > down["h"] * 1.2,
+            (down_state.stdout or "") + (down_state.stderr or ""),
+        )
+        runner.expect_ok("scroll up", runner.run("act", "scroll", "up", "1"), "scroll=")
+        up_state = runner.run("js", "return JSON.stringify({y: scrollY, h: innerHeight})")
+        try:
+            up = json.loads((up_state.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            up = {"y": down["y"], "h": down["h"]}
+        runner.check(
+            "scroll up decreases scrollY",
+            up["y"] < down["y"],
+            (up_state.stdout or "") + (up_state.stderr or ""),
+        )
+
+        # open --timeout 必须按 waitTimeout 生效，并明确报告 pending。
+        slow_start = time.time()
+        slow = runner.run("open", f"{base}/slow", "--timeout", "1", timeout=30)
+        slow_elapsed = time.time() - slow_start
+        slow_out = (slow.stdout or "") + (slow.stderr or "")
+        runner.check(
+            "open timeout reports load=pending",
+            slow.returncode == 0 and "load=pending" in slow_out and slow_elapsed < 12,
+            f"elapsed={slow_elapsed:.1f}s\n{slow_out[:1200]}",
+        )
 
         runner.run("js", "console.error('verify-boom')")
         console = runner.run("observe", "console", "--level", "error")
@@ -316,6 +499,14 @@ def main() -> int:
         file_state = runner.run("js", "const f = document.getElementById('file').files[0]; return f ? f.name + ':' + f.size : 'none'")
         runner.check("upload reaches input", "upload.txt" in (file_state.stdout or ""), (file_state.stdout or "") + (file_state.stderr or "")[:300])
 
+        big = tmp / "big.bin"
+        big.write_bytes(b"x" * (5 * 1024 * 1024))
+        runner.run("open", f"{base}/")
+        big_upload = runner.run("files", "upload", str(big).replace("\\", "/"), "--selector", "#file", timeout=120)
+        runner.expect_ok("files upload at 5 MiB", big_upload, "uploaded=1")
+        big_state = runner.run("js", "const f = document.getElementById('file').files[0]; return f ? f.size : -1")
+        runner.check("large upload reaches input", str(5 * 1024 * 1024) in (big_state.stdout or ""), (big_state.stdout or "") + (big_state.stderr or "")[:300])
+
         batch = runner.run("batch", "read", "--urls", f"{base}/,{base}/second.html", "--concurrency", "2", timeout=120)
         runner.check(
             "batch reads both tabs",
@@ -326,6 +517,18 @@ def main() -> int:
         runner.expect_error("unknown act flag", runner.run("act", "click", "--at", "10,20"), "invalid_argument", 1)
         runner.expect_error("non-ref positional", runner.run("act", "click", "not-a-ref"), "invalid_argument", 1)
         runner.expect_error("stale ref", runner.run("act", "click", "e999@d999"), "stale_ref", 4)
+        runner.expect_error(
+            "act rejects unquoted extra text",
+            runner.run("act", "type", "e1", "hello", "world"),
+            "invalid_argument",
+            1,
+        )
+        runner.expect_error(
+            "batch urls rejects replace",
+            runner.run("batch", "open", "--urls", f"{base}/", "--replace"),
+            "invalid_argument",
+            1,
+        )
 
         closed = runner.run("tabs", "close", "--session")
         runner.check("tabs close --session", closed.returncode == 0 and "closed=" in (closed.stdout or ""), (closed.stdout or "")[:300])

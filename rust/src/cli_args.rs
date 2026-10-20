@@ -227,7 +227,12 @@ pub struct TabsArgs {
 #[derive(Subcommand)]
 pub enum TabsCommand {
     /// 列出标签页（默认动作）
-    List,
+    List {
+        #[arg(long)]
+        budget: Option<u64>,
+        #[arg(long)]
+        cursor: Option<u64>,
+    },
     /// 当前活动标签页
     Current,
     /// 新建标签页
@@ -303,15 +308,21 @@ pub fn parse_duration_secs(input: &str) -> Result<f64, String> {
 // ---------------------------------------------------------------- 各命令 → ToolCall
 
 pub fn build_tabs(args: &TabsArgs) -> Result<ToolCall, String> {
-    let arguments = match args.cmd.as_ref().unwrap_or(&TabsCommand::List) {
-        TabsCommand::List => json!({ "action": "list" }),
-        TabsCommand::Current => json!({ "action": "current" }),
-        TabsCommand::New { url, active } => json!({
+    let arguments = match args.cmd.as_ref() {
+        None => json!({ "action": "list" }),
+        Some(TabsCommand::List { budget, cursor }) => {
+            let mut arguments = json!({ "action": "list" });
+            set_opt(&mut arguments, "budget", *budget);
+            set_opt(&mut arguments, "cursor", *cursor);
+            arguments
+        }
+        Some(TabsCommand::Current) => json!({ "action": "current" }),
+        Some(TabsCommand::New { url, active }) => json!({
             "action": "new",
             "url": url,
             "active": *active,
         }),
-        TabsCommand::Close { ids, session } => {
+        Some(TabsCommand::Close { ids, session }) => {
             if *session {
                 if !ids.is_empty() {
                     return Err("tabs close: use either ids or --session, not both".into());
@@ -325,7 +336,7 @@ pub fn build_tabs(args: &TabsArgs) -> Result<ToolCall, String> {
                 json!({ "action": "close", "tabIds": ids })
             }
         }
-        TabsCommand::Activate { id } => json!({ "action": "activate", "tabId": id }),
+        Some(TabsCommand::Activate { id }) => json!({ "action": "activate", "tabId": id }),
     };
     Ok(ToolCall::new("tabs", arguments))
 }
@@ -982,10 +993,6 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
     let mut arguments = json!({});
     set_opt(&mut arguments, "tabId", tab);
 
-    if let Some(wait_for) = &wait_for {
-        arguments["waitFor"] = parse_wait_for(wait_for)?;
-    }
-
     if let Some(source) = steps_inline {
         // 多步模式：位置参数不该再出现（避免两套意图混用）。
         if !positional.is_empty() {
@@ -995,20 +1002,25 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             ));
         }
         let parsed = parse_act_script(&source)?;
-        if let Some(script_wait) = parsed.get("waitFor") {
-            if wait_for.is_some() {
+        let mut steps = parsed["steps"].as_array().cloned().unwrap_or_default();
+        if let Some(wait_for) = &wait_for {
+            // 脚本里已经有 waitFor 时不再追加第二个；没有则挂在整次调用末尾。
+            if steps
+                .iter()
+                .any(|step| step.get("action").and_then(Value::as_str) == Some("waitFor"))
+            {
                 return Err(
                     "act: only one waitFor per call (--wait-for or a script waitFor line)".into(),
                 );
             }
-            arguments["waitFor"] = script_wait.clone();
+            let mut step = parse_wait_for(wait_for)?;
+            step["action"] = json!("waitFor");
+            steps.push(step);
         }
-        let steps = parsed["steps"].clone();
-        let count = steps.as_array().map(Vec::len).unwrap_or(0);
-        if count == 0 || count > 20 {
+        if steps.is_empty() || steps.len() > 20 {
             return Err("act: script must contain 1..20 steps".into());
         }
-        arguments["steps"] = steps;
+        arguments["steps"] = json!(steps);
     } else {
         let action = positional
             .first()
@@ -1016,7 +1028,16 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
         if !ACT_ACTIONS.contains(&action.as_str()) {
             return Err(format!("act: unknown action {action:?}"));
         }
+        if submit_flag && action != "type" {
+            return Err(
+                "act: --submit is only supported by type; use action=submit or click the submit button"
+                    .into(),
+            );
+        }
         let rest: Vec<String> = positional[1..].to_vec();
+        if let Some(wait_for) = &wait_for {
+            arguments["waitFor"] = parse_wait_for(wait_for)?;
+        }
         arguments["action"] = json!(action);
         set_opt(&mut arguments, "selector", selector.clone());
         set_opt(&mut arguments, "target", target.clone());
@@ -1031,6 +1052,12 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
         }
         match action.as_str() {
             "click" | "hover" | "submit" => {
+                if rest.len() > 1 {
+                    return Err(format!(
+                        "act {action}: unexpected extra argument {:?}; quote values with spaces",
+                        rest[1]
+                    ));
+                }
                 if let Some(r#ref) = rest.first() {
                     check_ref_token(r#ref)?;
                     arguments["ref"] = json!(r#ref);
@@ -1039,14 +1066,20 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             "type" | "fill" | "select" => {
                 // 位置参数有两种形态：`[ref] <text>` 或（有 --selector/--target 时）`<text>`。
                 let located = selector.is_some() || target.is_some();
-                let (text, positional_ref) = if rest.len() >= 2 {
-                    (rest[1].clone(), Some(rest[0].clone()))
-                } else if rest.len() == 1 && located {
+                let (text, positional_ref) = if located {
+                    if rest.len() != 1 {
+                        return Err(format!(
+                            "act {action}: expected <text> with --selector/--target (quote values with spaces)"
+                        ));
+                    }
                     (rest[0].clone(), None)
                 } else {
-                    return Err(format!(
-                        "act {action}: missing text (act {action} [ref] <text>)"
-                    ));
+                    if rest.len() != 2 {
+                        return Err(format!(
+                            "act {action}: expected [ref] <text> (quote values with spaces)"
+                        ));
+                    }
+                    (rest[1].clone(), Some(rest[0].clone()))
                 };
                 if action == "fill" {
                     // 扩展的 fill 走 fields[]；CLI 保持 `fill e15 "hello"` 的行式形态。
@@ -1085,6 +1118,12 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             }
             "press" => {
                 // `press [ref] <key>` 或 `press [ref] --key <key>` 或 `press <key>`。
+                if rest.len() > 2 || (key.is_some() && rest.len() > 1) {
+                    return Err(
+                        "act press: too many arguments (use `press [ref] <key>` or `press [ref] --key <key>`)"
+                            .into(),
+                    );
+                }
                 let positional_ref = if rest.len() >= 2 || (key.is_some() && rest.len() == 1) {
                     Some(rest[0].clone())
                 } else {
@@ -1103,6 +1142,12 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             }
             "scroll" => {
                 // scroll down 3 → text="down 3"（扩展按屏数滚动）；--delta-y 走像素。
+                if rest.len() > 2 {
+                    return Err(
+                        "act scroll: too many arguments (use `scroll [down|up] [count]` or --delta-y)"
+                            .into(),
+                    );
+                }
                 let mut direction = rest.first().cloned();
                 if let Some(dir) = &direction {
                     if dir != "down" && dir != "up" {
@@ -1124,7 +1169,11 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                     arguments["text"] = json!(format!("{dir} {}", count as u64));
                 }
             }
-            "back" | "forward" | "reload" => {}
+            "back" | "forward" | "reload" => {
+                if !rest.is_empty() {
+                    return Err(format!("act {action}: takes no arguments"));
+                }
+            }
             _ => unreachable!("validated above"),
         }
     }
@@ -1171,10 +1220,9 @@ fn parse_wait_for(input: &str) -> Result<Value, String> {
 /// `.ema2` 脚本 / `--steps` 文本 → steps[] 数组。
 ///
 /// 语法：每行一条；空行与 `#` 注释忽略；含空格的值加双引号（支持 `\"` 转义）；
-/// `waitFor` 独立成行，挂在整体调用上（扩展的 waitFor 是 args 级语义）。
+/// `waitFor` 是独立步骤，保持它在脚本中的位置（不再挪到整次调用末尾）。
 pub fn parse_act_script(source: &str) -> Result<Value, String> {
     let mut steps = Vec::new();
-    let mut wait_for: Option<Value> = None;
     for (number, raw) in source.lines().enumerate() {
         if raw.trim().is_empty() || raw.trim_start().starts_with('#') {
             continue;
@@ -1190,17 +1238,10 @@ pub fn parse_act_script(source: &str) -> Result<Value, String> {
                 .first()
                 .ok_or_else(|| format!("script line {}: empty statement", number + 1))?;
             if action == "waitFor" {
-                let spec: Vec<String> = tokens[1..].to_vec();
-                let joined = spec.join(" ");
-                let parsed = parse_wait_for(&joined)
+                let mut parsed = parse_wait_for(&tokens[1..].join(" "))
                     .map_err(|error| format!("script line {}: {error}", number + 1))?;
-                if wait_for.is_some() {
-                    return Err(format!(
-                        "script line {}: only one waitFor per call is supported",
-                        number + 1
-                    ));
-                }
-                wait_for = Some(parsed);
+                parsed["action"] = json!("waitFor");
+                steps.push(parsed);
                 continue;
             }
             if action == "await" {
@@ -1232,37 +1273,54 @@ pub fn parse_act_script(source: &str) -> Result<Value, String> {
             }
             let mut step = json!({ "action": action });
             let mut rest: Vec<String> = tokens[1..].to_vec();
-            // 命名参数 selector=/target= 从 token 里摘出来。
-            rest.retain(|token| {
-                if let Some(value) = token.strip_prefix("selector=") {
+            // 只从位置参数开头摘 selector=/target=；文本值里的 `selector=` 仍然算文本。
+            while let Some(first) = rest.first() {
+                if let Some(value) = first.strip_prefix("selector=") {
                     step["selector"] = json!(value);
-                    return false;
+                    rest.remove(0);
+                    continue;
                 }
-                if let Some(value) = token.strip_prefix("target=") {
+                if let Some(value) = first.strip_prefix("target=") {
                     step["target"] = json!(value);
-                    return false;
+                    rest.remove(0);
+                    continue;
                 }
-                true
-            });
+                break;
+            }
+            let script_error = |message: String| format!("script line {}: {message}", number + 1);
             match action.as_str() {
                 "click" | "hover" | "submit" => {
+                    if rest.len() > 1 {
+                        return Err(script_error(format!(
+                            "{action}: unexpected extra argument {:?}; quote values with spaces",
+                            rest[1]
+                        )));
+                    }
                     if let Some(r#ref) = rest.first() {
+                        check_ref_token(r#ref).map_err(script_error)?;
                         step["ref"] = json!(r#ref);
                     }
                 }
                 "type" | "fill" | "select" => {
                     let located = step.get("selector").is_some() || step.get("target").is_some();
-                    let (text, positional_ref) = if rest.len() >= 2 {
-                        (rest[1].clone(), Some(rest[0].clone()))
-                    } else if rest.len() == 1 && located {
+                    let (text, positional_ref) = if located {
+                        if rest.len() != 1 {
+                            return Err(script_error(format!(
+                                "{action}: expected <text> with selector=/target= (quote values with spaces)"
+                            )));
+                        }
                         (rest[0].clone(), None)
                     } else {
-                        return Err(format!(
-                            "script line {}: {} needs a value",
-                            number + 1,
-                            action
-                        ));
+                        if rest.len() != 2 {
+                            return Err(script_error(format!(
+                                "{action}: expected [ref] <text> (quote values with spaces)"
+                            )));
+                        }
+                        (rest[1].clone(), Some(rest[0].clone()))
                     };
+                    if let Some(r#ref) = &positional_ref {
+                        check_ref_token(r#ref).map_err(script_error)?;
+                    }
                     if action == "fill" {
                         let mut field = json!({ "value": text });
                         if let Some(r#ref) = positional_ref {
@@ -1294,37 +1352,44 @@ pub fn parse_act_script(source: &str) -> Result<Value, String> {
                     }
                 }
                 "press" => {
+                    if rest.len() > 2 {
+                        return Err(script_error("press: too many arguments".into()));
+                    }
                     let key = rest
                         .get(1)
                         .or_else(|| rest.first())
                         .cloned()
-                        .ok_or_else(|| format!("script line {}: press needs a key", number + 1))?;
+                        .ok_or_else(|| script_error("press needs a key".into()))?;
                     step["key"] = json!(key);
                     if rest.len() >= 2 {
+                        check_ref_token(&rest[0]).map_err(script_error)?;
                         step["ref"] = json!(rest[0]);
                     }
                 }
                 "scroll" => {
+                    if rest.len() > 2 {
+                        return Err(script_error("scroll: too many arguments".into()));
+                    }
                     let direction = rest.first().cloned().unwrap_or_else(|| "down".to_owned());
                     if direction != "down" && direction != "up" {
-                        return Err(format!(
-                            "script line {}: scroll direction must be down|up",
-                            number + 1
-                        ));
+                        return Err(script_error("scroll direction must be down|up".into()));
                     }
                     let count = rest.get(1).cloned().unwrap_or_else(|| "1".to_owned());
                     let count: f64 = count
                         .parse()
-                        .map_err(|_| format!("script line {}: invalid scroll count", number + 1))?;
+                        .map_err(|_| script_error("invalid scroll count".into()))?;
                     if count < 1.0 || count.fract() != 0.0 {
-                        return Err(format!(
-                            "script line {}: scroll count must be a positive integer",
-                            number + 1
+                        return Err(script_error(
+                            "scroll count must be a positive integer".into(),
                         ));
                     }
                     step["text"] = json!(format!("{direction} {}", count as u64));
                 }
-                "back" | "forward" | "reload" => {}
+                "back" | "forward" | "reload" => {
+                    if !rest.is_empty() {
+                        return Err(script_error(format!("{action}: takes no arguments")));
+                    }
+                }
                 _ => unreachable!("validated above"),
             }
             steps.push(step);
@@ -1333,12 +1398,7 @@ pub fn parse_act_script(source: &str) -> Result<Value, String> {
     if steps.is_empty() {
         return Err("script: no steps found (only comments/blank lines?)".into());
     }
-    let out = json!(steps);
-    if let Some(wait_for) = wait_for {
-        // waitFor 挂在整体调用（args 级）；调用方把它并进顶层 arguments。
-        return Ok(json!({ "steps": out, "waitFor": wait_for }));
-    }
-    Ok(json!({ "steps": out }))
+    Ok(json!({ "steps": steps }))
 }
 
 /// 按分号拆语句（引号内的分号不算），让 `--steps 'click e1; type e2 hi'`
@@ -1506,6 +1566,10 @@ mod tests {
 
         assert!(build_act(&["explode".into()]).is_err());
         assert!(build_act(&["type".into(), "e15".into()]).is_err());
+        assert!(build_act(&["click".into(), "e12".into(), "extra".into()]).is_err());
+        assert!(build_act(&["type".into(), "e15".into(), "hello".into(), "world".into()]).is_err());
+        assert!(build_act(&["back".into(), "extra".into()]).is_err());
+        assert!(build_act(&["click".into(), "e1".into(), "--submit".into()]).is_err());
     }
 
     #[test]
@@ -1548,7 +1612,7 @@ waitFor url=api/save status=200 timeout=5s
         let script = script.replace("open handled elsewhere\n", "");
         let parsed = parse_act_script(&script).unwrap();
         let steps = parsed["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), 6);
+        assert_eq!(steps.len(), 7);
         assert_eq!(steps[0]["action"], "type");
         assert_eq!(steps[0]["ref"], "e15");
         assert_eq!(steps[0]["text"], "hello world");
@@ -1560,8 +1624,10 @@ waitFor url=api/save status=200 timeout=5s
         assert_eq!(steps[3]["ref"], "e15");
         assert_eq!(steps[4]["text"], "down 3");
         assert_eq!(steps[5]["action"], "click");
-        assert_eq!(parsed["waitFor"]["url"], "api/save");
-        assert_eq!(parsed["waitFor"]["status"], 200);
+        assert_eq!(steps[6]["action"], "waitFor");
+        assert_eq!(steps[6]["url"], "api/save");
+        assert_eq!(steps[6]["status"], 200);
+        assert_eq!(steps[6]["timeout"], 5.0);
     }
 
     #[test]
@@ -1576,6 +1642,40 @@ click target=\"button:提交\"
         assert_eq!(steps[0]["selector"], "#submit");
         assert_eq!(steps[1]["target"], "button:提交");
         assert_eq!(steps.len(), 2);
+    }
+
+    #[test]
+    fn act_script_wait_for_keeps_its_line_position() {
+        let parsed =
+            parse_act_script("click e1\nwaitFor url=api/first timeout=3s\nclick e2\n").unwrap();
+        let steps = parsed["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[1]["action"], "waitFor");
+        assert_eq!(steps[1]["url"], "api/first");
+        assert_eq!(steps[2]["action"], "click");
+
+        // --steps 没有 waitFor 时，--wait-for 追加为最后一步。
+        let call = build_act(&[
+            "--steps".into(),
+            "click e1".into(),
+            "--wait-for".into(),
+            "url=api/save".into(),
+        ])
+        .unwrap();
+        let steps = call.args["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1]["action"], "waitFor");
+    }
+
+    #[test]
+    fn act_script_keeps_selector_like_text_and_rejects_extra_tokens() {
+        let parsed = parse_act_script("type e15 \"selector=not-a-param\"").unwrap();
+        let steps = parsed["steps"].as_array().unwrap();
+        assert_eq!(steps[0]["text"], "selector=not-a-param");
+        assert!(parse_act_script("click e1 extra").is_err());
+        assert!(parse_act_script("type e15 hello world").is_err());
+        assert!(parse_act_script("back extra").is_err());
+        assert!(parse_act_script("click not-a-ref").is_err());
     }
 
     #[test]
@@ -1866,6 +1966,16 @@ click target=\"button:提交\"
     fn tabs_forms() {
         let call = build_tabs(&TabsArgs { cmd: None }).unwrap();
         assert_eq!(args_of(&call)["action"], "list");
+
+        let call = build_tabs(&TabsArgs {
+            cmd: Some(TabsCommand::List {
+                budget: Some(200),
+                cursor: Some(3),
+            }),
+        })
+        .unwrap();
+        assert_eq!(args_of(&call)["budget"], 200);
+        assert_eq!(args_of(&call)["cursor"], 3);
 
         let call = build_tabs(&TabsArgs {
             cmd: Some(TabsCommand::Close {

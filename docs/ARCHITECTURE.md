@@ -123,7 +123,8 @@ CLI 参数
   → CLI 渲染文本（图片 --inline 输出 data URI）
 ```
 
-- 工具超时预算在 `tools.rs`：wait = timeout+15s，act = 60s+waitFor，js/shot/files=120s，
+- 工具超时预算在 `tools.rs`：wait = timeout+15s；open = waitTimeout+15s；
+  act = 60s + 每步最多 3s 的隐式 settle + 脚本 waitFor/await；js/shot/files=120s；
   batch 按目标数/并发/内层工具估算，超过 600s 在执行前拒绝。
 - pending 表按扩展连接 generation 隔离；旧连接的迟到响应不会解决新请求。
 - CLI 中途断开时 `PendingGuard` 清掉 pending 条目。
@@ -139,10 +140,12 @@ CLI 参数
   `hint=call ema2 await 10s`。
 - `ema2 await 10s` 读取 lastAct，继续等上一个动作的效果；不带 `--tab` 时使用动作所在 tab。
   显式 await 超时才返回 `wait_timeout`（退出 4）。
-- 动作打开的新标签会返回 `new_tab=` 并登记进会话，`tabs close --session` 能清理。
+- 动作打开的新标签会返回 `new_tab=`；opener 明确的才自动登记进会话，`tabs close --session` 能清理。
+  noopener 标签只用于定位，避免误关用户手动打开的 tab。
 - `.ema2`/`--steps` 里 `await 10s` 是脚本专用步骤；如果上一步 pending 且下一步不是 await，
   脚本停止，避免在旧页面继续点击。
-- `act` 的工具超时预算会叠加脚本中的 await 时长，超过 600s 在执行前拒绝。
+- `act` 的工具超时预算会叠加脚本中的 await + 每步 settle，超过 600s 在执行前拒绝。
+- 脚本里的 `waitFor` 是独立步骤，在所在行执行；失败时已完成的 `stepN` 会随错误返回。
 
 ## ref 模型
 
@@ -159,6 +162,7 @@ CLI 参数
   的隐藏元素；`html` 保持原始输出。
 - `mainRoot` 用清洁后的文本和链接密度评分；候选 <200 字符，或 body>2000 字符且候选不到 body 5%
   时回退 `main=body(fallback)`，并输出 `hint=main extraction too short (...)`。
+- `text`/`md` 遍历会进入 open shadow root；closed shadow root 仍不可见。
 - `md` 是有损渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对URL)`，
   行内 code/strong/em 保留；样式、合并单元格、脚本生成内容会丢。
 - `mainRoot` 先按 `textContent` 长度门槛过滤，最多对 12 个候选跑清洁评分，避免大页面 CPU 峰值。
@@ -177,7 +181,8 @@ CLI 参数
 ## js 的两条通道
 
 `js` 默认走 debugger（`Runtime.evaluate`，`returnByValue` + `awaitPromise`），
-语义是“先按表达式执行，语法错误再按 async 函数体执行”。
+先用 `Runtime.compileScript` 做 compile-only 探测：表达式能编译就只执行一次，
+否则按 async 函数体执行；运行时 `SyntaxError` 绝不重跑（避免副作用执行两次）。
 
 当 `debugger.attach` 被拒（DevTools 占用，或 tab 里有**别的扩展**的页面目标）时：
 
@@ -193,7 +198,8 @@ CLI 参数
 CLI 读本地文件 → base64 随 `/cmd` 请求下发 → 扩展在页面 MAIN world 里用
 `DataTransfer` 构造 `File` 赋给 `input.files`，再派发 `input/change`。
 因此上传**不依赖 debugger**，在“debugger 被别的扩展挡住”的 tab 上同样可用。
-单次 ≤20 个文件、载荷 ≤5 MiB（`/cmd` body 上限 8 MiB，base64 膨胀 4/3）。
+单次 ≤20 个文件、原始载荷 ≤5 MiB。axum `Json` 的 `DefaultBodyLimit`、
+`RequestBodyLimitLayer`、扩展 WS 入站上限都放开到 8 MiB，base64 膨胀后仍有余量。
 
 ## 前台语义
 
@@ -209,7 +215,8 @@ CLI 读本地文件 → base64 随 `/cmd` 请求下发 → 扩展在页面 MAIN 
 - `--tab-ids`：对已有标签并发执行；
 - 并发默认 2，最大 4；`js` 因全局 debugger 串行，预算按有效并发 1 计算；
 - 每块 `---` 分隔，单块失败不影响其它块；
-- 内层参数复用子工具 validator，不能绕过 `wait time=300` 等上限。
+- 内层参数复用子工具 validator，不能绕过 `wait time=300` 等上限；
+  `--urls` 模式始终新开标签，`--replace`/`--reuse`/`tabId` 会被拒绝。
 
 ## 输出与退出码
 

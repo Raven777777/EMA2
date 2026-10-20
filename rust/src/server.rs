@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -98,6 +98,11 @@ pub fn router(state: Arc<RelayState>, shutdown: Arc<Notify>) -> Router {
         .route("/shutdown", post(handle_shutdown))
         .with_state((state, shutdown))
         // CLI 上传 body 上限：js code ≤100KB、paths ≤20 条，8MB 绰绰有余。
+        //
+        // tower-http 的 RequestBodyLimitLayer 只限制 body 流；axum 的 Json/Bytes
+        // 提取器还各自带默认 2MB 的 DefaultBodyLimit。两者必须同时放开，否则
+        // 上传会在 2MB 处先被提取器拒绝（HTTP 413）。
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             8 * 1024 * 1024,
         ))
@@ -454,6 +459,23 @@ mod tests {
             "{}",
             body
         );
+    }
+
+    /// axum 的 Json 提取器默认只接受 2MB；CLI 上传可以接近 8MB。
+    /// 这个测试保证请求能穿过提取器到达参数校验（400），而不是被 413 截断。
+    #[tokio::test]
+    async fn large_command_body_passes_the_extractor_limit() {
+        let (app, _) = app();
+        let response = app
+            .oneshot(post(
+                "/cmd",
+                json!({ "tool": "js", "args": { "code": "x".repeat(2_500_000) } }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "invalid_argument");
     }
 
     #[tokio::test]

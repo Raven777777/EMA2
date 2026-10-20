@@ -5,9 +5,9 @@
 ## 当前版本
 
 ```text
-exe        2.1.7
-extension  2.1.7
-helper     10
+exe        2.2.1
+extension  2.2.1
+helper     11
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
@@ -92,7 +92,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前 Rust 测试：**60 passed**。
+当前 Rust 测试：**65 passed**。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -122,9 +122,11 @@ cargo test
 - pending 时给 `expect=` / `next_url=` / `hint=ema2 await 10s`
 - `ema2 await [duration]` 使用**上一个动作所在 tab**，不是当前活动 tab
 - 显式 await 超时返回 `wait_timeout`，退出 4
-- 动作打开新标签：`new_tab=` + 自动登记 session
+- 动作打开新标签：`new_tab=` + opener 明确时自动登记 session（noopener 只用于定位）
 - `.ema2` / `--steps` 里 `await 10s` 是脚本步骤；pending 且下一步不是 await 时脚本停止
 - `open` 和新的 act 会清掉旧 lastAct 上下文
+- `open --timeout` 超时返回 `load=pending`，中继预算跟随 `waitTimeout`
+- 脚本里的 `waitFor` 是独立步骤，在原行执行；失败时保留已完成步骤
 
 ### read
 
@@ -136,23 +138,26 @@ cargo test
 
 ### 其他
 
-- `type` 追加，`fill` 覆盖
+- `type` 追加，`fill` 覆盖；控件会清洗值时（number/date/range）返回 `value_rejected`
+- `act scroll down|up N` 按方向与屏数滚动
+- 上传原始载荷 ≤5 MiB；daemon body / axum 提取器 / 扩展入站上限都已对齐
 - `select` 的位置参数是 option 的 `value`
 - `files download-dir` 固定返回 `download_dir_unsupported`
 - `batch` 内层参数放在 `args`；内层校验复用子工具 validator
-- `js` 全局 debugger 串行；attach 非超时失败自动重试一次
+- `js` 全局 debugger 串行；attach 非超时失败自动重试一次；运行时 SyntaxError 不重跑
 - `server` 重复启动输出 `relay=already_running`，退出 0
 - `server stop` 已停止时输出 `relay=not_running`，退出 0
 
 ## 已知弱点与下一步优先级
 
-### P1：act 结果可信度（v2.1.6 已大部分落地）
+### P1：act 结果可信度（v2.2.1 已收口）
 
 HN 真机出现过一次 `act click` 返回 `ok=1/1` 但页面没有导航，换 selector 后成功。
-v2.1.6 起：
+v2.2.1 起：
 
-- 点击 `<a>` 后结算里没有 `url`/`new_tab` 变化时，只对链接安全重试一次（输出 `retried=1`）
-- 仍无变化则给 `nav=none` + hint，而不是假成功
+- 可导航链接无任何变化时安全重试一次（输出 `retried=1`）；仍无变化给 `nav=none`
+- SPA 链接只改 DOM 不导航：约 1s 后 `settle=done` + `nav=none`，不再 pending 3s
+- `javascript:` / `download` / `#` 链接不重试
 - 普通按钮**不**自动重试（避免点赞/提交执行两次）
 
 还没做：按钮类动作的“预期效果”校验（比如表单提交失败仍停在本页）。
@@ -169,8 +174,8 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 
 ### P3：真实浏览器验收 harness
 
-目前真机验收是人工清单 + 临时脚本。  
-可以在 `scripts/` 下加 PowerShell/Python 验收脚本，但：
+`scripts/verify.py` 已经是真实前台 Edge 的验收脚本（fixture + CLI + 断言），
+新增行为要同步加断言；它不替代人工检查复杂站点。
 
 - **不能用 Node.js**
 - 只做启动 Edge、打开页面、跑 CLI、断言输出
@@ -194,7 +199,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 ## 开发陷阱
 
 1. **修改页面 helper 必须提升 `__ema2_helpers_version`**
-   否则已打开页面继续用旧 helper。
+   当前是 11；否则已打开页面继续用旧 helper。
 
 2. **Edge 会按 manifest 版本缓存扩展脚本**
    行为没更新时提升 `extension/manifest.json` 版本，或在 `edge://extensions` 重新加载；
@@ -224,7 +229,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
 4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
-5. `python scripts/verify.py` —— 28 项真机检查，跑不过就别改行为
+5. `python scripts/verify.py` —— 53 项真机检查，跑不过就别改行为
 6. 打开一个真实网站，跑 `open → snapshot → act → read`
 7. 修改行为前先问：这是通用原语，还是网站特例？
 8. 任何动作相关改动，必须真机验证“成功就是真的成功”

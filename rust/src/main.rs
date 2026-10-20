@@ -1,4 +1,4 @@
-//! EMA2 v2.0 —— 单个 exe 同时是 daemon 与短命 CLI。
+//! EMA2 v2.2 —— 单个 exe 同时是 daemon 与短命 CLI。
 //!
 //! ```text
 //! ema2 server           一次性，daemon 化，立即返回
@@ -262,11 +262,38 @@ fn start_server(port: u16) -> i32 {
 }
 
 fn stop_server(port: u16) -> i32 {
-    let Some(health) = health(port).filter(is_ema2) else {
+    if !port_alive(port) {
         cleanup_pid_file(port);
         println!("relay=not_running port={port}");
         return 0;
-    };
+    }
+    let health_value = health(port);
+    let answered = health_value.is_some();
+    let ema2_health = health_value.filter(is_ema2);
+    if ema2_health.is_none() {
+        // /health 超时不等于“进程已经退出”：daemon 可能只是卡住了。
+        // 先确认端口是否真的在监听，再按 PID 文件兜底。
+        if answered {
+            eprintln!(
+                "error=port_in_use msg=127.0.0.1:{port} is answering, but it is not an ema2 daemon hint=nothing was stopped"
+            );
+            return 2;
+        }
+        if let Some(pid) = read_pid_file(port)
+            && kill_process(pid)
+            && wait_until_down(port, Duration::from_secs(4))
+        {
+            cleanup_pid_file(port);
+            println!("relay=stopped port={port} pid={pid} forced=1");
+            return 0;
+        }
+        eprintln!(
+            "error=shutdown_failed msg=127.0.0.1:{port} is still listening but /health did not answer hint=close the daemon process manually; check {}",
+            paths::pid_file(port).display()
+        );
+        return 2;
+    }
+    let health = ema2_health.expect("checked above");
     let pid = health
         .get("pid")
         .and_then(Value::as_u64)
@@ -354,7 +381,7 @@ fn tabs_summary(port: u16) -> (String, String) {
     let Ok(result) = send_cmd(
         port,
         "tabs",
-        &json!({ "action": "list" }),
+        &json!({ "action": "list", "budget": 200000 }),
         None,
         Duration::from_secs(5),
     ) else {
@@ -365,7 +392,12 @@ fn tabs_summary(port: u16) -> (String, String) {
     let mut active = "unknown".to_owned();
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("total=") {
-            total = value.trim().to_owned();
+            // footer 是 `total=2 shown=2 next=none` 一行，不能把整行当数量。
+            total = value
+                .split_whitespace()
+                .next()
+                .unwrap_or("unknown")
+                .to_owned();
         }
         let mut fields = line.split('\t');
         let id = fields.next();
@@ -513,14 +545,28 @@ fn send_cmd(
         body["out"] = json!(out);
     }
     let response = client::request(port, "POST", "/cmd", Some(&body.to_string()), timeout)
-        .map_err(|error| CmdError {
-            code: "relay_not_running".into(),
-            msg: format!("cannot connect to 127.0.0.1:{port}: {error}"),
-            hint: "start it with `ema2 server`".into(),
-        })?;
+        .map_err(|error| request_error(port, &error))?;
     let value = serde_json::from_str::<Value>(&response.body).unwrap_or(Value::Null);
     if response.status == 200 {
-        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+        let result = value.get("result").cloned();
+        return result.ok_or_else(|| CmdError {
+            code: "relay_error".into(),
+            msg: format!(
+                "HTTP 200 from relay without a result: {}",
+                response.body.chars().take(300).collect::<String>()
+            ),
+            hint: "check `ema2 status`; reload the extension if this persists".into(),
+        });
+    }
+    if response.status == 413 {
+        return Err(CmdError {
+            code: "payload_too_large".into(),
+            msg: format!(
+                "HTTP 413 from relay: {}",
+                response.body.chars().take(300).collect::<String>()
+            ),
+            hint: "reduce the upload size (files upload is limited to 5 MiB of raw bytes), or split the call".into(),
+        });
     }
     let code = value
         .get("code")
@@ -544,6 +590,33 @@ fn send_cmd(
         .unwrap_or("check `ema2 status`")
         .to_owned();
     Err(CmdError { code, msg, hint })
+}
+
+/// 区分“连不上 daemon”和“连上了但请求中途失败”。
+/// 后者不能被报成 relay_not_running，否则 AI 会去重启一个还在运行的中继。
+fn request_error(port: u16, error: &std::io::Error) -> CmdError {
+    use std::io::ErrorKind;
+    let unreachable = matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::AddrNotAvailable
+            | ErrorKind::NotConnected
+            | ErrorKind::NotFound
+    );
+    if unreachable {
+        CmdError {
+            code: "relay_not_running".into(),
+            msg: format!("cannot connect to 127.0.0.1:{port}: {error}"),
+            hint: "start it with `ema2 server`".into(),
+        }
+    } else {
+        CmdError {
+            code: "relay_error".into(),
+            msg: format!("request to 127.0.0.1:{port} failed: {error}"),
+            hint: "check `ema2 status`; the daemon is reachable but the request did not complete"
+                .into(),
+        }
+    }
 }
 
 /// 把扩展返回的 content[] 渲染成 CLI 文本；图片转 data URI。
@@ -588,6 +661,8 @@ fn exit_for_code(code: &str) -> i32 {
         || code.starts_with("missing")
         || code.starts_with("unknown")
         || code == "too_many_files"
+        || code == "too_many_steps"
+        || code == "payload_too_large"
     {
         1
     } else if code == "relay_not_running" || code == "port_in_use" {
@@ -651,12 +726,17 @@ fn cleanup_pid_file(port: u16) {
 fn wait_until_down(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if health(port).filter(is_ema2).is_none() {
+        // 不用 /health 判断：卡死的 daemon 仍会接受 TCP，只是不应答。
+        if !port_alive(port) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    health(port).filter(is_ema2).is_none()
+    !port_alive(port)
+}
+
+fn port_alive(port: u16) -> bool {
+    TcpStream::connect_timeout(&loopback(port), Duration::from_millis(300)).is_ok()
 }
 
 fn log_hint(path: &Path) -> String {
