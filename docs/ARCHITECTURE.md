@@ -1,4 +1,4 @@
-# EMA2 架构说明 · v2.1.6
+# EMA2 架构说明
 
 ## 总览
 
@@ -159,6 +159,9 @@ CLI 参数
   的隐藏元素；`html` 保持原始输出。
 - `mainRoot` 用清洁后的文本和链接密度评分；候选 <200 字符，或 body>2000 字符且候选不到 body 5%
   时回退 `main=body(fallback)`，并输出 `hint=main extraction too short (...)`。
+- `md` 是有损渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对URL)`，
+  行内 code/strong/em 保留；样式、合并单元格、脚本生成内容会丢。
+- `mainRoot` 先按 `textContent` 长度门槛过滤，最多对 12 个候选跑清洁评分，避免大页面 CPU 峰值。
 - main 太短、百度 hidden textarea JSON、GitHub dashboard JSON、隐藏弹窗文本都不会再污染正文。
 
 ## 网络 / console hook
@@ -170,6 +173,35 @@ CLI 参数
 - `bodyFilter` 限 512 字符，拒绝嵌套量词/量词组内分支等指数回溯形态；
 - `--har` 导出 HAR 1.2 采样，不是完整抓包；
 - console hook 记录 log/info/warn/error/debug，支持增量 `--since` 和 `--filter`。
+
+## js 的两条通道
+
+`js` 默认走 debugger（`Runtime.evaluate`，`returnByValue` + `awaitPromise`），
+语义是“先按表达式执行，语法错误再按 async 函数体执行”。
+
+当 `debugger.attach` 被拒（DevTools 占用，或 tab 里有**别的扩展**的页面目标）时：
+
+1. 先按该 tab 的 page target `targetId` 重挂一次；
+2. 仍失败则降级到 `chrome.scripting.executeScript({world:'MAIN'})`，在页面侧 eval，
+   输出末尾多一行 `via=scripting`。
+
+降级路径的 `eval` 受页面 CSP 约束（严格 CSP 站点会 `js_exception`），
+且没有 `Runtime.terminateExecution` 兜底；看到 `via=scripting` 就知道本次没走 debugger。
+
+## files upload
+
+CLI 读本地文件 → base64 随 `/cmd` 请求下发 → 扩展在页面 MAIN world 里用
+`DataTransfer` 构造 `File` 赋给 `input.files`，再派发 `input/change`。
+因此上传**不依赖 debugger**，在“debugger 被别的扩展挡住”的 tab 上同样可用。
+单次 ≤20 个文件、载荷 ≤5 MiB（`/cmd` body 上限 8 MiB，base64 膨胀 4/3）。
+
+## 前台语义
+
+扩展不提供 headless：`shot` 用 `captureVisibleTab`，只截窗口里**活动的 tab**；
+`tabs activate` / `tabs new` / `open`（新建标签）都会
+`chrome.windows.update({focused:true})` 把窗口提到前台。
+`open` 输出 `focused=1|0`：`0` 表示窗口不在前台，会附 hint。
+测试脚本必须据此断言 `document.hasFocus()`（见 TESTING.md）。
 
 ## batch
 

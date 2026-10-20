@@ -2,17 +2,19 @@
   <img src="docs/img/ema2log_t.svg" alt="EMA2 — Edge Agent" width="520">
 </p>
 
-# EMA2 — Edge Agent 2 · v2.1.4
+# EMA2 — Edge Agent 2
 
 让 AI 通过 shell 直接操作**你日常使用的 Edge**：真实指纹、真实登录态，
 不依赖 CDP 调试端口，也不需要 MCP 客户端配置。
+
+> 当前版本见 [CHANGELOG](docs/CHANGELOG.md) 顶部；契约与已知弱点见 [HANDOFF](docs/HANDOFF.md)。
 
 ```text
 AI / shell ──ema2 CLI──> :7744 ──daemon──> WebSocket ──> Edge 扩展 (MV3) ──> 真实浏览器
                         单端口：HTTP /cmd + WS upgrade
 ```
 
-- **单 exe 自带 daemon**：`ema2 server` 一次，之后 11 个子命令都是短命客户端
+- **单 exe 自带 daemon**：`ema2 server` 一次，之后每个工具调用都是短命客户端（11 个工具 + `server/status/init/await`）
 - **无 MCP、无 token、无授权页、无配置文件**：中继和扩展裸连本机回环端口
 - **行式紧凑输出**：`key=value` / TSV / `[e12@d1]`，错误统一 `error=<code> msg=... hint=...`
 - **ref 快照**：按 snapshot 返回的 ref 操作，不猜 CSS；文档句柄防止旧 ref 误点
@@ -31,6 +33,17 @@ AI / shell ──ema2 CLI──> :7744 ──daemon──> WebSocket ──> Edg
 - [docs/TESTING.md](docs/TESTING.md) — 真实 Edge 验收（禁止 Node 测试）
 - [docs/HANDOFF.md](docs/HANDOFF.md) — 交接文档与下一步计划
 - [docs/README.md](docs/README.md) — 文档索引
+
+## 仓库结构
+
+| 路径 | 内容 |
+|---|---|
+| `rust/` | daemon + CLI（单 exe，Rust） |
+| `extension/` | Edge MV3 扩展（无构建步骤，直接“加载解压缩的扩展”） |
+| `docs/` | 契约文档；`docs/archive/` 只放已归档的历史规划 |
+| `examples/` | `.ema2` 脚本、`js` 抽取脚本、批量 shell 示例 |
+| `scripts/` | `setup.cmd` 构建、`verify.py` 真机验收 |
+| `bin/` | 本地构建产物（gitignore，不提交） |
 
 ## 架构
 
@@ -183,6 +196,15 @@ cargo fmt --check
 ```
 
 扩展是普通 MV3 service worker；改完 `extension/` 后在 `edge://extensions/` 重新加载。
+
+**所有测试都在真实、前台可见的 Edge 里跑**：禁止无头浏览器、禁止后台隐藏窗口。
+一键验收：
+
+```bash
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（28 项）
+python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
+```
+
 真机检查清单见 **[docs/TESTING.md](docs/TESTING.md)**，模块与生命周期见
 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**。
 
@@ -196,7 +218,15 @@ cargo fmt --check
 - `open status=` 依赖 `PerformanceNavigationTiming.responseStatus`（Chromium 109+）；
   Service Worker 缓存返回或 `--wait none` 时可能是 `unknown|pending`。
 - `files download-dir` 固定返回 `download_dir_unsupported`，下载目录需在
-  `edge://settings/downloads` 手动设置。
+  `edge://settings/downloads` 手动设置；`files upload` 单次 ≤20 个文件、载荷 ≤5 MiB。
+- **前台要求**：窗口必须可见；`shot` 还要求目标 tab 是活动 tab。无头/后台窗口不支持。
+- `click`/`press` 是合成事件（`isTrusted=false`），校验 `isTrusted` 的站点会忽略；
+  浏览器级快捷键（`chrome.commands`）不可达。
+- **别的扩展的浮层 UI 不可点击**（密码管理器下拉、翻译面板）：EMA2 只能把它召唤出来，
+  浮层内容在跨扩展隔离的 iframe / closed shadow root 里。
+- `read --mode md` 是有损渲染（标题/列表/表格/链接保留，样式与合并单元格丢失）。
+- `js` 在 debugger 不可用时降级到 MAIN world 注入（输出 `via=scripting`）；
+  严格 CSP 站点可能拒绝 eval，此时只能重载 tab 让 debugger 恢复。
 
 ## License
 

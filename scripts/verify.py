@@ -169,6 +169,29 @@ def static_contract_check() -> bool:
     return not missing
 
 
+def markdown_link_check() -> bool:
+    """本地相对链接必须存在；行内代码里的 `[text](url)` 不算链接。"""
+    broken: list[str] = []
+    checked = 0
+    skip = {".git", "bin", "target", "node_modules"}
+    for path in ROOT.rglob("*.md"):
+        if skip & set(path.parts):
+            continue
+        text = re.sub(r"`[^`\n]*`", "", path.read_text(encoding="utf-8", errors="replace"))
+        for match in re.finditer(r"\[[^\]]*\]\(([^)\s]+)\)", text):
+            target = match.group(1)
+            if target.startswith(("http://", "https://", "mailto:", "#")):
+                continue
+            resolved = (path.parent / target.split("#")[0]).resolve()
+            checked += 1
+            if not resolved.exists():
+                broken.append(f"{path.relative_to(ROOT)} -> {target}")
+    print(f"PASS  static: {checked} local markdown links" if not broken else f"FAIL  static: {len(broken)} broken links")
+    for item in broken:
+        print("      ", item)
+    return not broken
+
+
 def wait_for_extension(runner: Runner, timeout: float = 40.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -189,6 +212,8 @@ def main() -> int:
     print(f"ema2 verify · root={ROOT} port={args.port}")
     print("real foreground Edge only: no headless / no background browser")
     if not static_contract_check():
+        return 1
+    if not markdown_link_check():
         return 1
     if args.skip_real_edge:
         print("skipped real-Edge checks (--skip-real-edge)")

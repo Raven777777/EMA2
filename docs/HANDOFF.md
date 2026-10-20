@@ -46,14 +46,17 @@ AI / shell
 | `rust/src/paths.rs` | 端口、PID/日志、输出目录 |
 | `extension/background.js` | 11 工具实现、ref、hook、settle/await、debugger 队列 |
 | `extension/popup.*` | 端口配置与连接状态 |
-| `docs/TOOLS.md` | 命令参考、输出协议、错误码 |
-| `docs/TESTING.md` | 真机验收清单（禁止 Node 测试） |
+| `docs/TOOLS.md` | 命令参考、输出协议、错误码（唯一错误码表） |
+| `docs/TESTING.md` | 真机、前台、可见的验收规定与清单（禁止 Node 测试） |
+| `scripts/verify.py` | 一键验收：静态契约 + 真实前台 Edge 冒烟 |
 | `docs/ARCHITECTURE.md` | 模块、生命周期、数据流 |
 | `docs/PHILOSOPHY.md` | 项目哲学与边界 |
-| `docs/CHANGELOG.md` | 版本历史 |
+| `docs/CHANGELOG.md` | 版本历史（唯一版本号来源） |
+| `docs/archive/` | 已归档的历史规划（不代表当前行为） |
 | `rust/assets/AGENTS.md` | `ema2 init` 模板 |
+| `examples/` | `.ema2` 脚本、`js` 抽取、批量读取示例 |
 
-`bin/` 是本地构建产物，已 gitignore；`docs/archive/` 是历史规划稿。
+`bin/` 是本地构建产物，已 gitignore；扩展没有构建步骤。
 
 ## 构建与运行
 
@@ -220,10 +223,11 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 1. 读 [PHILOSOPHY.md](PHILOSOPHY.md)
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
-4. `bin\ema2.exe server` + `status`，确认扩展连接
-5. 打开一个真实网站，跑 `open → snapshot → act → read`
-6. 修改行为前先问：这是通用原语，还是网站特例？
-7. 任何动作相关改动，必须真机验证“成功就是真的成功”
+4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
+5. `python scripts/verify.py` —— 28 项真机检查，跑不过就别改行为
+6. 打开一个真实网站，跑 `open → snapshot → act → read`
+7. 修改行为前先问：这是通用原语，还是网站特例？
+8. 任何动作相关改动，必须真机验证“成功就是真的成功”
 
 ## 一句话交接
 

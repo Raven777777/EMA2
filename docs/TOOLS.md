@@ -1,4 +1,4 @@
-# EMA2 命令参考（v2.1.4）
+# EMA2 命令参考
 
 单文件 `ema2` CLI。AI 通过 shell 调用子命令操作真实 Edge。
 无 MCP、无 token、无授权、无配置文件。默认端口 **7744**。
@@ -147,7 +147,7 @@ ema2 status [--port N]
 
 ```text
 relay=running  pid=12345  port=7744  uptime=2h13m
-extension=connected  version=2.1.4  last_ping=2s
+extension=connected  version=<ext-version>  last_ping=2s
 tabs=3  active_tab=42
 ```
 
@@ -180,6 +180,8 @@ ema2 tabs activate <id>
   本会话由 `ema2 open` 打开的标签再追加一行 `session_tabs=<id,id>`。
 - `current` → `id/window/os/title/url`。
 - `new` → `id/url/window`（登记进会话）；`--active` 顺带激活。
+- `activate` → `active=<id> focused=1|0`：除了切 tab，还会 `chrome.windows.update{focused:true}`
+  把窗口提到前台（截图/输入/密码管理器浮层都依赖前台）。
 - `close`：
   - 位置参数 `id...`（≤8）→ `closed=<id,id>` + `count=<n>`，已不存在的 id 自动跳过。
   - `--session` → 关掉本会话由 `open`/`tabs new` 打开的标签，返回 `closed=..|none` + `count=`。
@@ -194,6 +196,7 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 
 等页面就绪、装网络 hook，返回 `id / url / title / status / reuse / net_hook`（有重定向时加 `redirects=`）。
 
+- 输出包含 `focused=1|0`：`0` 表示浏览器窗口不在前台，会附 hint（先 `tabs activate`）。
 - 默认新开标签，并登记进会话。
 - `--replace`：在当前活动标签里导航（不新建），适合「同一个页面连续翻几页」。
 - `--reuse session`：复用本会话**最近**打开的标签；标签已被关掉则退回新建。
@@ -219,7 +222,7 @@ ema2 read [--tab ID] [--mode md|text|html] [--selector X] [--no-main] [--budget 
   nav/header/footer/aside/form 等页面壳，以及 `display:none`/`visibility:hidden`/
   `content-visibility` 的隐藏元素；`html` 仍是原始 HTML。
 - Markdown 按 `childNodes` 遍历，根节点直接文本、p/h1/pre、文本+块混排都不会漏字或重复。
-- `md` 是**有损**渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对 URL)`，
+- `md` 是**有损**渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对URL)`，
   行内代码与 `strong/em` 保留；样式、合并单元格、脚本生成内容会丢，不要拿它当可回写的源文件。
 - 头部 `url/title[/main]`，正文，尾部 `total/shown/next`。
 - **被截断时尾部多一行** `hint=truncated: returned 4000 of 12345 chars; call read with --cursor 4000 to continue`：

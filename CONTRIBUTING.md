@@ -1,8 +1,19 @@
 # 贡献指南
 
 先读 [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) 和 [docs/HANDOFF.md](docs/HANDOFF.md)，再改代码。
+文档全貌见 [docs/README.md](docs/README.md)。
 
 ## 硬性测试政策
+
+### 真机、前台、可见
+
+> 所有测试都必须在**真实、前台可见的 Edge 窗口**里执行。
+> 禁止无头浏览器、禁止后台隐藏窗口；扩展不提供 headless 模式。
+
+一键验收：`python scripts/verify.py`（先 `bin/ema2.exe server`，窗口保持前台）。
+它会把窗口提到前台并断言 `document.hasFocus()`，失败即失败。
+
+### 禁止 Node.js 测试
 
 > **绝对禁止使用 Node.js 跑测试。**
 >
@@ -15,7 +26,7 @@
 >   `observe console --filter`、`files download-dir` 等问题都是真机验收才发现的。
 > - Rust 单测只用于纯解析/校验的快速反馈，**不能替代真实浏览器验收**。
 
-真机验收清单见 [docs/TESTING.md](docs/TESTING.md)。
+真机验收清单与规定见 [docs/TESTING.md](docs/TESTING.md)。
 
 ## 构建
 

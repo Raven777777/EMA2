@@ -1,7 +1,8 @@
 # EMA2 示例
 
 EMA2 没有 MCP、token 或客户端配置；所有示例都直接调用 `ema2` 子命令。
-参数与错误码见 [../docs/TOOLS.md](../docs/TOOLS.md)。
+参数与错误码见 [../docs/TOOLS.md](../docs/TOOLS.md)，一键真机验收见
+[`../scripts/verify.py`](../scripts/verify.py)。
 
 ## 前置条件
 
@@ -11,6 +12,7 @@ bin/ema2.exe status        # relay=running + extension=connected
 ```
 
 Edge 扩展的 popup 端口必须是 **7744**（或与 `--port` 一致）。
+示例要在真实、前台可见的 Edge 窗口里跑（无头/后台窗口不支持截图与输入）。
 
 ## form.ema2 —— 登录/表单脚本
 
@@ -50,6 +52,17 @@ bin/ema2.exe js --file examples/extract.js
 
 `js` 先按表达式执行；遇到语法错误再按 async 函数体执行，所以文件里可以直接
 `return ...`。
+
+## 上传文件
+
+```bash
+bin/ema2.exe open https://example.com/upload
+bin/ema2.exe snapshot                     # 找到 input[type=file] 的 ref
+bin/ema2.exe files upload C:/tmp/a.pdf --ref e8
+```
+
+`upload` 会把文件字节随请求下发，页面侧用 `DataTransfer` 赋给 `input.files`，
+不依赖 debugger；单次 ≤20 个文件、载荷 ≤5 MiB。
 
 ## 典型循环
 
