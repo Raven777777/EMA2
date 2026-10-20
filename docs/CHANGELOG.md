@@ -14,7 +14,8 @@
 - **js** 原来只走 debugger：一旦 attach 被别的扩展页面目标挡住就永久
   `debugger_attach_failed`，hint 还误报“关掉 DevTools”。现在 attach 失败先按 page target
   的 `targetId` 重挂，仍失败则降级到 MAIN world 注入，输出追加 `via=scripting`；
-  失败信息带 `tab=`/`targets=` 诊断。
+  失败信息带 `tab=`/`targets=` 诊断。降级路径用信封回传结果，页面里抛出的
+  运行时错误仍然是 `js_exception`，不会被 `executeScript` 退化成 `null` 而伪装成功。
 - 版本：exe/扩展 2.1.5。
 
 ## v2.1.4 — read 正文清洁、main 回退、debugger 重试

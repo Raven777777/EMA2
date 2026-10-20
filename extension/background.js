@@ -2707,33 +2707,47 @@ async function injectMainWorld(tabId, source) {
     target: { tabId },
     world: 'MAIN',
     args: [source],
+    // executeScript 会把页面里抛出的异常退化成 null 结果，所以用信封把成功/失败都带回来。
     func: async (src) => {
       // eslint-disable-next-line no-eval
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
       try {
-        return await (0, eval)(src);
+        return { __ema2: 1, ok: true, value: await (0, eval)(src) };
       } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error;
-        return await new AsyncFunction(src)();
+        if (error instanceof SyntaxError) {
+          try {
+            return { __ema2: 1, ok: true, value: await new AsyncFunction(src)() };
+          } catch (bodyError) {
+            return { __ema2: 1, ok: false, error: String((bodyError && bodyError.stack) || bodyError) };
+          }
+        }
+        return { __ema2: 1, ok: false, error: String((error && error.stack) || error) };
       }
     },
   });
-  return results && results[0] ? results[0].result : undefined;
+  const payload = results && results[0] ? results[0].result : undefined;
+  if (payload && typeof payload === 'object' && payload.__ema2 === 1) return payload;
+  return { ok: true, value: payload };
 }
 
 /// debugger 被占时的降级：MAIN world 注入，参数/输出语义与 `js` 一致，额外给一行 via=scripting。
 async function jsViaScripting(tabId, args, attachError) {
   const code = String(args.code || '');
   const budget = normalizeBudget(args.budget === undefined ? 8000 : args.budget);
-  let value;
+  let payload;
   try {
-    value = await injectMainWorld(tabId, code);
+    payload = await injectMainWorld(tabId, code);
   } catch (error) {
-    // eval 在页面里被 CSP 拦或代码语法错：统一报 js_exception，不伪装成 attach 问题。
+    // 注入本身失败（CSP 拦 eval、tab 被关）：统一报 js_exception，不伪装成 attach 问题。
     const message = oneLine(error && error.message || error).slice(0, 300);
     fail('js_exception', message,
       `scripting fallback failed after ${attachError.code}: page CSP may forbid eval; reload the tab and retry, or close what owns the debugger target`);
   }
+  if (!payload.ok) {
+    fail('js_exception', oneLine(payload.error || 'JS error').slice(0, 300),
+      'runtime error: the code parsed but threw; read the page first (snapshot/read) or guard with try/catch');
+  }
+  const value = payload.value;
   const text = value === undefined ? 'undefined' : stringifyValue(value);
   const slice = sliceText(text, budget, 0);
   const lines = [slice.text];
