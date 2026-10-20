@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.1.6
-extension  2.1.6
+exe        2.1.7
+extension  2.1.7
 helper     10
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```

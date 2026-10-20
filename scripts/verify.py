@@ -44,6 +44,7 @@ FIXTURE_HOME = """<!doctype html>
 <body>
 <h1>Fixture Home</h1>
 <p id="para">intro text with a <a id="link" href="/second.html">second page</a> link</p>
+<p id="para2">second paragraph stays separate</p>
 <table id="table">
   <thead><tr><th>key</th><th>value</th></tr></thead>
   <tbody><tr><td>alpha</td><td>1</td></tr><tr><td>beta</td><td>2</td></tr></tbody>
@@ -282,6 +283,11 @@ def main() -> int:
         runner.check("md keeps links", re.search(r"\]\(http[^)]+second\.html\)", md) is not None, md[:600])
         runner.check("md keeps table", "| key | value |" in md and "| alpha | 1 |" in md, md[:600])
         runner.check("md keeps list", "- one" in md and "- two" in md, md[:400])
+        runner.check(
+            "md keeps paragraph breaks",
+            re.search("intro text[^\n]*\n\n[^\n]*second paragraph", md) is not None,
+            md[:600],
+        )
 
         runner.expect_ok("js value", runner.run("js", "1+1"), "2")
         runner.expect_error("js throw is js_exception", runner.run("js", "throw new Error('boom')"), "js_exception", 4)

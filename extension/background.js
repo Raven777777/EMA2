@@ -1199,8 +1199,9 @@ function installHelpers() {
           if (lines.length) blocks.push(lines.join('\n'));
           continue;
         }
-        const hasBlock = [...child.children].some(grand => BLOCK.test(grand.tagName));
-        if (hasBlock) {
+        // 块级元素本身就是段落边界：两个连续 <p> 不能粘成一段。
+        // （以前只判断“子元素里有块”，纯文本的 <p> 会被直接追加到 buffer。）
+        if (BLOCK.test(tag)) {
           flush();
           walk(child);
           flush();
