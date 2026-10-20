@@ -1,5 +1,22 @@
 # 变更记录
 
+## v2.1.5 — click 保真、press 修饰键、js 降级通道
+
+真机实测发现三个原语级缺陷，都在扩展侧，Rust 无改动：
+
+- **click** 原来只有 `el.click()`：只产生一个 `click` 事件，聚焦是静默的，没有
+  `pointerdown/mousedown/mouseup`。密码管理器这类监听 `focusin`/`pointerdown` 的扩展
+  完全看不到点击。现在按真实浏览器顺序补指针事件 → 聚焦（`focusin` 真的发出来）→
+  caret 落到末尾 → 补齐 up 事件，最后仍用 `el.click()` 做唯一一次激活。
+  事件是合成的（`isTrusted=false`），校验 `isTrusted` 的站点仍会忽略。
+- **press** 原来把 `Control+Shift+L` 整串当成 key，`ctrlKey/shiftKey` 全是 `false`，还返回
+  `ok=1/1`。现在解析组合键、设置修饰位与 `code`；仍然只能到达页面，浏览器级快捷键不可达。
+- **js** 原来只走 debugger：一旦 attach 被别的扩展页面目标挡住就永久
+  `debugger_attach_failed`，hint 还误报“关掉 DevTools”。现在 attach 失败先按 page target
+  的 `targetId` 重挂，仍失败则降级到 MAIN world 注入，输出追加 `via=scripting`；
+  失败信息带 `tab=`/`targets=` 诊断。
+- 版本：exe/扩展 2.1.5。
+
 ## v2.1.4 — read 正文清洁、main 回退、debugger 重试
 
 - `read --mode text|md` 现在跳过 `script/style/noscript/template/textarea/input/select/option`、

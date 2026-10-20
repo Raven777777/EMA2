@@ -246,7 +246,13 @@ ema2 act --script run.ema2                    # 脚本文件
 - 动作打开新标签时会返回 `new_tab=<id>`，并自动登记进会话；`tabs close --session` 会清掉它。
 - disabled/readOnly/不支持写值的控件返回明确错误；`type` 只回 `wrote=1 chars=N`，不回显输入。
 - `select` 的位置参数是 option 的 `value`（不是显示文本）。
-- `press` 有定位时先聚焦目标再发键；无定位时使用当前焦点。合成 KeyboardEvent 不能承诺浏览器原生 Tab/组合键行为。
+- `press` 有定位时先聚焦目标再发键；无定位时使用当前焦点。键名支持组合写法 `Control+Shift+L`、`Meta+K`，
+  会正确设置 `ctrlKey/shiftKey/altKey/metaKey` 与 `code`（`KeyL`/`Digit7`/`Enter`…）。
+  合成 KeyboardEvent 只能到达页面：`chrome.commands` 快捷键、浏览器 UI（地址栏、标签页切换）不会响应。
+- `click` 按真实浏览器顺序补 `pointerover/pointerdown/mousedown → 聚焦 → pointerup/mouseup`，
+  最后仍用原生 `el.click()` 触发一次激活；靠 `focusin`/`pointerdown` 出浮层的密码管理器、
+  输入法候选、右键菜单扩展因此能看到这次点击。事件是合成的（`isTrusted=false`），
+  校验 `event.isTrusted` 的站点仍会忽略。
 - 目标未渲染时自动重试 3 次（约 1s）；`stale_ref` 不重试。
 - `waitFor`：动作后等匹配响应，命中回 `response=<status> <method> <path> <ms>`；
   跨导航时自动从新文档起点匹配；hook 安装前的历史请求只给 `observation_gap=status_unavailable`。
@@ -350,6 +356,9 @@ ema2 js --file script.js [...]
 - **既可传表达式也可传语句体**：先按表达式执行；若报语法错误，再按 async 函数体执行一次，
   因此顶层 `return`、`await`、`const a = 1; return a` 都能用。函数体没写 `return` 时返回 `undefined` 并提示 `note=ran as an async function body`。
 - 错误 `hint` 区分两类：`syntax error: ...` 与 `runtime error: ...`。除语法错误外的异常不会重跑，避免副作用执行两次。
+- `debugger.attach` 被拒时先按 page target 的 `targetId` 重挂；仍失败则退到 MAIN world 注入，
+  输出末尾多一行 `via=scripting`。降级路径的 `eval` 受页面 CSP 限制，严格 CSP 站点会返回
+  `js_exception`；看到 `via=scripting` 说明本次没走 debugger。
 - 全局 debugger 队列串行执行；单任务 60s 执行上限，超时会 `Runtime.terminateExecution` 并 detach，
   后续调用可继续。注意 `terminateExecution` 终止的是该 tab 里**所有** JS 执行（不只是本次表达式），
   页面自身的定时器/长任务也会被打断；能用 `wait` 或更短的表达式时不要依赖超时兜底。

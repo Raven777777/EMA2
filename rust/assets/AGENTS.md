@@ -60,7 +60,7 @@ ema2 status      # relay=running / extension=connected
 | `element_disabled` / `element_readonly` / `unsupported_control` | 换控件或先启用 |
 | `wait_timeout` / `response_timeout` | 检查条件或提高 timeout |
 | `tab_not_active` | 先 `ema2 tabs activate <id>`；截图只截活动页 |
-| `debugger_attach_failed` | 关掉该 tab 的 DevTools 再试 |
+| `debugger_attach_failed` | 先重载该 tab；`ema2 js` 会自动降级到 scripting（看 `via=scripting`） |
 | `internal_page` | `edge://` 等内置页不可脚本化 |
 | `download_dir_unsupported` | Edge 不允许扩展改下载目录，手动在设置里改 |
 

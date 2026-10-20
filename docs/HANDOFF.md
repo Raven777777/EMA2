@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.1.4
-extension  2.1.4
+exe        2.1.5
+extension  2.1.5
 helper     10
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
@@ -177,6 +177,11 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 - OCR、验证码、登录态管理
 - 自动下单/发帖/业务工作流
 - 第 12 个工具
+- **驱动别的扩展自己的浮层 UI**（密码管理器下拉、翻译插件面板）：v2.1.5 起
+  `click` 会补齐指针事件与 `focusin`，能把浮层**召唤**出来，但浮层内容在跨扩展
+  隔离的 iframe / closed shadow root 里，`snapshot` 拿不到 ref，坐标点击也会被
+  `debugger.attach` 的跨扩展限制挡住（真机实测：此时 `getTargets` 只剩一个 page target，
+  `attach({tabId})` 和 `attach({targetId})` 都会被拒）。这一步仍需人手点一下。
 
 这些用 `js`、`.ema2`、外部 Python 脚本完成。
 

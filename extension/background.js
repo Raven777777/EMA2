@@ -1324,6 +1324,43 @@ function performActionInPage(spec) {
     candidates: helpers.candidates(5),
   });
 
+  // press 的 key 支持 "Control+Shift+L"：最后一段是键，其余是修饰位。
+  const parseKeyCombo = (raw) => {
+    const parts = String(raw || '').split('+').map(part => part.trim()).filter(Boolean);
+    const token = parts.pop() || '';
+    const combo = { key: '', code: '', ctrlKey: false, shiftKey: false, altKey: false, metaKey: false };
+    for (const part of parts) {
+      const lower = part.toLowerCase();
+      if (lower === 'ctrl' || lower === 'control') combo.ctrlKey = true;
+      else if (lower === 'shift') combo.shiftKey = true;
+      else if (lower === 'alt' || lower === 'option') combo.altKey = true;
+      else if (lower === 'meta' || lower === 'cmd' || lower === 'command' || lower === 'win') combo.metaKey = true;
+    }
+    if (!token) return combo;
+    const alias = {
+      esc: 'Escape', escape: 'Escape', enter: 'Enter', return: 'Enter', tab: 'Tab', space: ' ',
+      backspace: 'Backspace', delete: 'Delete', del: 'Delete', insert: 'Insert', home: 'Home',
+      end: 'End', pageup: 'PageUp', pagedown: 'PageDown', arrowup: 'ArrowUp', up: 'ArrowUp',
+      arrowdown: 'ArrowDown', down: 'ArrowDown', arrowleft: 'ArrowLeft', left: 'ArrowLeft',
+      arrowright: 'ArrowRight', right: 'ArrowRight',
+    };
+    const lower = token.toLowerCase();
+    if (alias[lower] !== undefined) {
+      combo.key = alias[lower];
+      combo.code = alias[lower] === ' ' ? 'Space' : alias[lower];
+      return combo;
+    }
+    if (token.length === 1) {
+      combo.key = token;
+      combo.code = /[a-z]/i.test(token) ? `Key${token.toUpperCase()}`
+        : (/[0-9]/.test(token) ? `Digit${token}` : '');
+      return combo;
+    }
+    combo.key = token;
+    combo.code = /^f\d{1,2}$/i.test(token) ? token.toUpperCase() : token;
+    return combo;
+  };
+
   if (action === 'fill') {
     const fields = Array.isArray(spec.fields) ? spec.fields : [];
     const results = [];
@@ -1381,6 +1418,33 @@ function performActionInPage(spec) {
         || (tag === 'input' && (el.type === 'submit' || el.type === 'image'));
       const effect = anchor || (submitter && !!form) ? 'nav' : 'page';
       const nextUrl = anchor ? (el.href || el.getAttribute('href') || '') : (submitter && form ? form.action || '' : '');
+      // 纯 el.click() 只产生一个 click 事件：没有 pointer/mouse 序列，聚焦还是静默的，
+      // 密码管理器这类靠 focusin/pointerdown 出浮层的扩展完全看不到这次点击。
+      // 按真实浏览器顺序补事件，真正的激活仍然交给 el.click()，只发生一次。
+      try {
+        const rect = el.getBoundingClientRect();
+        const x = Math.round(rect.left + rect.width / 2);
+        const y = Math.round(rect.top + rect.height / 2);
+        const base = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, view: window };
+        const pointer = (type, buttons) => el.dispatchEvent(new PointerEvent(type, {
+          ...base, button: 0, buttons, pointerId: 1, pointerType: 'mouse', isPrimary: true,
+        }));
+        const mouse = (type, buttons) => el.dispatchEvent(new MouseEvent(type, { ...base, button: 0, buttons, detail: 1 }));
+        pointer('pointerover', 0);
+        pointer('pointerenter', 0);
+        pointer('pointermove', 0);
+        pointer('pointerdown', 1);
+        mouse('mousedown', 1);
+        try { el.focus({ preventScroll: true }); } catch (_) { try { el.focus(); } catch (_) { /* ignore */ } }
+        if (typeof el.setSelectionRange === 'function') {
+          try {
+            const length = String(el.value == null ? '' : el.value).length;
+            el.setSelectionRange(length, length);
+          } catch (_) { /* 非文本控件不支持选区，忽略 */ }
+        }
+        pointer('pointerup', 0);
+        mouse('mouseup', 0);
+      } catch (_) { /* 补事件是尽力而为，不影响下面的真实激活 */ }
       try { el.click(); } catch (error) {
         return { found: true, ok: false, code: 'click_failed', message: String(error && error.message || error) };
       }
@@ -1426,17 +1490,26 @@ function performActionInPage(spec) {
       return { found: true, ok: true, info: `value=${value.slice(0, 40)}` };
     }
     case 'press': {
-      const key = String(spec.key || '');
-      if (!key) return { found: true, ok: false, code: 'missing_key', message: 'press requires key' };
+      const combo = parseKeyCombo(String(spec.key || ''));
+      if (!combo.key) return { found: true, ok: false, code: 'missing_key', message: 'press requires key' };
       if (hasLocator) { try { el.focus(); } catch (_) { /* ignore */ } }
       const pressTarget = el || document.activeElement || document.body;
       if (!pressTarget) return { found: true, ok: false, code: 'target_not_found', message: 'no element to receive the key' };
-      const opts = { key, code: key, bubbles: true, cancelable: true };
+      const opts = {
+        key: combo.key,
+        code: combo.code,
+        bubbles: true,
+        cancelable: true,
+        ctrlKey: combo.ctrlKey,
+        shiftKey: combo.shiftKey,
+        altKey: combo.altKey,
+        metaKey: combo.metaKey,
+      };
       const notCanceled = pressTarget.dispatchEvent(new KeyboardEvent('keydown', opts));
       pressTarget.dispatchEvent(new KeyboardEvent('keyup', opts));
       let effect = 'page';
       let nextUrl = '';
-      if (key === 'Enter' && notCanceled) {
+      if (combo.key === 'Enter' && notCanceled) {
         const form = pressTarget.closest && pressTarget.closest('form');
         if (form && form.requestSubmit) {
           form.requestSubmit();
@@ -1445,13 +1518,20 @@ function performActionInPage(spec) {
         }
       }
       const where = ref ? `ref=${ref}` : selector ? `selector=${selector}` : target ? `target=${target}` : 'target=active';
-      return { found: true, ok: true, info: `key=${key} ${where}`, effect, nextUrl };
+      return { found: true, ok: true, info: `key=${spec.key} ${where}`, effect, nextUrl };
     }
     case 'hover': {
       const rect = el.getBoundingClientRect();
-      const opts = { bubbles: true, clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2 };
+      const x = rect.x + rect.width / 2;
+      const y = rect.y + rect.height / 2;
+      const opts = { bubbles: true, clientX: x, clientY: y };
+      const pointerOpts = { ...opts, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      el.dispatchEvent(new PointerEvent('pointerover', pointerOpts));
+      el.dispatchEvent(new PointerEvent('pointerenter', pointerOpts));
+      el.dispatchEvent(new PointerEvent('pointermove', pointerOpts));
       el.dispatchEvent(new MouseEvent('mouseover', opts));
       el.dispatchEvent(new MouseEvent('mouseenter', opts));
+      el.dispatchEvent(new MouseEvent('mousemove', opts));
       return { found: true, ok: true, info: '' };
     }
     case 'submit': {
@@ -2458,6 +2538,40 @@ async function abortDebuggerEvaluation(tabId) {
   catch (_) { /* older builds may not support it */ }
 }
 
+/// attach({tabId}) 在 tab 内存在其他扩展的页面目标时会被拒；直接按 targetId 挂 page target。
+async function attachByTargetId(tabId) {
+  try {
+    const targets = await chrome.debugger.getTargets();
+    const page = targets.find(target => target.tabId === tabId && target.type === 'page' && !target.attached);
+    if (!page) return null;
+    const target = { targetId: page.id };
+    await withDeadline(chrome.debugger.attach(target, '1.3'), 10000, 'debugger_attach_timeout', `cannot attach debugger to target ${page.id}`);
+    return target;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// attach 失败时列出该 tab 的全部 debugger target，避免把"另一个扩展的页面目标"误报成 DevTools。
+async function describeAttachFailure(tabId) {
+  const parts = [];
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    parts.push(`tab=${shortText(tab.url || '', 80)}`);
+  } catch (_) {
+    parts.push('tab=missing');
+  }
+  try {
+    const targets = await chrome.debugger.getTargets();
+    const mine = targets.filter(target => target.tabId === tabId);
+    if (!mine.length) parts.push('targets=0');
+    else parts.push('targets=' + mine.map(target => `${target.type}:${shortText(target.url || '', 70)}`).join(' '));
+  } catch (error) {
+    parts.push(`targets=? ${oneLine(error && error.message || error).slice(0, 120)}`);
+  }
+  return parts.join(' ');
+}
+
 function withDebugger(tabId, run, options = {}) {
   const taskTimeout = options.timeoutMs || DEBUGGER_TASK_TIMEOUT_MS;
   const queueWait = options.queueWaitMs || DEBUGGER_QUEUE_TIMEOUT_MS;
@@ -2469,21 +2583,33 @@ function withDebugger(tabId, run, options = {}) {
     }
     const remaining = Math.min(taskTimeout, queueWait - waited);
     let attachError = null;
+    let target = { tabId };
     // 扩展重载/DevTools 关闭的瞬间会偶发 attach 失败；非超时错误重试一次。
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await withDeadline(chrome.debugger.attach({ tabId }, '1.3'), Math.min(10000, remaining), 'debugger_attach_timeout', `cannot attach debugger to tab ${tabId}`);
+        await withDeadline(chrome.debugger.attach(target, '1.3'), Math.min(10000, remaining), 'debugger_attach_timeout', `cannot attach debugger to tab ${tabId}`);
         attachError = null;
         break;
       } catch (error) {
         attachError = error;
         if (error instanceof ToolError && error.code === 'debugger_attach_timeout') break;
-        if (attempt === 0) await sleep(200);
+        if (attempt === 0) {
+          await sleep(200);
+          const byTarget = await attachByTargetId(tabId);
+          if (byTarget) {
+            target = byTarget;
+            attachError = null;
+            break;
+          }
+        }
       }
     }
     if (attachError) {
       if (attachError instanceof ToolError && attachError.code === 'debugger_attach_timeout') throw attachError;
-      throw new ToolError('debugger_attach_failed', `cannot attach debugger to tab ${tabId}: ${attachError.message || attachError}`, 'close DevTools on that tab and retry');
+      const detail = await describeAttachFailure(tabId);
+      throw new ToolError('debugger_attach_failed',
+        `cannot attach debugger to tab ${tabId}: ${attachError.message || attachError} | ${detail}`,
+        'the tab has no attachable page target (DevTools open, or another extension page owns the tab); reload the tab and retry');
     }
     let work;
     try {
@@ -2497,7 +2623,7 @@ function withDebugger(tabId, run, options = {}) {
       }
       throw error;
     } finally {
-      try { await withDeadline(chrome.debugger.detach({ tabId }), 2000, 'debugger_detach_timeout', 'detach timed out'); }
+      try { await withDeadline(chrome.debugger.detach(target), 2000, 'debugger_detach_timeout', 'detach timed out'); }
       catch (_) { /* ignore */ }
     }
   });
@@ -2530,12 +2656,23 @@ function evaluateInTab(tabId, expression) {
 async function jsTool(args) {
   const tab = await resolveTab(args);
   if (isInternalUrl(tab.url)) fail('internal_page', 'browser internal pages cannot run JS', 'open an http(s) page');
-  return withDebugger(tab.id, async () => {
-    let result = await evaluateInTab(tab.id, args.code);
+  try {
+    return await jsViaDebugger(tab.id, args);
+  } catch (error) {
+    // 别的扩展占住 tab 的页面目标时 attach 会持续失败；js 是原语，不能跟着一起消失。
+    if (!(error instanceof ToolError)) throw error;
+    if (error.code !== 'debugger_attach_failed' && error.code !== 'debugger_attach_timeout') throw error;
+    return jsViaScripting(tab.id, args, error);
+  }
+}
+
+async function jsViaDebugger(tabId, args) {
+  return withDebugger(tabId, async () => {
+    let result = await evaluateInTab(tabId, args.code);
     // 顶层 return / 多条语句不是合法表达式：按 async 函数体再跑一次，
     // 与常见 codemode 沙箱的语义保持一致。
     if (result.exceptionDetails && isSyntaxErrorDetails(result.exceptionDetails)) {
-      result = await evaluateInTab(tab.id, `(async () => {\n${args.code}\n})()`);
+      result = await evaluateInTab(tabId, `(async () => {\n${args.code}\n})()`);
       if (result.exceptionDetails) {
         const details = result.exceptionDetails;
         const message = details.exception && details.exception.description || details.text || 'JS error';
@@ -2562,6 +2699,47 @@ async function jsTool(args) {
     const slice = sliceText(value === undefined ? 'undefined' : stringifyValue(value), budget, 0);
     return slice.text + (slice.next == null ? '' : '\n' + footer(slice.total, slice.text.length, slice.next));
   });
+}
+
+/** 在页面 MAIN world 里执行源码；函数在扩展页被序列化，eval 发生在页面侧。 */
+async function injectMainWorld(tabId, source) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    args: [source],
+    func: async (src) => {
+      // eslint-disable-next-line no-eval
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      try {
+        return await (0, eval)(src);
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        return await new AsyncFunction(src)();
+      }
+    },
+  });
+  return results && results[0] ? results[0].result : undefined;
+}
+
+/// debugger 被占时的降级：MAIN world 注入，参数/输出语义与 `js` 一致，额外给一行 via=scripting。
+async function jsViaScripting(tabId, args, attachError) {
+  const code = String(args.code || '');
+  const budget = normalizeBudget(args.budget === undefined ? 8000 : args.budget);
+  let value;
+  try {
+    value = await injectMainWorld(tabId, code);
+  } catch (error) {
+    // eval 在页面里被 CSP 拦或代码语法错：统一报 js_exception，不伪装成 attach 问题。
+    const message = oneLine(error && error.message || error).slice(0, 300);
+    fail('js_exception', message,
+      `scripting fallback failed after ${attachError.code}: page CSP may forbid eval; reload the tab and retry, or close what owns the debugger target`);
+  }
+  const text = value === undefined ? 'undefined' : stringifyValue(value);
+  const slice = sliceText(text, budget, 0);
+  const lines = [slice.text];
+  if (slice.next != null) lines.push(footer(slice.total, slice.text.length, slice.next));
+  lines.push('via=scripting');
+  return lines.join('\n');
 }
 
 function stringifyValue(value) {
