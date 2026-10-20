@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
@@ -75,6 +77,9 @@ pub enum Command {
         /// 等待级别：load|dom|none
         #[arg(long)]
         wait: Option<String>,
+        /// 等文档接位的秒数（默认 15，1..60）
+        #[arg(long)]
+        timeout: Option<f64>,
     },
     /// 读页面为 md|text|html
     Read {
@@ -331,6 +336,7 @@ pub fn build_open(
     replace: bool,
     reuse: &Option<String>,
     wait: &Option<String>,
+    timeout: Option<f64>,
 ) -> Result<ToolCall, String> {
     let mut arguments = json!({ "url": url });
     let picks = [tab.is_some(), replace, reuse.is_some()]
@@ -357,6 +363,14 @@ pub fn build_open(
             return Err(format!("open: --wait must be load|dom|none, got {wait:?}"));
         }
         arguments["wait"] = json!(wait);
+    }
+    if let Some(seconds) = timeout {
+        if !(1.0..=60.0).contains(&seconds) {
+            return Err(format!(
+                "open: --timeout must be 1..60 seconds, got {seconds}"
+            ));
+        }
+        arguments["waitTimeout"] = json!(seconds);
     }
     Ok(ToolCall::new("open", arguments))
 }
@@ -516,6 +530,33 @@ pub fn build_observe(
     Ok(call)
 }
 
+/// 上传载荷上限：daemon 的 /cmd body 上限是 8MB，base64 会膨胀 4/3。
+const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024;
+
+fn guess_mime(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "zip" => "application/zip",
+        "md" => "text/markdown",
+        _ => "application/octet-stream",
+    }
+}
+
 pub fn build_files(args: &FilesArgs) -> Result<ToolCall, String> {
     match &args.cmd {
         FilesCommand::Upload {
@@ -544,7 +585,30 @@ pub fn build_files(args: &FilesArgs) -> Result<ToolCall, String> {
             if targets > 1 {
                 return Err("files upload: use only one of --ref, --selector, --target".into());
             }
-            let mut arguments = json!({ "action": "upload", "paths": paths });
+            // 把字节一并送给扩展：DataTransfer 路径不需要 debugger，
+            // 另一个扩展占住 tab 时 upload 仍然可用。
+            let mut payload: Vec<serde_json::Value> = Vec::new();
+            let mut total_bytes = 0usize;
+            for path in paths {
+                let bytes = std::fs::read(path)
+                    .map_err(|error| format!("files upload: cannot read {path}: {error}"))?;
+                total_bytes += bytes.len();
+                if total_bytes > MAX_UPLOAD_BYTES {
+                    return Err(format!(
+                        "files upload: payload exceeds {} MiB",
+                        MAX_UPLOAD_BYTES / (1024 * 1024)
+                    ));
+                }
+                payload.push(json!({
+                    "name": std::path::Path::new(path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone()),
+                    "type": guess_mime(path),
+                    "data": BASE64.encode(&bytes),
+                }));
+            }
+            let mut arguments = json!({ "action": "upload", "paths": paths, "files": payload });
             if let Some(value) = r#ref {
                 arguments["ref"] = json!(value);
             }
@@ -818,6 +882,23 @@ const ACT_ACTIONS: &[&str] = &[
     "reload",
 ];
 
+/// 位置参数里的 ref 只能是 `e12` / `e12@d1` / `[e12@d1]`；
+/// 否则 `act click foo` 会把拼错的参数当成 ref，报成看不懂的 stale_ref。
+fn check_ref_token(token: &str) -> Result<(), String> {
+    let text = token.trim().trim_start_matches('[').trim_end_matches(']');
+    let body = text.strip_prefix(['e', 'E']).unwrap_or(text);
+    let ok = body.split_once('@').map_or_else(
+        || body.parse::<u64>().is_ok(),
+        |(seq, doc)| seq.parse::<u64>().is_ok() && doc.len() > 1 && doc.starts_with('d'),
+    );
+    if ok {
+        return Ok(());
+    }
+    Err(format!(
+        "act: {token:?} is not a ref (want e12 or e12@d1); use --selector or --target for CSS/role queries"
+    ))
+}
+
 pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
     let mut selector: Option<String> = None;
     let mut target: Option<String> = None;
@@ -873,6 +954,13 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             "--steps" => steps_inline = Some(next_value("--steps")?),
             "--script" => script_path = Some(next_value("--script")?),
             "--submit" => submit_flag = true,
+            other if other.starts_with('-') => {
+                // trailing_var_arg + allow_hyphen_values 会把拼错的 flag 变成位置参数；
+                // 这里直接拒绝，别让它悄悄变成一个 ref。
+                return Err(format!(
+                    "act: unknown flag {other:?} (known: --selector --target --key --delta-y --submit                      --tab --wait-for --steps --script --port)"
+                ));
+            }
             other => {
                 positional.push(other.to_owned());
                 index += 1;
@@ -944,6 +1032,7 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
         match action.as_str() {
             "click" | "hover" | "submit" => {
                 if let Some(r#ref) = rest.first() {
+                    check_ref_token(r#ref)?;
                     arguments["ref"] = json!(r#ref);
                 }
             }
@@ -963,6 +1052,7 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                     // 扩展的 fill 走 fields[]；CLI 保持 `fill e15 "hello"` 的行式形态。
                     let mut field = json!({ "value": text });
                     if let Some(r#ref) = positional_ref {
+                        check_ref_token(&r#ref)?;
                         field["ref"] = json!(r#ref);
                     }
                     if let Some(selector) = arguments.get("selector").cloned() {
@@ -982,11 +1072,13 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                 } else if action == "select" {
                     arguments["value"] = json!(text);
                     if let Some(r#ref) = positional_ref {
+                        check_ref_token(&r#ref)?;
                         arguments["ref"] = json!(r#ref);
                     }
                 } else {
                     arguments["text"] = json!(text);
                     if let Some(r#ref) = positional_ref {
+                        check_ref_token(&r#ref)?;
                         arguments["ref"] = json!(r#ref);
                     }
                 }
@@ -1005,6 +1097,7 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                     .ok_or_else(|| "act press: missing key (act press [ref] <key>)".to_owned())?;
                 arguments["key"] = json!(press_key);
                 if let Some(r#ref) = positional_ref {
+                    check_ref_token(&r#ref)?;
                     arguments["ref"] = json!(r#ref);
                 }
             }
@@ -1725,20 +1818,48 @@ click target=\"button:提交\"
 
     #[test]
     fn open_navigation_modes_are_exclusive() {
-        assert!(build_open("https://x.y", None, false, &None, &None).is_ok());
-        assert!(build_open("https://x.y", Some(3), true, &None, &None).is_err());
+        assert!(build_open("https://x.y", None, false, &None, &None, None).is_ok());
+        assert!(build_open("https://x.y", Some(3), true, &None, &None, None).is_err());
         assert!(
             build_open(
                 "https://x.y",
                 Some(3),
                 false,
                 &Some("session".into()),
-                &None
+                &None,
+                None
             )
             .is_err()
         );
-        assert!(build_open("https://x.y", None, false, &Some("all".into()), &None).is_err());
-        assert!(build_open("https://x.y", None, false, &None, &Some("later".into())).is_err());
+        assert!(build_open("https://x.y", None, false, &Some("all".into()), &None, None).is_err());
+        assert!(
+            build_open(
+                "https://x.y",
+                None,
+                false,
+                &None,
+                &Some("later".into()),
+                None
+            )
+            .is_err()
+        );
+        assert!(build_open("https://x.y", None, false, &None, &None, Some(0.5)).is_err());
+        let call = build_open("https://x.y", None, false, &None, &None, Some(20.0)).unwrap();
+        assert_eq!(args_of(&call)["waitTimeout"], 20.0);
+    }
+
+    #[test]
+    fn act_rejects_unknown_flags_instead_of_treating_them_as_refs() {
+        let error = build_act(&["click".into(), "--at".into(), "593,380".into()])
+            .err()
+            .expect("unknown flag must fail");
+        assert!(error.contains("unknown flag"), "{error}");
+        let error = build_act(&["click".into(), "foo".into()])
+            .err()
+            .expect("non-ref positional must fail");
+        assert!(error.contains("not a ref"), "{error}");
+        assert!(build_act(&["click".into(), "e12@d1".into()]).is_ok());
+        assert!(build_act(&["click".into(), "[e12@d1]".into()]).is_ok());
     }
 
     #[test]
@@ -1777,9 +1898,17 @@ click target=\"button:提交\"
 
     #[test]
     fn files_forms() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("ema2-test-{}-a.pdf", std::process::id()));
+        let b = dir.join(format!("ema2-test-{}-b.txt", std::process::id()));
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&b, b"world").unwrap();
         let call = build_files(&FilesArgs {
             cmd: FilesCommand::Upload {
-                paths: vec!["C:/tmp/a.pdf".into(), "C:/tmp/b.pdf".into()],
+                paths: vec![
+                    a.to_string_lossy().to_string(),
+                    b.to_string_lossy().to_string(),
+                ],
                 r#ref: Some("e3".into()),
                 selector: None,
                 target: None,
@@ -1789,10 +1918,14 @@ click target=\"button:提交\"
         .unwrap();
         assert_eq!(args_of(&call)["action"], "upload");
         assert_eq!(args_of(&call)["ref"], "e3");
-        assert_eq!(
-            args_of(&call)["paths"],
-            json!(["C:/tmp/a.pdf", "C:/tmp/b.pdf"])
-        );
+        assert_eq!(args_of(&call)["paths"][0], a.to_string_lossy().to_string());
+        // 字节载荷随请求下发，upload 不再依赖 debugger。
+        assert_eq!(args_of(&call)["files"][0]["type"], "application/pdf");
+        assert_eq!(args_of(&call)["files"][1]["type"], "text/plain");
+        assert_eq!(args_of(&call)["files"][0]["data"], "aGVsbG8=");
+        assert_eq!(args_of(&call)["files"][1]["data"], "d29ybGQ=");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
 
         let call = build_files(&FilesArgs {
             cmd: FilesCommand::DownloadDir,

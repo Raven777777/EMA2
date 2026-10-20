@@ -61,8 +61,9 @@ fn main() {
             replace,
             reuse,
             wait,
+            timeout,
         } => run_built(
-            cli_args::build_open(&url, tab, replace, &reuse, &wait),
+            cli_args::build_open(&url, tab, replace, &reuse, &wait, timeout),
             port,
         ),
         cli_args::Command::Read {
@@ -454,13 +455,10 @@ fn run_built(call: Result<cli_args::ToolCall, String>, port: u16) -> i32 {
 fn run_tool(call: cli_args::ToolCall, port: u16) -> i32 {
     let port = call.port.unwrap_or(port);
     let out = call.out.as_ref().map(|path| absolute(path));
-    match send_cmd(
-        port,
-        call.tool,
-        &call.args,
-        out.as_deref(),
-        Duration::from_secs(610),
-    ) {
+    // CLI 侧只做“比 daemon 更宽松”的兜底：具体预算由 tools::timeout_for 决定，
+    // 硬编码一个常数会在 batch（600s 上限）和长 js 上先于 daemon 断开。
+    let timeout = tools::timeout_for(call.tool, &call.args) + Duration::from_secs(5);
+    match send_cmd(port, call.tool, &call.args, out.as_deref(), timeout) {
         Ok(result) => {
             let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
             let (text, images) = render_result(&result);

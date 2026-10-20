@@ -181,6 +181,11 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             url_arg(object)?;
             tab_id(object)?;
             enum_arg(object, "wait", &["load", "dom", "none"], false)?;
+            if let Some(timeout) = number_arg(object, "waitTimeout", false)?
+                && !(1.0..=60.0).contains(&timeout)
+            {
+                return Err("waitTimeout must be between 1 and 60 seconds".into());
+            }
             bool_arg(object, "replace")?;
             enum_arg(object, "reuse", &["session"], false)?;
             let replace = object
@@ -373,6 +378,35 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 });
                 if !has_target {
                     return Err("upload needs one of ref, selector, target".into());
+                }
+                // 字节载荷（DataTransfer 路径）：daemon body 上限 8MB，base64 会膨胀 4/3。
+                if let Some(files) = object.get("files").filter(|value| !value.is_null()) {
+                    let Some(files) = files.as_array() else {
+                        return Err("files must be an array".into());
+                    };
+                    if files.len() > 20 {
+                        return Err("files must contain at most 20 entries".into());
+                    }
+                    let mut total = 0usize;
+                    for (index, file) in files.iter().enumerate() {
+                        let Some(file) = file.as_object() else {
+                            return Err(format!("files[{index}] must be an object"));
+                        };
+                        string_arg(file, "name", 255, true, true)
+                            .map_err(|e| format!("files[{index}]: {e}"))?;
+                        string_arg(file, "type", 100, false, true)
+                            .map_err(|e| format!("files[{index}]: {e}"))?;
+                        string_arg(file, "data", 7_000_000, true, true)
+                            .map_err(|e| format!("files[{index}]: {e}"))?;
+                        let data = file.get("data").and_then(Value::as_str).unwrap_or_default();
+                        total += data.len();
+                        if total > 6_500_000 {
+                            return Err(
+                                "files payload exceeds 6.5MB of base64; upload fewer/smaller files"
+                                    .into(),
+                            );
+                        }
+                    }
                 }
             } else {
                 // download-dir 只为返回明确的 download_dir_unsupported 错误，
@@ -1324,5 +1358,30 @@ mod tests {
             ),
             ACT_TIMEOUT + Duration::from_secs(10)
         );
+    }
+    /// 错误码表是 AI 自我纠正的依据；新增 `fail('code'` 时文档必须同步。
+    #[test]
+    fn documented_error_codes_cover_extension_codes() {
+        let js = include_str!("../../extension/background.js");
+        let docs = include_str!("../../docs/TOOLS.md");
+        let mut codes: Vec<String> = Vec::new();
+        let mut rest = js;
+        while let Some(index) = rest.find("fail('") {
+            rest = &rest[index + "fail('".len()..];
+            let end = rest.find("'").unwrap_or(0);
+            let code = &rest[..end];
+            if !code.is_empty() && !codes.iter().any(|known| known == code) {
+                codes.push(code.to_owned());
+            }
+        }
+        assert!(
+            codes.len() > 20,
+            "expected to find fail('code') calls, found {codes:?}"
+        );
+        let missing: Vec<&String> = codes
+            .iter()
+            .filter(|code| !docs.contains(&format!("`{code}`")))
+            .collect();
+        assert!(missing.is_empty(), "docs/TOOLS.md 缺少错误码: {missing:?}");
     }
 }

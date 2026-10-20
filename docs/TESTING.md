@@ -1,6 +1,14 @@
 # EMA2 测试说明 · v2.1.4
 
-> ## 硬性规定：禁止 Node.js 测试
+> ## 硬性规定：真机、前台、可见
+
+- 所有测试都必须在**真实、前台可见的 Edge 窗口**里执行，禁止无头浏览器、
+  禁止后台隐藏窗口、禁止用模拟 DOM 代替。
+- 扩展侧不提供 headless 模式；`shot`、`press`、密码管理器浮层都依赖前台窗口。
+- `scripts/verify.py` 会 `tabs activate` 把窗口提到前台，并断言 `document.hasFocus()`；
+  焦点断言失败即视为测试失败，而不是“跳过”。
+
+## 硬性规定：禁止 Node.js 测试
 >
 > - **绝对禁止**新增或运行 Node.js 测试（`node:test`、`jest`、`jsdom`、Playwright、
 >   Puppeteer、VM 模拟等都不允许）。
@@ -27,6 +35,23 @@ Rust 单测覆盖：工具白名单/参数校验、超时预算、act 脚本/`--
 batch 内层参数、pending 代际、锁中毒、截图/HAR 落盘、HTTP 路由、health/shutdown。
 
 扩展侧不依赖 VM/jsdom 模拟；关键 DOM 行为全部通过下面的真实 Edge 清单覆盖。
+
+## 一键真机验收：`scripts/verify.py`
+
+```bash
+python scripts/verify.py              # 静态契约 + 真实 Edge 冒烟
+python scripts/verify.py --skip-real-edge   # 只查错误码文档漂移
+```
+
+脚本会：
+
+1. 静态检查 `extension/background.js` 的每个 `fail('code'` 都写进了 `docs/TOOLS.md`；
+2. 起一个本机 fixture HTTP 服务，**用真实 `ema2` CLI 驱动真实 Edge** 打开它，
+   依次验证 open / snapshot / act（按钮+链接）/ read（md 链接·表格·列表）/
+   js / wait / observe console·network / shot / files upload / batch / 负例错误码；
+3. 需要 Edge 已加载 `extension/` 且连上 7744，没连会明确提示并退出 2。
+
+它只依赖 Python 标准库，不引入 Node；fixture 是本机页面，结果可复现。
 
 ## 真机验收清单
 

@@ -1,5 +1,25 @@
 # 变更记录
 
+## v2.1.6 — 契约补齐：错误码、md 保真、上传去 debugger、动作校验
+
+一轮代码 review 后的收口，重点是把“看着能用”变成“错了知道为什么错”：
+
+- **act 未知 flag 不再被当 ref**：`ema2 act click --at 593,380` 以前报 `stale_ref`，
+  现在报 `invalid_argument` 并列出已知 flag；位置参数也校验 ref 形态（`e12` / `e12@d1`）。
+- **错误码表补全**：`docs/TOOLS.md` 从 24 条补到 50+ 条，新增 Rust 单测扫描
+  `extension/background.js` 的 `fail('code'`，缺文档直接失败，防止再次漂移。
+- **`read --mode md` 保真**：链接输出 `[text](绝对URL)`、表格输出 GFM 表格、行内代码/强调保留；
+  文档明确它是有损渲染，不是可回写的源文件。
+- **`files upload` 不再依赖 debugger**：CLI 读字节随请求下发，扩展在页面里用 `DataTransfer`
+  构造 `File` 赋给 `input.files`；另一个扩展占住 tab 时上传仍然可用。
+- **act 结果校验**：点了链接但没导航时对 `<a>` 安全重试一次（输出 `retried=1`），
+  仍无导航则明确给 `nav=none` + hint；按钮不重试，避免提交/点赞执行两次。
+- **`type`/`fill` 发 `beforeinput`**：页面 cancel 时返回 `input_prevented` 而不是硬写。
+- **`open --timeout`**：文档接位等待从硬编码 15s 变成 1..60s 可调。
+- 杂项：`snapshot` 的 `visual=` 统计所有图片/媒体；`capText` 截断不再伪装成 `next=`；
+  `mainRoot` 对大页面加候选上限；`batch` 不再猜 `open` 的 tabId；`press` 支持 `+` 与 `Space`。
+- 版本：exe/扩展 2.1.6；`cargo test` 62 passed。
+
 ## v2.1.5 — click 保真、press 修饰键、js 降级通道
 
 真机实测发现三个原语级缺陷，都在扩展侧，Rust 无改动：

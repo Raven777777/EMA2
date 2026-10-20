@@ -327,7 +327,9 @@ function sendResponse(ws, id, payload) {
 function capText(text) {
   const value = String(text == null ? '' : text);
   if (value.length <= MAX_OUTPUT_CHARS) return value;
-  return value.slice(0, MAX_OUTPUT_CHARS) + '\nnext=truncated total=' + value.length;
+  return value.slice(0, MAX_OUTPUT_CHARS)
+    + '\ntruncated=1 total=' + value.length
+    + ' hint=use budget/cursor or narrow the query';
 }
 
 function toResult(value) {
@@ -481,6 +483,9 @@ async function tabsTool(args) {
     const url = args.url;
     if (!url) fail('missing_url', 'tabs new requires url', 'call open instead');
     const tab = await chrome.tabs.create({ url, active: args.active !== false });
+    if (args.active !== false) {
+      try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* ignore */ }
+    }
     await rememberSessionTab(tab.id);
     return `id=${tab.id}\nurl=${tab.pendingUrl || tab.url || url}\nwindow=${tab.windowId}`;
   }
@@ -513,7 +518,14 @@ async function tabsTool(args) {
   if (action === 'activate') {
     const tab = await resolveTab(args);
     await chrome.tabs.update(tab.id, { active: true });
-    return `active=${tab.id}`;
+    // 只切 tab 不会把窗口提到前台；前台语义必须显式 focus 窗口，
+    // 否则截图/密码管理器/输入焦点都会落在后台窗口上。
+    let focused = false;
+    try {
+      await chrome.windows.update(tab.windowId, { focused: true });
+      focused = true;
+    } catch (_) { /* 某些窗口类型不允许 focus */ }
+    return `active=${tab.id}${focused ? ' focused=1' : ' focused=0'}`;
   }
   fail('invalid_action', `unknown tabs action: ${action}`, 'use list|current|new|close|activate');
 }
@@ -564,9 +576,12 @@ async function openTool(args) {
   if (!tab) {
     tab = await chrome.tabs.create({ url: args.url, active: true });
     await rememberSessionTab(tab.id);
+    // 新标签必须让用户看得见：窗口提到前台（测试也依赖前台语义）。
+    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* ignore */ }
   }
   if (wait !== 'none') {
-    await waitForDocument(tab.id, args.url, previousUrl, wait === 'load' ? 'complete' : 'interactive', 15000);
+    const docTimeout = Math.min(60000, Math.max(1000, Number(args.waitTimeout || 15) * 1000));
+    await waitForDocument(tab.id, args.url, previousUrl, wait === 'load' ? 'complete' : 'interactive', docTimeout);
   }
   const current = await chrome.tabs.get(tab.id);
   // 等页面稳定后自动装网络 hook，这样后续 fetch/XHR 都能被 observe network 看到。
@@ -585,6 +600,12 @@ async function openTool(args) {
     `net_hook=${hook ? 'on' : 'off'}`,
   ];
   if (timing && timing.redirects > 0) lines.push(`redirects=${timing.redirects}`);
+  const focused = await runInTab(tab.id, () => document.hasFocus(), []).catch(() => false);
+  lines.push(`focused=${focused ? 1 : 0}`);
+  if (!focused) {
+    lines.push('hint=the browser window is not focused; call `ema2 tabs activate ' + tab.id
+      + '` (or bring Edge to front) before shot/press/password-manager flows');
+  }
   if (timing && timing.status >= 400) {
     lines.push(`hint=http ${timing.status}: the page is probably the site's own error page, not the content you asked for`);
   } else if (timing && timing.status > 0 && timing.status >= 300 && timing.status < 400) {
@@ -998,7 +1019,7 @@ function installHelpers() {
         + Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
         + ' refs=' + refs + ' roots=' + collectRoots().length
         + ' doc=' + docEpoch()
-        + ' visual=' + document.querySelectorAll('canvas,video,img[width],img[height]').length
+        + ' visual=' + document.querySelectorAll('canvas,video,img,picture,object,embed').length
         + (container ? ' near=' + (container.getAttribute('data-ema2-ref') || container.tagName.toLowerCase()) : ''),
       body: out.join('\n'),
       total,
@@ -1031,9 +1052,15 @@ function installHelpers() {
     let bestLength = 0;
     let candidateLength = 0;
     let sawCandidate = false;
+    let evaluated = 0;
     for (const selector of selectors) {
       for (const el of document.querySelectorAll(selector)) {
         sawCandidate = true;
+        // 先用便宜的 textContent 长度做门槛：大页面上候选可能几十个，
+        // 每个都跑一遍 plainText（整棵子树遍历）会把 read 拖成秒级。
+        if ((el.textContent || '').length < 200) continue;
+        if (evaluated >= 12) break;
+        evaluated++;
         // 用清洁后的文本评分，避免 script/style 把候选撑大。
         const text = plainText(el);
         candidateLength = Math.max(candidateLength, text.length);
@@ -1067,19 +1094,77 @@ function installHelpers() {
     };
   };
 
+  /**
+   * 有损正文渲染：保留标题/列表/表格/代码块，链接写成 [text](href)。
+   * 不是可回写的 markdown（样式、合并单元格、脚本生成的内容会丢）。
+   */
   const markdown = (root) => {
     const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
     const BLOCK = /^(DIV|SECTION|ARTICLE|P|UL|OL|LI|TABLE|THEAD|TBODY|TR|TD|TH|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|DL|DT|DD|FIGURE|FIGCAPTION|MAIN|HEADER|FOOTER|ASIDE|FORM|NAV)$/;
-    const out = [];
-    const push = (text) => {
-      const value = clean(text);
-      if (value) out.push(value);
+    const blocks = [];
+    let buffer = '';
+    const flush = () => {
+      const text = clean(buffer);
+      if (text) blocks.push(text);
+      buffer = '';
+    };
+    const hrefOf = (el) => {
+      const raw = el.getAttribute('href') || '';
+      if (!raw || /^javascript:/i.test(raw) || raw === '#') return '';
+      try { return new URL(raw, location.href).href; } catch (_) { return raw; }
+    };
+    const cellText = (cell) => clean(cell.innerText || cell.textContent || '').replace(/\|/g, '\\|');
+    const tableText = (table) => {
+      const rows = [...table.querySelectorAll('tr')]
+        .map(row => [...row.children]
+          .filter(cell => /^(TD|TH)$/.test(cell.tagName))
+          .map(cellText))
+        .filter(cells => cells.length);
+      if (!rows.length) return '';
+      const width = Math.max(...rows.map(cells => cells.length));
+      const pad = (cells) => [...cells, ...Array(Math.max(0, width - cells.length)).fill('')];
+      const head = pad(rows[0]);
+      const lines = [
+        '| ' + head.join(' | ') + ' |',
+        '| ' + head.map(() => '---').join(' | ') + ' |',
+      ];
+      for (const cells of rows.slice(1)) lines.push('| ' + pad(cells).join(' | ') + ' |');
+      return lines.join('\n');
+    };
+    // 行内节点：链接/行内代码/强调转成 markdown，其余退回纯文本。
+    const inline = (node) => {
+      if (node.nodeType === 3) return node.nodeValue || '';
+      if (node.nodeType !== 1) return '';
+      const el = node;
+      const tag = el.tagName;
+      if (!tag || SKIP.test(tag)) return '';
+      if (!isReadVisible(el)) return '';
+      if (tag === 'BR') return '\n';
+      if (tag === 'A') {
+        const text = clean(el.innerText || el.textContent || '');
+        const href = hrefOf(el);
+        if (!text) return href ? href + ' ' : '';
+        return href ? '[' + text + '](' + href + ') ' : text;
+      }
+      if (tag === 'CODE') {
+        const text = clean(el.innerText || '');
+        return text ? '`' + text + '`' : '';
+      }
+      if (tag === 'STRONG' || tag === 'B') {
+        const text = clean(el.innerText || '');
+        return text ? '**' + text + '**' : '';
+      }
+      if (tag === 'EM' || tag === 'I') {
+        const text = clean(el.innerText || '');
+        return text ? '*' + text + '*' : '';
+      }
+      return [...el.childNodes].map(inline).join('');
     };
     const walk = (parent) => {
       // childNodes（而不是 children）确保根节点/混合结构中的直接文本不会丢失。
       for (const node of parent.childNodes || []) {
         if (node.nodeType === 3) {
-          push(node.nodeValue || node.textContent || '');
+          buffer += node.nodeValue || '';
           continue;
         }
         if (node.nodeType !== 1) continue;
@@ -1087,40 +1172,46 @@ function installHelpers() {
         const tag = child.tagName;
         if (!tag || SKIP.test(tag)) continue;
         if (!isReadVisible(child)) continue;
-        if (!child.innerText) continue;
+        if (!child.innerText && !child.querySelector('img,picture,video')) continue;
         if (/^H[1-4]$/.test(tag)) {
           const text = clean(child.innerText);
-          if (text) out.push('#'.repeat(Number(tag[1])) + ' ' + text);
+          if (text) { flush(); blocks.push('#'.repeat(Number(tag[1])) + ' ' + text); }
           continue;
         }
         if (tag === 'PRE') {
           const code = (child.innerText || '').replace(/^\n+/, '').replace(/\s+$/, '');
-          if (code.trim()) out.push('```\n' + code + '\n```');
-          continue;
-        }
-        if (tag === 'UL' || tag === 'OL') {
-          for (const li of child.children) {
-            if (li.tagName !== 'LI') continue;
-            const text = clean(li.innerText);
-            if (text) out.push('- ' + text);
-          }
+          if (code.trim()) { flush(); blocks.push('```\n' + code + '\n```'); }
           continue;
         }
         if (tag === 'TABLE') {
-          const rows = (child.innerText || '').split('\n').map(clean).filter(Boolean);
-          if (rows.length) out.push(rows.join(' | '));
+          const table = tableText(child);
+          if (table) { flush(); blocks.push(table); }
+          continue;
+        }
+        if (tag === 'UL' || tag === 'OL') {
+          flush();
+          const lines = [];
+          for (const li of child.children) {
+            if (li.tagName !== 'LI') continue;
+            const text = clean([...li.childNodes].map(inline).join(' '));
+            if (text) lines.push((tag === 'OL' ? '1. ' : '- ') + text);
+          }
+          if (lines.length) blocks.push(lines.join('\n'));
           continue;
         }
         const hasBlock = [...child.children].some(grand => BLOCK.test(grand.tagName));
-        if (!hasBlock) {
-          push(child.innerText);
+        if (hasBlock) {
+          flush();
+          walk(child);
+          flush();
           continue;
         }
-        walk(child);
+        buffer += inline(child);
       }
     };
     walk(root);
-    return out.join('\n\n');
+    flush();
+    return blocks.join('\n\n');
   };
   /** 清洁文本：跳过 script/style/noscript/iframe/媒体/导航等，块级边界换行。 */
   const plainText = (root) => {
@@ -1233,6 +1324,23 @@ function installHelpers() {
     else if (tag === 'SELECT' && win.HTMLSelectElement) proto = win.HTMLSelectElement.prototype;
     if (!proto) return { ok: false, code: 'not_writable', message: `cannot write to ${String(tag).toLowerCase()}` };
     if (el.readOnly && tag !== 'SELECT') return { ok: false, code: 'element_readonly', message: 'target is read-only' };
+    // 输入掩码（IMask / 金额 / 手机号格式化）依赖 beforeinput；
+    // 页面主动 cancel 时说明它自己接管了输入，这时不强写，避免和页面状态打架。
+    if (tag !== 'SELECT') {
+      try {
+        const text = String(value == null ? '' : value);
+        const before = new InputEvent('beforeinput', {
+          bubbles: true, cancelable: true, inputType: 'insertText', data: text,
+        });
+        if (!el.dispatchEvent(before)) {
+          return {
+            ok: false,
+            code: 'input_prevented',
+            message: 'the page cancelled beforeinput for this control',
+          };
+        }
+      } catch (_) { /* 老浏览器/特殊控件忽略 */ }
+    }
     const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
     if (!descriptor || typeof descriptor.set !== 'function') {
       return { ok: false, code: 'not_writable', message: 'value setter is unavailable' };
@@ -1326,7 +1434,12 @@ function performActionInPage(spec) {
 
   // press 的 key 支持 "Control+Shift+L"：最后一段是键，其余是修饰位。
   const parseKeyCombo = (raw) => {
-    const parts = String(raw || '').split('+').map(part => part.trim()).filter(Boolean);
+    const source = String(raw || '').trim();
+    // '+' 本身无法用分隔符解析，单独处理（真实事件是 Shift+Equal）。
+    if (source === '+') {
+      return { key: '+', code: 'Equal', ctrlKey: false, shiftKey: true, altKey: false, metaKey: false };
+    }
+    const parts = source.split('+').map(part => part.trim()).filter(Boolean);
     const token = parts.pop() || '';
     const combo = { key: '', code: '', ctrlKey: false, shiftKey: false, altKey: false, metaKey: false };
     for (const part of parts) {
@@ -1449,7 +1562,9 @@ function performActionInPage(spec) {
         return { found: true, ok: false, code: 'click_failed', message: String(error && error.message || error) };
       }
       const info = ref ? `ref=${ref}` : target ? `target=${target}` : `selector=${selector}`;
-      return { found: true, ok: true, info, effect, nextUrl };
+      // kind 只影响 settle 后的重试策略：链接可安全重试，按钮不行。
+      const kind = anchor ? 'anchor' : submitter ? 'submit' : 'node';
+      return { found: true, ok: true, info, effect, nextUrl, kind };
     }
     case 'type': {
       const text = spec.text === undefined ? '' : String(spec.text);
@@ -2102,7 +2217,28 @@ async function actTool(args) {
       throw error;
     }
 
-    const settled = await settleAfterAction(tab, step, outcome, stepBefore, tabsBefore);
+    let settled = await settleAfterAction(tab, step, outcome, stepBefore, tabsBefore);
+    // 链接点了但没导航：只对 <a> 安全重试一次（按钮不重试，避免点赞/提交执行两次）。
+    if (outcome.kind === 'anchor' && outcome.effect === 'nav') {
+      const navMissing = settled.settle.settled
+        && !settled.settle.changed.includes('url')
+        && !(settled.settle.newTabIds || []).length;
+      if (navMissing) {
+        await sleep(250);
+        const retryBefore = await pageState(tab.id);
+        let retryTabs = [];
+        try { retryTabs = await chrome.tabs.query({}); } catch (_) { /* ignore */ }
+        const retryOutcome = await runStepWithRetry(tab, step);
+        const retrySettled = await settleAfterAction(tab, step, retryOutcome, retryBefore, retryTabs);
+        if (!retrySettled.settle.settled
+            || retrySettled.settle.changed.includes('url')
+            || (retrySettled.settle.newTabIds || []).length) {
+          outcome = retryOutcome;
+          settled = retrySettled;
+          results.push('retried=1 reason=anchor_did_not_navigate');
+        }
+      }
+    }
     const settle = settled.settle;
     settle.nextUrl = outcome.nextUrl || '';
     lastSettle = settle;
@@ -2154,6 +2290,12 @@ async function actTool(args) {
         : 'hint=page still navigating; call `ema2 await 10s` to keep waiting');
     } else if (!batch && lastSettle.expect === 'page' && changed.length === 0) {
       lines.push('hint=no navigation; if this starts async work, use `--wait-for` or `observe network`');
+    } else if (lastSettle.expect === 'nav'
+        && !changed.includes('url')
+        && !changed.includes('new_tab')) {
+      // 点了导航意图但 URL / 新标签都没变：这是“动作执行了但没生效”，不是成功。
+      lines.push('nav=none');
+      lines.push('hint=the click ran but the page did not navigate; the target may have been re-rendered - snapshot again and retry, or check console_errors');
     }
   }
   if (url) lines.push(`url=${url}`);
@@ -2312,7 +2454,12 @@ function mapActionResult(step, result) {
   if (!result.ok) {
     fail(result.code || 'action_failed', result.message || `${step.action} failed`, result.hint || 'inspect the page and retry with a fresh snapshot');
   }
-  return { info: result.info || '', effect: result.effect || 'none', nextUrl: result.nextUrl || '' };
+  return {
+    info: result.info || '',
+    effect: result.effect || 'none',
+    nextUrl: result.nextUrl || '',
+    kind: result.kind || '',
+  };
 }
 
 async function runStep(tab, step) {
@@ -2459,15 +2606,9 @@ async function filesTool(args) {
   const tab = await resolveTab(args);
   const action = args.action;
   if (action === 'upload') {
+    const payload = Array.isArray(args.files) ? args.files : [];
     const paths = Array.isArray(args.paths) ? args.paths.filter(p => typeof p === 'string' && p.trim()) : [];
-    if (!paths.length) fail('missing_files', 'upload requires paths[]', 'pass absolute file paths');
-    if (paths.length > 20) fail('too_many_files', 'at most 20 paths per upload', 'split into multiple calls');
-    const os = await currentOs();
-    const bad = paths.find(p => !looksAbsolute(p, os));
-    if (bad) {
-      fail('invalid_path', `not an absolute path for ${os}: ${bad}`,
-        os === 'win' ? 'use a Windows path like C:/dir/file.pdf' : 'use a path starting with /');
-    }
+    if (!payload.length && !paths.length) fail('missing_files', 'upload requires paths[]', 'pass absolute file paths');
     if (!args.ref && !args.selector && !args.target) {
       fail('missing_target', 'upload requires ref, selector or target', 'call snapshot and pass the file input ref');
     }
@@ -2487,6 +2628,60 @@ async function filesTool(args) {
         fail('stale_ref', `ref ${targetRef} is stale or belongs to another document`, 'call snapshot again');
       }
       targetRef = current.ref;
+    }
+    if (payload.length) {
+      if (payload.length > 20) fail('too_many_files', 'at most 20 files per upload', 'split into multiple calls');
+      // 字节由 CLI 读好后随请求下发；页面侧用 DataTransfer 赋给 input.files，
+      // 不依赖 debugger（别的扩展占住 tab 时 upload 仍然可用）。
+      const result = await runInTab(tab.id, (ref, selector, target, files) => {
+        const helpers = window.__ema2_helpers;
+        if (!helpers) return { ok: false, code: 'upload_failed', message: 'page helpers are not installed' };
+        const el = helpers.find(ref, selector, target);
+        if (!el) {
+          return {
+            ok: false,
+            code: ref && !helpers.refIsCurrent(ref) ? 'stale_ref' : 'target_not_found',
+            message: 'file input not found',
+          };
+        }
+        if (el.tagName !== 'INPUT' || String(el.type || '').toLowerCase() !== 'file') {
+          return { ok: false, code: 'unsupported_control', message: 'target is not input[type=file]' };
+        }
+        try {
+          const transfer = new DataTransfer();
+          for (const item of files) {
+            const binary = atob(String(item.data || ''));
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+            transfer.items.add(new File([bytes], String(item.name || 'file'), {
+              type: String(item.type || 'application/octet-stream'),
+            }));
+          }
+          el.files = transfer.files;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          return { ok: true, names: [...el.files].map(file => file.name) };
+        } catch (error) {
+          return { ok: false, code: 'upload_failed', message: String((error && error.message) || error) };
+        }
+      }, [targetRef, args.selector || null, args.target || null, payload.map(item => ({
+        name: String(item.name || 'file'),
+        type: String(item.type || 'application/octet-stream'),
+        data: String(item.data || ''),
+      }))]);
+      if (!result || !result.ok) {
+        fail((result && result.code) || 'upload_failed',
+          (result && result.message) || 'cannot assign files',
+          'pass the file input ref from snapshot, or use --selector "input[type=file]"');
+      }
+      return 'uploaded=' + result.names.length + '\nfiles=' + result.names.join(',');
+    }
+    // 旧路径：只给了路径没有字节时，仍走 debugger（扩展读不了本地文件）。
+    const os = await currentOs();
+    const bad = paths.find(p => !looksAbsolute(p, os));
+    if (bad) {
+      fail('invalid_path', `not an absolute path for ${os}: ${bad}`,
+        os === 'win' ? 'use a Windows path like C:/dir/file.pdf' : 'use a path starting with /');
     }
     return withDebugger(tab.id, async () => {
       await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.enable');
@@ -2508,7 +2703,7 @@ async function filesTool(args) {
         files: paths,
         objectId,
       });
-      return `uploaded=${paths.length}\nfiles=${paths.map(p => p.split(/[\\/]/).pop()).join(',')}`;
+      return 'uploaded=' + paths.length + '\nfiles=' + paths.map(p => p.split(/[\\/]/).pop()).join(',');
     });
   }
   if (action === 'download-dir') {
@@ -2916,9 +3111,11 @@ async function batchTool(args) {
           if (toolName === 'open') {
             results[index] = `url=${url}\n` + openedText;
           } else {
-            const tabId = Number((/^id=(\d+)/m.exec(openedText) || [])[1]);
+            const tabId = Number((/^id=(\d+)\s*$/m.exec(openedText) || [])[1]);
             if (!Number.isInteger(tabId)) {
-              results[index] = `url=${url}\n` + openedText;
+              // open 的输出契约变了就别猜：明确失败，而不是把别的东西当 tabId。
+              results[index] = `url=${url}\n` + openedText
+                + '\nerror=internal msg=open did not report id= hint=retry with tool=open to inspect the tab';
             } else {
               const innerArgs = { ...inner, tabId };
               delete innerArgs.replace;

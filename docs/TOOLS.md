@@ -56,32 +56,62 @@ total=2 shown=2 next=none
 
 ## 错误码
 
+> 这张表是 AI 自我纠正的主要依据：新增 `fail('code'` 时必须同步这里，
+> `cargo test` 里有一条测试会扫描 `extension/background.js` 并断言每个 code 都出现在本文中。
+
 | code | 含义 | 建议 |
 |---|---|---|
 | `relay_not_running` | 7744 不通，server 没起 | `ema2 server` |
 | `extension_not_connected` | server 在，扩展没连 | 查扩展 popup 端口是否 7744 |
 | `port_in_use` | 7744 被占用 | `ema2 server stop` 或换 `--port` |
+| `relay_start_failed` | daemon 没起来 | 看提示里的 `%TEMP%\ema2.log` |
+| `shutdown_failed` | server 卡死且 PID 兜底失败 | 手动结束进程后重启 |
+| `extension_error` | 中继连不上扩展（兜底） | `ema2 status` |
 | `invalid_argument` | 参数不合法（含脚本内层参数） | 看本节参数说明 |
-| `no_pending_action` | `await` 没有可等待的 act 上下文 | 先 `act`；或改用 `wait text/selector/time/idle` |
+| `invalid_arguments` | arguments 不是对象 | 用 `key=value` 形式传参 |
+| `invalid_action` | 未支持的 act 动作 | 用 click/type/fill/select/press/hover/scroll/submit/back/forward/reload |
+| `invalid_step` | `steps[]` 缺 action | 每步都要写动作名 |
+| `invalid_tab` | tabId 不是非负整数 | `tabs list` 拿 id |
+| `invalid_tool` | batch 不支持该工具 | batch 只跑 open/read/snapshot/js/wait |
+| `invalid_url` | URL 不是 http(s) | 用完整 http(s) 地址 |
+| `invalid_path` | 上传路径不合法（Windows 必须绝对路径） | 用 `C:/dir/file.pdf` |
+| `invalid_regex` | `bodyFilter` 不合法或有灾难性回溯风险 | 改写正则或改用子串 |
+| `unknown_tool` | 工具名不在白名单 | 11 个工具之一 |
+| `missing_url` | `open` 缺 url | 传 URL |
+| `missing_code` | `js` 缺 code | 传表达式或 `--file` |
+| `missing_fields` | `fill` 缺 `fields[]` | `fill ref value` 或传 fields |
+| `missing_files` | `files upload` 缺 paths | 传至少一个路径 |
+| `missing_target` | 缺 ref/selector/target | 三选一 |
+| `missing_key` | `press` 缺 key | 传键名 |
+| `too_many_files` | 上传文件超过 20 个 | 分批传 |
+| `too_many_steps` | act 步数超过 20 | 拆成多次调用 |
+| `no_active_tab` | 没有活动标签页 | 先 `open` 或 `tabs new` |
+| `tab_not_found` | 标签页不存在/已关闭 | `tabs list` |
 | `stale_ref` | 页面已跳转/刷新/换 tab，ref 失效 | 重新 `snapshot` |
 | `ref_not_found` | 同页但 ref 不存在 | 重新 `snapshot` |
 | `target_not_found` | ref/selector/target 都找不到 | 用 `snapshot` 的 ref，或 `--target "role:name"` |
+| `selector_not_found` | `read --selector` 没匹配到 | 用 `snapshot` 的 ref 或换 selector |
 | `element_disabled` | 目标 disabled | 先启用控件或换目标 |
 | `element_readonly` / `unsupported_control` | 控件不可写/类型不支持 | 用可编辑控件，或 `select` 对应控件 |
-| `value_not_available` | select 没有匹配 option | 检查 option value |
+| `not_writable` / `not_select` | 目标不是可写控件/不是 select | 换目标或换动作 |
+| `value_not_available` / `value_rejected` | select 无匹配 option / 控件拒绝写入 | 检查 value，或改用 `type` |
+| `input_prevented` | 页面 cancel 了 `beforeinput`（自己接管输入） | 用 `js` 或 `press` 逐键输入 |
+| `click_failed` | 点击触发时页面抛错 | 看 console，或换目标 |
+| `action_failed` | 动作没有返回结果/执行失败 | 重新 `snapshot` 后重试 |
 | `no_form` | submit 目标不在 form 内 | 用 click 提交按钮，或 press Enter |
+| `no_pending_action` | `await` 没有可等待的 act 上下文 | 先 `act`；或改用 `wait text/selector/time/idle` |
+| `wait_timeout` | `wait`/`await` 条件超时 | 检查条件或提高 timeout |
+| `response_timeout` | `act waitFor` 未等到响应 | 看 `observation_gap`，或调大 timeout |
 | `tab_not_active` | `shot` 目标不是活动 tab | 先 `tabs activate`；截图只截当前活动页 |
 | `tab_changed` | 截图过程中目标 document 变化 | 页面稳定后重试 |
-| `response_timeout` | `act waitFor` 未等到响应 | 看 `observation_gap`，或调大 timeout |
-| `wait_timeout` | `wait` 条件超时 | 检查条件或提高 timeout |
-| `invalid_regex` | `bodyFilter` 不是合法正则 | 修正正则 |
-| `relay_start_failed` | daemon 没起来 | 看提示里的 `%TEMP%\ema2.log` |
-| `shutdown_failed` | server 卡死且 PID 兜底失败 | 手动结束进程后重启 |
-| `debugger_attach_failed` | 该 tab 被 DevTools 占用 | 已自动重试一次；仍失败则关掉 DevTools 重试 |
+| `capture_failed` / `capture_empty` | `captureVisibleTab` 失败/空图 | 让窗口可见并保持前台 |
+| `snapshot_failed` | 快照没有产出 | 重试，或用 `shot` 看渲染 |
+| `upload_failed` | 文件注入失败 | 换 ref/selector，或确认目标是 `input[type=file]` |
+| `js_exception` | 页面 JS 抛错（语法或运行时） | 看 `hint`，先 `read`/`snapshot` 再改代码 |
+| `debugger_attach_failed` | 无法挂 debugger（DevTools 或其他扩展占用该 tab） | `js` 会自动降级（看 `via=scripting`）；否则重载该 tab |
 | `debugger_timeout` / `debugger_busy` | JS 执行或队列等待超期 | 终止长任务后重试 |
 | `internal_page` | 内置页（edge:// 等）不可脚本化 | 换 http(s) 页面 |
 | `download_dir_unsupported` | Edge 不允许扩展改下载目录 | 文件会进默认下载目录 |
-| `extension_error` | 中继连不上扩展（兜底） | `ema2 status` |
 
 ## 服务管理
 
@@ -159,7 +189,7 @@ ema2 tabs activate <id>
 ## open
 
 ```bash
-ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none]
+ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] [--timeout 15]
 ```
 
 等页面就绪、装网络 hook，返回 `id / url / title / status / reuse / net_hook`（有重定向时加 `redirects=`）。
@@ -168,6 +198,7 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none]
 - `--replace`：在当前活动标签里导航（不新建），适合「同一个页面连续翻几页」。
 - `--reuse session`：复用本会话**最近**打开的标签；标签已被关掉则退回新建。
 - `--tab ID`：导航指定标签（显式意图，不计入会话）。
+- `--timeout N`：等文档接位的秒数（1..60，默认 15）；慢站点/SPA 首屏可以调大。
 - 三者互斥，同时给报 `invalid_argument`。
 - `status=` 来自 `PerformanceNavigationTiming.responseStatus` 的真实主文档状态：
   `status=404` 这类错误页会额外给 `hint=http 404 ...`；`--wait none` 时是 `status=pending`。
@@ -188,6 +219,8 @@ ema2 read [--tab ID] [--mode md|text|html] [--selector X] [--no-main] [--budget 
   nav/header/footer/aside/form 等页面壳，以及 `display:none`/`visibility:hidden`/
   `content-visibility` 的隐藏元素；`html` 仍是原始 HTML。
 - Markdown 按 `childNodes` 遍历，根节点直接文本、p/h1/pre、文本+块混排都不会漏字或重复。
+- `md` 是**有损**渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对 URL)`，
+  行内代码与 `strong/em` 保留；样式、合并单元格、脚本生成内容会丢，不要拿它当可回写的源文件。
 - 头部 `url/title[/main]`，正文，尾部 `total/shown/next`。
 - **被截断时尾部多一行** `hint=truncated: returned 4000 of 12345 chars; call read with --cursor 4000 to continue`：
   不要把这 4000 字当成全文，按提示传 `--cursor` 续读（长页面的 FAQ/页脚常在后半段）。
@@ -246,6 +279,13 @@ ema2 act --script run.ema2                    # 脚本文件
 - 动作打开新标签时会返回 `new_tab=<id>`，并自动登记进会话；`tabs close --session` 会清掉它。
 - disabled/readOnly/不支持写值的控件返回明确错误；`type` 只回 `wrote=1 chars=N`，不回显输入。
 - `select` 的位置参数是 option 的 `value`（不是显示文本）。
+- `click` 会补齐指针事件序列（`pointerover/pointerdown/mousedown` → 聚焦 → `pointerup/mouseup`），
+  最后用原生 `el.click()` 触发一次激活；靠 `focusin`/`pointerdown` 出浮层的密码管理器能看到这次点击。
+  事件是合成的（`isTrusted=false`），校验 `isTrusted` 的站点仍会忽略。
+- 点了 `<a>` 但 URL/标签都没变时只对链接安全重试一次，输出 `retried=1`；
+  仍没导航则额外给 `nav=none` + hint（按钮不重试，避免提交/点赞执行两次）。
+- `type`/`fill` 写值前会发 `beforeinput`；页面 cancel 掉它时返回 `input_prevented`，
+  说明该控件自己接管输入，改用 `js` 或逐键 `press`。
 - `press` 有定位时先聚焦目标再发键；无定位时使用当前焦点。键名支持组合写法 `Control+Shift+L`、`Meta+K`，
   会正确设置 `ctrlKey/shiftKey/altKey/metaKey` 与 `code`（`KeyL`/`Digit7`/`Enter`…）。
   合成 KeyboardEvent 只能到达页面：`chrome.commands` 快捷键、浏览器 UI（地址栏、标签页切换）不会响应。
@@ -383,6 +423,12 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
   - `--body-filter` 限 512 字符，拒绝量词嵌套（`(a+)+`）与量词组内分支（`(a|a)+`）这类
     会指数回溯的形态，返回 `invalid_regex`。
   - `--har PATH`：导出 HAR 1.2（采样/预览，不是完整抓包），落盘并回 `path=` + `entries=N`。
+
+## files
+
+上传走**页面侧 DataTransfer**：CLI 读文件字节随请求下发，扩展在页面里构造 `File`
+再赋给 `input.files`，因此不依赖 debugger（别的扩展占住 tab 时也能用）。
+单次 ≤20 个文件、载荷 ≤5 MiB；下载目录仍固定报 `download_dir_unsupported`（Edge 限制）。
 
 ## files
 

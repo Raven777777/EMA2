@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.1.5
-extension  2.1.5
+exe        2.1.6
+extension  2.1.6
 helper     10
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
@@ -79,6 +79,9 @@ Edge 侧：
 
 ## 测试
 
+真机测试必须在前台可见的真实 Edge 里跑（禁止无头/后台窗口）；`scripts/verify.py`
+会先把窗口提到前台并断言 `document.hasFocus()`。
+
 ```bash
 cd rust
 cargo fmt --check
@@ -140,17 +143,17 @@ cargo test
 
 ## 已知弱点与下一步优先级
 
-### P1：act 结果可信度
+### P1：act 结果可信度（v2.1.6 已大部分落地）
 
 HN 真机出现过一次 `act click` 返回 `ok=1/1` 但页面没有导航，换 selector 后成功。
-可能是页面重绘导致元素被替换。下一步建议：
+v2.1.6 起：
 
-- 点击 `<a>` 后验证 URL / document / 新标签 / DOM 变化
-- 无变化时只对 `<a>` 安全重试一次
-- 普通按钮不自动重试（避免点赞/提交点两次）
-- 明确返回 `nav=none` + hint，而不是假成功
+- 点击 `<a>` 后结算里没有 `url`/`new_tab` 变化时，只对链接安全重试一次（输出 `retried=1`）
+- 仍无变化则给 `nav=none` + hint，而不是假成功
+- 普通按钮**不**自动重试（避免点赞/提交执行两次）
 
-这是当前核心最值得投入的方向。
+还没做：按钮类动作的“预期效果”校验（比如表单提交失败仍停在本页）。
+先靠 `--wait-for "url=... status=..."` 覆盖，不要为了按钮加启发式。
 
 ### P2：动态页面可读时机
 
