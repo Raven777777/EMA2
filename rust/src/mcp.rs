@@ -16,6 +16,20 @@ use crate::tools;
 const MAX_SCREENSHOT_BASE64: usize = 48 * 1024 * 1024;
 /// 支持的 MCP 协议版本，第一个为最新（未知版本回落值）。
 pub const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// `initialize` 返回给客户端的服务端说明。
+///
+/// 这是模型判断“这组工具到底操作什么浏览器”的第一手材料：必须明确写出
+/// 用户的真实可见 Edge、带真实登录态、不是无头/远程/沙箱，否则模型很容易
+/// 把 tabs/open/read 当成通用网页工具，甚至声称自己没有控制浏览器的工具。
+pub const INSTRUCTIONS: &str = "\
+EMA2 controls the user's real, visible Microsoft Edge browser: the same window they are using, with their real cookies, logins, tabs and extensions. It is NOT a headless browser, NOT a remote browser, and NOT a sandbox.
+
+Every tool in this server (tabs, open, read, snapshot, act, wait, js, observe, files, shot, batch) operates on that real browser. The tabs you see are the user's actual tabs, and screenshots capture the visible window.
+
+When the user asks to open, read, click, fill, scroll, inspect network/console, or screenshot a page, call these tools directly. Never tell the user that you have no tool to control their browser: you do, and it is this server.
+
+Typical flow: tabs(action=current|list) or open(url) -> snapshot -> act by ref -> read/observe when needed. Ask before destructive or irreversible actions (purchases, deletions, sending messages).";
 static NEXT_SCREENSHOT_ID: AtomicU64 = AtomicU64::new(0);
 
 pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
@@ -54,8 +68,15 @@ pub async fn handle(state: &RelayState, request: Value) -> Option<Value> {
                 "jsonrpc": "2.0",
                 "result": {
                     "protocolVersion": version,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "edge-browser-mcp", "version": env!("CARGO_PKG_VERSION") }
+                    // logging 是真实能力：扩展连接/断开通过 GET /mcp 的
+                    // notifications/message 推给客户端。
+                    "capabilities": { "tools": {}, "logging": {} },
+                    "serverInfo": {
+                        "name": "ema2",
+                        "title": "EMA2 — user's real Microsoft Edge browser",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "instructions": INSTRUCTIONS
                 }
             }))
         }
@@ -448,6 +469,48 @@ mod tests {
         let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let response = handle(&state(), request).await.unwrap();
         assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 11);
+    }
+
+    #[tokio::test]
+    async fn initialize_identifies_the_users_real_browser() {
+        let response = handle(
+            &state(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "1" }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let result = &response["result"];
+        assert_eq!(result["serverInfo"]["name"], "ema2");
+        assert!(
+            result["serverInfo"]["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("real"),
+            "serverInfo.title must describe the real browser: {}",
+            result["serverInfo"]
+        );
+        let instructions = result["instructions"].as_str().unwrap_or_default();
+        assert!(
+            instructions.contains("real, visible Microsoft Edge browser"),
+            "instructions must name the real Edge browser"
+        );
+        assert!(
+            instructions.contains("NOT a headless browser"),
+            "instructions must rule out the headless misconception"
+        );
+        assert!(
+            instructions.contains("Never tell the user that you have no tool"),
+            "instructions must forbid the 'no browser tool' claim"
+        );
     }
 
     #[test]

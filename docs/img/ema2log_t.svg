@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1380 512" role="img" aria-label="EMA2 Logo">
+  <defs>
+    <linearGradient id="edge-flow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00CFE8"/>
+      <stop offset="50%" stop-color="#1688C9"/>
+      <stop offset="100%" stop-color="#064B78"/>
+    </linearGradient>
+
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <!-- 左侧 Edge 螺旋 -->
+  <path d="M256,40C370,40,456,120,456,230C456,350,360,440,240,440C140,440,72,370,72,276C72,210,115,160,175,160C185,160,190,168,185,176C150,210,135,245,135,280C135,330,175,370,240,370C315,370,380,310,380,225C380,145,320,95,240,95C180,95,125,128,90,175C82,185,70,180,72,168C105,100,170,40,256,40Z"
+        fill="url(#edge-flow)"
+        filter="url(#shadow)"/>
+
+  <!-- 主标题：深海蓝 -->
+  <text x="520" y="302"
+        text-anchor="start"
+        font-family="Segoe UI, Arial, sans-serif"
+        font-size="312"
+        font-weight="700"
+        fill="#064B78">EMA2</text>
+
+  <!-- 副标题：协调的亮蓝；略微右移以修正不同字号字形边距造成的视觉错位 -->
+  <text x="539" y="397"
+        text-anchor="start"
+        font-family="Segoe UI, Arial, sans-serif"
+        font-size="76"
+        font-weight="600"
+        letter-spacing="5"
+        fill="#1688C9">EDGE MCP AGENT</text>
+</svg>

@@ -15,15 +15,15 @@ Python 标准库，可以当作「用 EMA2 写爬虫」的最小模板：
     python examples/scrape_baike.py Python
     python examples/scrape_baike.py 量子计算 -o examples/output/quantum.md
     python examples/scrape_baike.py https://baike.baidu.com/item/DeepSeek --keep-tab --max-chars 100000
-    EDGE_MCP_TOKEN=xxx python examples/scrape_baike.py Python     # 中继开了 token 时
+    EDGE_MCP_TOKEN=xxx python examples/scrape_baike.py Python     # 中继默认要求 token
 
 前置条件：
-    1. bin\\ema2.exe run（或 scripts\\start-bridge.cmd）
-    2. Edge 里已加载 extension/，且 ema2.exe status 显示 extension_connected: true
+    1. set EDGE_MCP_TOKEN=xxx && bin\\ema2.exe run（或 scripts\\start-bridge.cmd）
+    2. Edge 里已加载 extension/ 并设置同一个 token，且 ema2.exe status 显示 extension_connected: true
 
 环境变量：
     EMA2_MCP_URL    覆盖 MCP 地址（默认 http://127.0.0.1:8765/mcp）
-    EDGE_MCP_TOKEN  中继启用鉴权时的 Bearer token
+    EDGE_MCP_TOKEN  Bearer token（中继默认启用鉴权，必填）
 """
 
 from __future__ import annotations
@@ -252,7 +252,7 @@ def baike_url(entry: str) -> str:
 
 
 def output_field(text: str, key: str) -> str | None:
-    """从 v1.4 的行式输出里取 `key=value`。"""
+    """从行式输出里取 `key=value`。"""
     match = re.search(rf"^{re.escape(key)}=(.*)$", text or "", re.MULTILINE)
     return match.group(1) if match else None
 

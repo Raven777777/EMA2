@@ -13,6 +13,8 @@ use serde_json::{Map, Value, json};
 
 pub struct Tool {
     pub name: &'static str,
+    /// 客户端 UI 里显示的短标题（部分客户端会展示给用户/模型）。
+    pub title: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
 }
@@ -33,12 +35,18 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     vec![
         Tool {
             name: "tabs",
-            description: "Tabs: action=list|current|new|close|activate. list = TSV id/active/title/url",
+            title: "List / manage real Edge tabs",
+            description: "On the user's real, visible Microsoft Edge browser (not headless): action=list|current|new|close|activate. list=TSV id/active/title/url; close takes tabId|tabIds[]|scope=session.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["list", "current", "new", "close", "activate"] },
                     "tabId": { "type": "integer", "minimum": 0 },
+                    "tabIds": {
+                        "type": "array", "minItems": 1, "maxItems": 8,
+                        "items": { "type": "integer", "minimum": 0 }
+                    },
+                    "scope": { "type": "string", "enum": ["session"] },
                     "url": { "type": "string" },
                     "active": { "type": "boolean" }
                 }
@@ -46,20 +54,24 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "open",
-            description: "Open url in new tab, or navigate tabId. Returns id/url/title/net_hook.",
+            title: "Open a page in real Edge",
+            description: "Open a URL in the user's real Edge browser: new tab by default; replace=true uses the current tab, reuse=\"session\" the last session tab, tabId that tab. Returns id/url/title/status/reuse/net_hook.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "maxLength": 8192 },
                     "tabId": { "type": "integer", "minimum": 0 },
-                    "wait": { "type": "string", "enum": ["load", "dom", "none"] }
+                    "wait": { "type": "string", "enum": ["load", "dom", "none"] },
+                    "replace": { "type": "boolean" },
+                    "reuse": { "type": "string", "enum": ["session"] }
                 },
                 "required": ["url"]
             }),
         },
         Tool {
             name: "read",
-            description: "Read page as md|text|html. main=true (default) extracts main content; selector/budget/cursor supported.",
+            title: "Read a page from real Edge",
+            description: "Read the page open in the user's real Edge as md|text|html. main=true (default) extracts main content; selector/budget/cursor supported. Truncation adds hint=truncated + cursor.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -74,7 +86,8 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "snapshot",
-            description: "Ref snapshot `[e12@doc] button \"X\"`. filter/ near=<ref> scope; refs are document-scoped and go stale after navigation.",
+            title: "Snapshot real Edge page",
+            description: "Snapshot the user's real Edge page as refs `[e12@d1] button \"X\"`. filter/ near=<ref> scope; refs are document-scoped and go stale after navigation.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -88,7 +101,8 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "act",
-            description: "click|type|fill|select|press|hover|scroll|submit|back|forward|reload by ref/selector/target; steps[] batch; waitFor response.",
+            title: "Act in real Edge",
+            description: "Interact with the user's real Edge page: click|type|fill|select|press|hover|scroll|submit|back|forward|reload by ref/selector/target; steps[] batch; waitFor response.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -133,7 +147,8 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "wait",
-            description: "Wait for one of text|textGone|selector|time|idle (max 300s).",
+            title: "Wait in real Edge",
+            description: "Wait inside the user's real Edge page for one of text|textGone|selector|time|idle (max 300s).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -149,7 +164,8 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "js",
-            description: "Eval JS in tab (await ok); compact value, budget-capped.",
+            title: "Run JS in real Edge",
+            description: "Evaluate JS in a tab of the user's real Edge browser (await ok); compact value, budget-capped. On timeout all JS in that tab is terminated.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -162,7 +178,8 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "observe",
-            description: "console deltas or network (fetch/XHR with real status+body). since=last next; bodyFilter regex; har=true exports HAR.",
+            title: "Observe real Edge network/console",
+            description: "Observe the user's real Edge tab: console deltas or network (fetch/XHR with real status+body). since=last next; bodyFilter regex; har=true exports HAR.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -182,7 +199,8 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "files",
-            description: "Upload local files into a file input, or set the download directory.",
+            title: "Upload files in real Edge",
+            description: "Upload local files into a file input on the user's real Edge page. action=download-dir is accepted but Edge always returns download_dir_unsupported.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -199,7 +217,8 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "shot",
-            description: "Screenshot: default saves PNG and returns path; inline=true returns image; annotate=true adds ref boxes and a coordinate list.",
+            title: "Screenshot real Edge",
+            description: "Screenshot the user's real, visible Edge tab: default saves PNG and returns path; inline=true returns image; annotate=true adds ref boxes and a coordinate list.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -212,19 +231,25 @@ pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         },
         Tool {
             name: "batch",
-            description: "Run read|snapshot|js|wait on several tabs concurrently. Returns one block per tab.",
+            title: "Batch across real Edge tabs",
+            description: "Run open|read|snapshot|js|wait concurrently on the user's real Edge tabs: tabIds for existing tabs, urls to open each url then run there.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tool": { "type": "string", "enum": ["read", "snapshot", "js", "wait"] },
+                    "tool": { "type": "string", "enum": ["open", "read", "snapshot", "js", "wait"] },
                     "tabIds": {
                         "type": "array", "minItems": 1, "maxItems": 8,
                         "items": { "type": "integer", "minimum": 0 }
                     },
+                    "urls": {
+                        "type": "array", "minItems": 1, "maxItems": 8,
+                        "items": { "type": "string", "maxLength": 8192 }
+                    },
                     "args": { "type": "object" },
                     "concurrency": { "type": "integer", "minimum": 1, "maximum": 4 }
                 },
-                "required": ["tool", "tabIds"]
+                "required": ["tool"],
+                "anyOf": [{ "required": ["tabIds"] }, { "required": ["urls"] }]
             }),
         },
     ]
@@ -237,6 +262,7 @@ pub fn tool_list() -> Value {
             .map(|tool| {
                 json!({
                     "name": tool.name,
+                    "title": tool.title,
                     "description": tool.description,
                     "inputSchema": tool.input_schema,
                 })
@@ -262,11 +288,14 @@ pub fn timeout_for(name: &str, arguments: &Value) -> Duration {
             ACT_TIMEOUT + Duration::from_secs_f64(wait)
         }
         "js" | "shot" | "files" => LONG_TIMEOUT,
-        "batch" => Duration::from_secs_f64(
-            batch_budget_seconds(arguments).min(MAX_CALL_TIMEOUT.as_secs_f64()),
-        ),
+        "batch" => batch_budget(arguments).min(MAX_CALL_TIMEOUT),
         _ => DEFAULT_TIMEOUT,
     }
+}
+
+/// batch 的实际预算（未截断）：`timeout_for` 与参数校验共用这一个入口。
+fn batch_budget(arguments: &Value) -> Duration {
+    Duration::from_secs_f64(batch_budget_seconds(arguments))
 }
 
 /// 已校验/已应用默认值后的 wait 实际秒数：time 优先，否则 timeout（默认 30）。
@@ -282,8 +311,16 @@ fn wait_seconds(arguments: &Value) -> f64 {
 }
 
 fn batch_tab_count(arguments: &Value) -> usize {
-    arguments
+    let tabs = arguments
         .get("tabIds")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if tabs > 0 {
+        return tabs;
+    }
+    arguments
+        .get("urls")
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0)
@@ -300,6 +337,7 @@ fn batch_concurrency(arguments: &Value) -> f64 {
 /// batch 的总预算 = 执行波次 × 单次最长耗时 + 余量。
 ///
 /// js 走全局 debugger 串行队列，所以有效并发固定为 1，不能直接使用声明并发。
+/// 传 urls 时每个目标多一次 open（等 load + 装 hook）。
 fn batch_budget_seconds(arguments: &Value) -> f64 {
     let tool = arguments
         .get("tool")
@@ -317,7 +355,21 @@ fn batch_budget_seconds(arguments: &Value) -> f64 {
         "js" => DEBUGGER_TASK_SECS,
         _ => DEFAULT_TIMEOUT.as_secs_f64(),
     };
-    waves * per_call + RELAY_MARGIN_SECS
+    let opens = batch_url_count(arguments) as f64;
+    let open_cost = if opens > 0.0 {
+        (opens / effective).ceil() * (PAGE_WAIT_TIMEOUT.as_secs_f64() + 2.0)
+    } else {
+        0.0
+    };
+    waves * per_call + open_cost + RELAY_MARGIN_SECS
+}
+
+fn batch_url_count(arguments: &Value) -> usize {
+    arguments
+        .get("urls")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
@@ -336,6 +388,19 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 false,
             )?;
             tab_id(object)?;
+            let has_many = tab_ids_arg(object)?;
+            enum_arg(object, "scope", &["session"], false)?;
+            if has_many && object.get("tabId").is_some_and(|v| !v.is_null()) {
+                return Err("use either tabId or tabIds, not both".into());
+            }
+            let action = object
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let wants_close = has_many || object.get("scope").is_some_and(|v| !v.is_null());
+            if wants_close && action != "close" {
+                return Err("tabIds/scope only apply to tabs action=close".into());
+            }
             if object.get("url").is_some_and(|v| !v.is_null()) {
                 url_arg(object)?;
             }
@@ -345,6 +410,20 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             url_arg(object)?;
             tab_id(object)?;
             enum_arg(object, "wait", &["load", "dom", "none"], false)?;
+            bool_arg(object, "replace")?;
+            enum_arg(object, "reuse", &["session"], false)?;
+            let replace = object
+                .get("replace")
+                .is_some_and(|v| matches!(v, Value::Bool(true)));
+            let has_reuse = object.get("reuse").is_some_and(|v| !v.is_null());
+            let has_tab = object.get("tabId").is_some_and(|v| !v.is_null());
+            let picks = [replace, has_reuse, has_tab]
+                .iter()
+                .filter(|flag| **flag)
+                .count();
+            if picks > 1 {
+                return Err("use only one of tabId, replace=true, reuse=session".into());
+            }
         }
         "read" => {
             tab_id(object)?;
@@ -442,11 +521,7 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
         "observe" => {
             enum_arg(object, "kind", &["console", "network"], true)?;
             tab_id(object)?;
-            if let Some(since) = number_arg(object, "since", false)?
-                && since < 0.0
-            {
-                return Err("since must be >= 0".into());
-            }
+            counter_arg(object, "since")?;
             enum_arg(object, "level", &["log", "warn", "error"], false)?;
             string_arg(object, "filter", 2_048, false, true)?;
             string_arg(object, "bodyFilter", 512, false, true)?;
@@ -511,17 +586,38 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             bool_arg(object, "annotate")?;
         }
         "batch" => {
-            enum_arg(object, "tool", &["read", "snapshot", "js", "wait"], true)?;
-            let Some(tab_ids) = object.get("tabIds").and_then(Value::as_array) else {
-                return Err("tabIds must be an array".into());
-            };
-            if tab_ids.is_empty() || tab_ids.len() > 8 {
-                return Err("tabIds must contain 1..8 entries".into());
+            enum_arg(
+                object,
+                "tool",
+                &["open", "read", "snapshot", "js", "wait"],
+                true,
+            )?;
+            let tool = object
+                .get("tool")
+                .and_then(Value::as_str)
+                .expect("required above");
+            let has_urls = urls_arg(object)?;
+            let has_tabs = object
+                .get("tabIds")
+                .is_some_and(|v| !matches!(v, Value::Null));
+            if has_urls && has_tabs {
+                return Err("batch takes either tabIds or urls, not both".into());
             }
-            for (index, id) in tab_ids.iter().enumerate() {
-                match id.as_f64() {
-                    Some(value) if value >= 0.0 && value.fract() == 0.0 => {}
-                    _ => return Err(format!("tabIds[{index}] must be a non-negative integer")),
+            if !has_urls {
+                let Some(tab_ids) = object.get("tabIds").and_then(Value::as_array) else {
+                    return Err("batch needs tabIds[] or urls[]".into());
+                };
+                if tab_ids.is_empty() || tab_ids.len() > 8 {
+                    return Err("tabIds must contain 1..8 entries".into());
+                }
+                for (index, id) in tab_ids.iter().enumerate() {
+                    match id.as_f64() {
+                        Some(value) if value >= 0.0 && value.fract() == 0.0 => {}
+                        _ => return Err(format!("tabIds[{index}] must be a non-negative integer")),
+                    }
+                }
+                if tool == "open" {
+                    return Err("batch open needs urls[], not tabIds[]".into());
                 }
             }
             if let Some(args) = object.get("args")
@@ -537,20 +633,21 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             // 内层参数复用子工具自己的验证器：batch 不能绕过 wait.time=300 等限制。
             if let Some(inner) = object.get("args") {
                 let inner = inner.as_object().expect("checked above");
-                let tool = object
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .expect("required above");
                 let mut merged = inner.clone();
-                merged.insert("tabId".into(), json!(0));
+                if tool == "open" {
+                    // urls 模式下 url 由 batch 逐个注入，这里只校验 wait/replace/reuse。
+                    merged.insert("url".into(), json!("https://placeholder.invalid/"));
+                } else {
+                    merged.insert("tabId".into(), json!(0));
+                }
                 validate_arguments(tool, &Value::Object(merged))
                     .map_err(|error| format!("args: {error}"))?;
             }
-            let budget = batch_budget_seconds(&Value::Object(object.clone()));
-            if budget > MAX_CALL_TIMEOUT.as_secs_f64() {
+            let budget = batch_budget(&Value::Object(object.clone()));
+            if budget > MAX_CALL_TIMEOUT {
                 return Err(format!(
-                    "batch estimated budget {:.0}s exceeds the {}s call limit; reduce tabIds, raise concurrency, or split the batch",
-                    budget,
+                    "batch estimated budget {:.0}s exceeds the {}s call limit; reduce tabIds/urls, raise concurrency, or split the batch",
+                    budget.as_secs_f64(),
                     MAX_CALL_TIMEOUT.as_secs()
                 ));
             }
@@ -718,6 +815,52 @@ fn tab_id(object: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
+/// `tabIds`（批量关闭）：1..8 个非负整数；返回是否出现。
+fn tab_ids_arg(object: &Map<String, Value>) -> Result<bool, String> {
+    let Some(value) = object.get("tabIds").filter(|v| !matches!(v, Value::Null)) else {
+        return Ok(false);
+    };
+    let Some(ids) = value.as_array() else {
+        return Err("tabIds must be an array".into());
+    };
+    if ids.is_empty() || ids.len() > 8 {
+        return Err("tabIds must contain 1..8 entries".into());
+    }
+    for (index, id) in ids.iter().enumerate() {
+        match id.as_f64() {
+            Some(value) if value >= 0.0 && value.fract() == 0.0 => {}
+            _ => return Err(format!("tabIds[{index}] must be a non-negative integer")),
+        }
+    }
+    Ok(true)
+}
+
+/// `urls`（batch 复合模式）：1..8 个 http(s) URL。
+fn urls_arg(object: &Map<String, Value>) -> Result<bool, String> {
+    let Some(value) = object.get("urls").filter(|v| !matches!(v, Value::Null)) else {
+        return Ok(false);
+    };
+    let Some(urls) = value.as_array() else {
+        return Err("urls must be an array".into());
+    };
+    if urls.is_empty() || urls.len() > 8 {
+        return Err("urls must contain 1..8 entries".into());
+    }
+    for (index, url) in urls.iter().enumerate() {
+        let Some(text) = url.as_str() else {
+            return Err(format!("urls[{index}] must be a string"));
+        };
+        if text.len() > 8_192 || text.trim().is_empty() {
+            return Err(format!("urls[{index}] must be a non-empty url (max 8192)"));
+        }
+        let lower = text.to_ascii_lowercase();
+        if !lower.starts_with("http://") && !lower.starts_with("https://") {
+            return Err(format!("urls[{index}] must use http or https"));
+        }
+    }
+    Ok(true)
+}
+
 fn url_arg(object: &Map<String, Value>) -> Result<(), String> {
     string_arg(object, "url", 8_192, true, false)?;
     let url = object
@@ -740,13 +883,27 @@ fn budget_arg(object: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-fn cursor_arg(object: &Map<String, Value>) -> Result<(), String> {
-    if let Some(cursor) = number_arg(object, "cursor", false)?
-        && (cursor < 0.0 || cursor.fract() != 0.0)
-    {
-        return Err("cursor must be a non-negative integer".into());
+/// 游标类参数（cursor / since）从工具输出里抄回来，模型常把它写成字符串（"400"）。
+/// 输出里是裸数字，两种形式都收；只接受非负整数。
+fn counter_arg(object: &Map<String, Value>, key: &str) -> Result<(), String> {
+    let Some(value) = object.get(key).filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let parsed = value.as_f64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| text.trim().parse::<f64>().ok())
+    });
+    match parsed {
+        Some(counter) if counter.is_finite() && counter >= 0.0 && counter.fract() == 0.0 => Ok(()),
+        _ => Err(format!(
+            "{key} must be a non-negative integer; use the numeric value from the previous output"
+        )),
     }
-    Ok(())
+}
+
+fn cursor_arg(object: &Map<String, Value>) -> Result<(), String> {
+    counter_arg(object, "cursor")
 }
 
 /// Windows 绝对路径：`C:\...`、`C:/...` 或 UNC `\\server\share`。
@@ -767,12 +924,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_tool_identifies_the_users_real_browser() {
+        for tool in TOOLS.iter() {
+            assert!(
+                !tool.title.trim().is_empty(),
+                "{} needs a UI title",
+                tool.name
+            );
+            let description = tool.description.to_lowercase();
+            assert!(
+                description.contains("real"),
+                "{} description must say 'real' browser: {}",
+                tool.name,
+                tool.description
+            );
+            assert!(
+                description.contains("edge"),
+                "{} description must name Edge: {}",
+                tool.name,
+                tool.description
+            );
+        }
+    }
+
+    #[test]
     fn registry_is_compact_and_complete() {
         assert_eq!(TOOLS.len(), 11);
         assert_eq!(tool_list().as_array().unwrap().len(), 11);
         let schema_chars = tool_list().to_string().len();
+        // v1.10.1 起每个描述都写明“用户的真实 Edge（非无头）”，约 6.5KB。
         assert!(
-            schema_chars < 6_000,
+            schema_chars < 7_000,
             "tool schema grew to {schema_chars} chars; keep it compact"
         );
         for tool in TOOLS.iter() {
@@ -835,6 +1017,18 @@ mod tests {
         assert!(validate_arguments("snapshot", &json!({ "filter": "all" })).is_err());
         assert!(validate_arguments("snapshot", &json!({ "filter": "links" })).is_ok());
         assert!(validate_arguments("snapshot", &json!({ "filter": "form", "near": "e3" })).is_ok());
+    }
+
+    /// 游标是从工具输出里抄回来的（`next=400`），模型常带引号；两种形式都该收。
+    #[test]
+    fn counters_accept_the_numeric_string_form() {
+        assert!(validate_arguments("read", &json!({ "cursor": "400" })).is_ok());
+        assert!(validate_arguments("read", &json!({ "cursor": " 400 " })).is_ok());
+        assert!(validate_arguments("snapshot", &json!({ "cursor": "12" })).is_ok());
+        assert!(validate_arguments("observe", &json!({ "kind": "console", "since": "7" })).is_ok());
+        assert!(validate_arguments("read", &json!({ "cursor": "next" })).is_err());
+        assert!(validate_arguments("read", &json!({ "cursor": "1.5" })).is_err());
+        assert!(validate_arguments("read", &json!({ "cursor": -1 })).is_err());
     }
 
     #[test]
@@ -1070,6 +1264,164 @@ mod tests {
                 &json!({
                     "tool": "wait", "tabIds": [1,2,3,4,5,6,7,8], "concurrency": 1,
                     "args": { "time": 40 }
+                })
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn open_reuse_modes_are_exclusive() {
+        assert!(validate_arguments("open", &json!({ "url": "https://x.y" })).is_ok());
+        assert!(
+            validate_arguments(
+                "open",
+                &json!({ "url": "https://x.y", "replace": true, "wait": "dom" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments("open", &json!({ "url": "https://x.y", "reuse": "session" }))
+                .is_ok()
+        );
+        // tabId / replace / reuse 三者互斥：同时给会让「哪个 tab 被导航」变得不可预测。
+        assert!(
+            validate_arguments(
+                "open",
+                &json!({ "url": "https://x.y", "replace": true, "tabId": 3 })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "open",
+                &json!({ "url": "https://x.y", "reuse": "session", "tabId": 3 })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "open",
+                &json!({ "url": "https://x.y", "replace": true, "reuse": "session" })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments("open", &json!({ "url": "https://x.y", "reuse": "all" })).is_err()
+        );
+        assert!(
+            validate_arguments("open", &json!({ "url": "https://x.y", "replace": "yes" })).is_err()
+        );
+    }
+
+    #[test]
+    fn tabs_close_scopes() {
+        assert!(
+            validate_arguments("tabs", &json!({ "action": "close", "scope": "session" })).is_ok()
+        );
+        assert!(
+            validate_arguments("tabs", &json!({ "action": "close", "tabIds": [1, 2, 3] })).is_ok()
+        );
+        assert!(validate_arguments("tabs", &json!({ "action": "close", "tabIds": [] })).is_err());
+        assert!(
+            validate_arguments(
+                "tabs",
+                &json!({ "action": "close", "tabIds": [1, 2, 3, 4, 5, 6, 7, 8, 9] })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "tabs",
+                &json!({ "action": "close", "tabId": 1, "tabIds": [2] })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments("tabs", &json!({ "action": "close", "scope": "window" })).is_err()
+        );
+        // 只有 close 接受批量/会话语义，其他动作传了就是参数错。
+        assert!(
+            validate_arguments("tabs", &json!({ "action": "list", "scope": "session" })).is_err()
+        );
+        assert!(
+            validate_arguments("tabs", &json!({ "action": "activate", "tabIds": [1] })).is_err()
+        );
+    }
+
+    #[test]
+    fn batch_urls_open_and_composite() {
+        // 打开多个 URL：不需要 tabIds。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({ "tool": "open", "urls": ["https://a.example/", "https://b.example/"] })
+            )
+            .is_ok()
+        );
+        // 复合：打开后读取。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "read", "urls": ["https://a.example/"],
+                    "args": { "mode": "md", "budget": 8000 }
+                })
+            )
+            .is_ok()
+        );
+        // open 的内层参数走 open 的校验器。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({ "tool": "open", "urls": ["https://a.example/"], "args": { "wait": "dom" } })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({ "tool": "open", "urls": ["https://a.example/"], "args": { "wait": "later" } })
+            )
+            .is_err()
+        );
+        // tabIds 与 urls 不能混用；open 不能只给 tabIds。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({ "tool": "open", "urls": ["https://a.example/"], "tabIds": [1] })
+            )
+            .is_err()
+        );
+        assert!(validate_arguments("batch", &json!({ "tool": "open", "tabIds": [1] })).is_err());
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({ "tool": "read", "urls": ["file:///etc/passwd"] })
+            )
+            .is_err()
+        );
+        assert!(validate_arguments("batch", &json!({ "tool": "read", "urls": [] })).is_err());
+        assert!(validate_arguments("batch", &json!({ "tool": "read" })).is_err());
+        // 复合模式仍然受内层工具上限约束。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "read", "urls": ["https://a.example/"],
+                    "args": { "budget": 100 }
+                })
+            )
+            .is_err()
+        );
+        // 8 个 URL 复合读取：open 成本计入预算，仍在 600s 内。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({
+                    "tool": "read",
+                    "urls": ["https://a/","https://b/","https://c/","https://d/","https://e/","https://f/","https://g/","https://h/"],
+                    "concurrency": 2
                 })
             )
             .is_ok()

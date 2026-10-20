@@ -1,7 +1,7 @@
 {
   "name": "ema2-tests",
   "private": true,
-  "version": "1.8.0",
+  "version": "1.12.1",
   "description": "Regression tests for the EMA2 extension and relay",
   "scripts": {
     "test": "node --test tests/*.test.cjs",

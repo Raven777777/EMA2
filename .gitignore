@@ -9,9 +9,16 @@ examples/output/
 .DS_Store
 Thumbs.db
 
+# 构建/编辑残留
+bin/*.old
+bin/*.tmp
+*~
+
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
 
 # Node test deps
 node_modules/

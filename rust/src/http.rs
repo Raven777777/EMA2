@@ -15,6 +15,7 @@ use axum::routing::{get, post};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::clients;
 use crate::mcp;
 use crate::relay;
 use crate::state::RelayState;
@@ -26,6 +27,8 @@ pub fn router(state: Arc<RelayState>) -> Router {
         .route("/sse", get(legacy_sse)) // legacy SSE transport
         .route("/messages", post(legacy_messages))
         .route("/status", get(status))
+        .route("/pair/status", get(pair_status))
+        .route("/admin/clients", post(configure_clients))
         .route("/reload", post(reload_extension))
         .with_state(state)
         // 只压缩会和 SSE 冲突，本地回环也没有带宽压力，所以这里不做压缩。
@@ -55,9 +58,32 @@ fn auth_header(headers: &HeaderMap) -> Option<&str> {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        "missing or invalid Authorization: Bearer <EDGE_MCP_TOKEN>",
+        "missing or invalid Authorization: Bearer <token>; run `ema2.exe status` for the paired token",
     )
         .into_response()
+}
+
+/// 未配对态：只允许授权通道，MCP 与状态接口一律 503。
+fn not_paired() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "EMA2 is not paired yet: open the EMA2 Edge window and click \"授权此浏览器\"",
+    )
+        .into_response()
+}
+
+/// 配对通道只接受扩展页面（或非浏览器脚本，无 Origin）。
+fn origin_is_extension_or_absent(headers: &HeaderMap) -> bool {
+    match headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        None => true,
+        Some(origin) => ["chrome-extension://", "moz-extension://", "extension://"]
+            .iter()
+            .any(|scheme| origin.starts_with(scheme)),
+    }
 }
 
 /// SSE 生成器被客户端丢弃时也会执行 Drop：清理不再依赖生成器循环自然结束。
@@ -91,11 +117,7 @@ impl SessionStreamCleanup {
 impl Drop for SessionStreamCleanup {
     fn drop(&mut self) {
         if self.legacy {
-            self.state
-                .sse_senders
-                .lock()
-                .unwrap()
-                .remove(&self.session_id);
+            crate::state::lock(&self.state.sse_senders).remove(&self.session_id);
         } else if let Some(stream_id) = self.stream_id {
             self.state
                 .unregister_event_stream(&self.session_id, stream_id);
@@ -207,6 +229,27 @@ async fn ws_upgrade(
     if let Some(response) = check_origin_and_host(&headers, true) {
         return response;
     }
+    // `?pair=1`：首次授权专用通道，不注册为工具连接，只接受 hello / pair-claim。
+    if params.get("pair").map(String::as_str) == Some("1") {
+        if !state.pairing_allowed() {
+            return (
+                StatusCode::CONFLICT,
+                "already paired; run `ema2.exe pair --reset` before re-pairing",
+            )
+                .into_response();
+        }
+        if !origin_is_extension_or_absent(&headers) {
+            return (
+                StatusCode::FORBIDDEN,
+                "forbidden: pairing requires a chrome-extension origin",
+            )
+                .into_response();
+        }
+        return ws
+            .max_message_size(64 * 1024 * 1024)
+            .max_frame_size(64 * 1024 * 1024)
+            .on_upgrade(move |socket| relay::handle_pairing_ws(socket, state));
+    }
     // 浏览器扩展无法设置 Authorization，因此也接受 ?token=。
     let token_ok = match auth_header(&headers) {
         Some(header) => state.authorized(Some(header)),
@@ -228,6 +271,9 @@ async fn mcp_post(
 ) -> Response {
     if let Some(response) = check_origin_and_host(&headers, true) {
         return response;
+    }
+    if state.pairing_allowed() {
+        return not_paired();
     }
     if !state.authorized(auth_header(&headers)) {
         return unauthorized();
@@ -274,9 +320,16 @@ async fn mcp_post(
 }
 
 /// GET /mcp —— Streamable HTTP 服务端事件流（保持打开）。
+///
+/// 事件来源是 `RelayState::broadcast_event`：扩展连接/断开会被转成
+/// `notifications/message` 推到每个打开的流。同一 session 只保留一条流，
+/// 重复 GET 会替换旧流（旧连接立即结束），不会叠加注册。
 async fn mcp_stream(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Response {
     if let Some(response) = check_origin_and_host(&headers, true) {
         return response;
+    }
+    if state.pairing_allowed() {
+        return not_paired();
     }
     if !state.authorized(auth_header(&headers)) {
         return unauthorized();
@@ -287,14 +340,19 @@ async fn mcp_stream(State(state): State<Arc<RelayState>>, headers: HeaderMap) ->
     else {
         return (StatusCode::BAD_REQUEST, "Mcp-Session-Id is required").into_response();
     };
-    let (stream_id, mut receiver) = match state.register_event_stream(session_id) {
+    let (stream_id, mut receiver, superseded) = match state.register_event_stream(session_id) {
         Ok(value) => value,
         Err(_) => return (StatusCode::NOT_FOUND, "unknown Mcp-Session-Id").into_response(),
     };
+    if let Some(superseded) = superseded {
+        tracing::info!("session {session_id}: event stream {superseded} replaced by {stream_id}");
+    }
     let session_id = session_id.to_owned();
     let cleanup_state = state.clone();
     let stream = async_stream::stream! {
         let _cleanup = SessionStreamCleanup::event_stream(cleanup_state, session_id, stream_id);
+        // 先发一条注释帧：客户端能立刻确认流已建立，而不是等到第一条业务通知。
+        yield Ok::<Event, Infallible>(Event::default().comment("ema2 stream ready"));
         while let Some(value) = receiver.recv().await {
             if let Ok(event) = Event::default().event("message").json_data(value) {
                 yield Ok::<Event, Infallible>(event);
@@ -311,16 +369,15 @@ async fn legacy_sse(State(state): State<Arc<RelayState>>, headers: HeaderMap) ->
     if let Some(response) = check_origin_and_host(&headers, true) {
         return response;
     }
+    if state.pairing_allowed() {
+        return not_paired();
+    }
     if !state.authorized(auth_header(&headers)) {
         return unauthorized();
     }
     let session_id = state.new_legacy_session_id();
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    state
-        .sse_senders
-        .lock()
-        .unwrap()
-        .insert(session_id.clone(), (Instant::now(), tx));
+    crate::state::lock(&state.sse_senders).insert(session_id.clone(), (Instant::now(), tx));
     let endpoint = format!("/messages?sessionId={session_id}");
     let cleanup_state = state.clone();
     let cleanup_id = session_id.clone();
@@ -348,6 +405,9 @@ async fn legacy_messages(
     if let Some(response) = check_origin_and_host(&headers, true) {
         return response;
     }
+    if state.pairing_allowed() {
+        return not_paired();
+    }
     if !state.authorized(auth_header(&headers)) {
         return unauthorized();
     }
@@ -361,7 +421,7 @@ async fn legacy_messages(
     let Some(session_id) = params.get("sessionId").cloned() else {
         return (StatusCode::BAD_REQUEST, "sessionId is required").into_response();
     };
-    if !state.sse_senders.lock().unwrap().contains_key(&session_id) {
+    if !crate::state::lock(&state.sse_senders).contains_key(&session_id) {
         return (StatusCode::NOT_FOUND, "unknown sessionId").into_response();
     }
     let req: Value = match serde_json::from_slice(&body) {
@@ -370,7 +430,7 @@ async fn legacy_messages(
     };
     if let Some(resp) = mcp::handle(&state, req).await {
         let tx = {
-            let mut map = state.sse_senders.lock().unwrap();
+            let mut map = crate::state::lock(&state.sse_senders);
             match map.get_mut(&session_id) {
                 Some((last, tx)) => {
                     *last = Instant::now();
@@ -391,6 +451,9 @@ async fn reload_extension(State(state): State<Arc<RelayState>>, headers: HeaderM
     if let Some(response) = check_origin_and_host(&headers, true) {
         return response;
     }
+    if state.pairing_allowed() {
+        return not_paired();
+    }
     if !state.authorized(auth_header(&headers)) {
         return unauthorized();
     }
@@ -400,18 +463,126 @@ async fn reload_extension(State(state): State<Arc<RelayState>>, headers: HeaderM
             r#"{"reloading":true}"#,
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("extension not connected: {error}"),
-        )
-            .into_response(),
+        Err(error) => {
+            // 扩展离线时不要排队 reload：它下次启动 worker 时会直接从磁盘读新文件，
+            // 额外插一次 runtime.reload 只会把重连再推迟一轮。
+            (
+                StatusCode::ACCEPTED,
+                [(header::CONTENT_TYPE, "application/json")],
+                format!(r#"{{"queued":false,"reason":"extension offline: {error}"}}"#),
+            )
+                .into_response()
+        }
     }
+}
+
+/// GET /pair/status —— 授权页/安装脚本使用的无鉴权状态查询（不含任何密钥）。
+async fn pair_status(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Response {
+    if let Some(response) = check_origin_and_host(&headers, true) {
+        return response;
+    }
+    let specs = clients::specs();
+    let chosen = state.paired_clients();
+    let default_checked: Vec<String> = specs
+        .iter()
+        .filter(|spec| spec.detected)
+        .map(|spec| spec.id.to_owned())
+        .collect();
+    let checked = if state.clients_chosen() {
+        chosen
+    } else {
+        default_checked
+    };
+    let clients_json: Vec<Value> = specs
+        .iter()
+        .map(|spec| {
+            let mut value = spec.to_json();
+            value["selected"] = Value::Bool(checked.iter().any(|id| id == spec.id));
+            value
+        })
+        .collect();
+    let body = json!({
+        "name": "ema2",
+        "version": env!("CARGO_PKG_VERSION"),
+        "port": state.port,
+        "paired": state.paired(),
+        "pairing": state.pairing_allowed(),
+        "anonymous": state.is_anonymous(),
+        "extension_connected": state.extension_connected(),
+        "extension_version": state.extension_version(),
+        "paired_at": state.paired_at(),
+        "token_fingerprint": state.token_fingerprint(),
+        "uptime_secs": state.uptime_secs(),
+        "clients": clients_json,
+    })
+    .to_string();
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// POST /admin/clients —— 重新写入 AI 客户端配置（授权页“更新配置”按钮用）。
+///
+/// 请求体：`{"clients": ["opencode", "codex"]}`；省略 `clients` 表示全部已安装的终端。
+async fn configure_clients(
+    State(state): State<Arc<RelayState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = check_origin_and_host(&headers, true) {
+        return response;
+    }
+    if state.pairing_allowed() {
+        return not_paired();
+    }
+    if !state.authorized(auth_header(&headers)) {
+        return unauthorized();
+    }
+    let Some(token) = state.token() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay runs without a token; there is nothing to write",
+        )
+            .into_response();
+    };
+    let requested = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value.get("clients").and_then(Value::as_array).map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+            })
+    };
+    let selection = clients::normalize(requested.as_deref());
+    state.set_clients(selection.clone());
+    let results = clients::apply(&selection, state.port, &token);
+    let body = json!({
+        "clients": results.iter().map(|result| result.to_json()).collect::<Vec<_>>(),
+        "selection": selection,
+    })
+    .to_string();
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 /// GET /status —— 健康检查。
 async fn status(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Response {
     if let Some(response) = check_origin_and_host(&headers, true) {
         return response;
+    }
+    if state.pairing_allowed() {
+        return not_paired();
     }
     if !state.authorized(auth_header(&headers)) {
         return unauthorized();
@@ -425,7 +596,13 @@ async fn status(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Res
         "mcp_sessions": state.mcp_session_count(),
         "mcp_streams": state.event_stream_count(),
         "protocol_versions": crate::mcp::PROTOCOL_VERSIONS,
-        "token_required": state.token.is_some(),
+        "paired": state.paired(),
+        "paired_at": state.paired_at(),
+        "token_required": state.token_required(),
+        "token_fingerprint": state.token_fingerprint(),
+        "extension_version": state.extension_version(),
+        "uptime_secs": state.uptime_secs(),
+        "clients": clients::specs().iter().map(|spec| spec.to_json()).collect::<Vec<_>>(),
     })
     .to_string();
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
@@ -448,6 +625,21 @@ mod tests {
         RelayState::new(
             token.map(str::to_owned),
             PathBuf::from("target/test-output"),
+        )
+    }
+
+    fn unpaired_state() -> std::sync::Arc<RelayState> {
+        RelayState::with_auth(
+            crate::state::AuthConfig {
+                token: None,
+                anonymous: false,
+                state_path: None,
+                clients: Vec::new(),
+                clients_chosen: false,
+                paired_at: None,
+            },
+            PathBuf::from("target/test-output"),
+            8765,
         )
     }
 
@@ -492,6 +684,7 @@ mod tests {
         assert!(response.headers().get("mcp-session-id").is_some());
         let body = body_json(response).await;
         assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(body["result"]["capabilities"]["logging"], json!({}));
     }
 
     #[tokio::test]
@@ -663,7 +856,8 @@ mod tests {
 
     #[tokio::test]
     async fn reload_reports_missing_extension() {
-        let app = router(state(None));
+        let state = state(None);
+        let app = router(state.clone());
         let request = Request::builder()
             .method("POST")
             .uri("/reload")
@@ -671,7 +865,67 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        assert_eq!(body["queued"], false);
+        assert!(
+            body["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("extension offline"),
+            "offline reload must explain why it is not queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpaired_relay_closes_mcp_and_advertises_pairing() {
+        let state = unpaired_state();
+        let app = router(state);
+
+        let status = app.clone().oneshot(get("/pair/status")).await.unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = body_json(status).await;
+        assert_eq!(body["pairing"], true);
+        assert_eq!(body["paired"], false);
+
+        let mcp = app.oneshot(post("/mcp", initialize())).await.unwrap();
+        assert_eq!(mcp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn paired_relay_reports_paired_and_requires_auth_for_admin() {
+        let app = router(state(Some("s3cret")));
+        let status = app.clone().oneshot(get("/pair/status")).await.unwrap();
+        let body = body_json(status).await;
+        assert_eq!(body["pairing"], false);
+        assert_eq!(body["paired"], true);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/admin/clients")
+            .header(header::HOST, "127.0.0.1:8765")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn pairing_origin_must_be_an_extension_or_absent() {
+        let extension = Request::builder()
+            .header(header::ORIGIN, "chrome-extension://abcdefghijklmnop")
+            .body(Body::empty())
+            .unwrap();
+        assert!(super::origin_is_extension_or_absent(extension.headers()));
+
+        let absent = Request::builder().body(Body::empty()).unwrap();
+        assert!(super::origin_is_extension_or_absent(absent.headers()));
+
+        let page = Request::builder()
+            .header(header::ORIGIN, "http://127.0.0.1:3000")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!super::origin_is_extension_or_absent(page.headers()));
     }
 
     #[tokio::test]
@@ -691,7 +945,7 @@ mod tests {
     fn stream_cleanup_guard_removes_event_stream_when_dropped() {
         let state = state(None);
         let session = state.create_mcp_session();
-        let (stream_id, _rx) = state.register_event_stream(&session).unwrap();
+        let (stream_id, _rx, _) = state.register_event_stream(&session).unwrap();
         {
             let _guard =
                 SessionStreamCleanup::event_stream(state.clone(), session.clone(), stream_id);
@@ -705,15 +959,69 @@ mod tests {
         let state = state(None);
         let session = state.new_legacy_session_id();
         let (tx, _rx) = mpsc::unbounded_channel::<Value>();
-        state
-            .sse_senders
-            .lock()
-            .unwrap()
-            .insert(session.clone(), (Instant::now(), tx));
+        crate::state::lock(&state.sse_senders).insert(session.clone(), (Instant::now(), tx));
         {
             let _guard = SessionStreamCleanup::legacy(state.clone(), session.clone());
             assert_eq!(state.legacy_session_count(), 1);
         }
         assert_eq!(state.legacy_session_count(), 0);
+    }
+
+    /// P1-1 回归：GET /mcp 打开的流必须真的能收到服务端通知。
+    #[tokio::test]
+    async fn event_stream_delivers_server_notifications() {
+        let state = state(None);
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post("/mcp", initialize()))
+            .await
+            .unwrap();
+        let session = response.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let request = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1:8765")
+            .header("mcp-session-id", &session)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+
+        // 第一条是“流已建立”注释帧。
+        let ready = next_chunk(&mut body).await;
+        assert!(
+            ready.contains("ema2 stream ready"),
+            "unexpected first chunk: {ready}"
+        );
+
+        let event = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": { "level": "info", "logger": "ema2", "data": "extension connected" }
+        });
+        assert_eq!(state.broadcast_event(&event), 1);
+        let chunk = next_chunk(&mut body).await;
+        assert!(
+            chunk.contains("notifications/message"),
+            "unexpected chunk: {chunk}"
+        );
+        assert!(
+            chunk.contains("extension connected"),
+            "unexpected chunk: {chunk}"
+        );
+    }
+
+    async fn next_chunk(body: &mut Body) -> String {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("SSE chunk timed out")
+            .expect("SSE stream ended")
+            .expect("SSE frame error");
+        String::from_utf8_lossy(frame.into_data().unwrap().as_ref()).into_owned()
     }
 }

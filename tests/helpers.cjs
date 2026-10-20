@@ -18,14 +18,19 @@ function createChrome(overrides = {}) {
       clear() {},
     },
     runtime: {
-      getManifest: () => ({ version: '1.8.0' }),
+      getManifest: () => ({ version: '1.12.1' }),
       getPlatformInfo: async () => ({ os: 'win' }),
       onStartup: { addListener() {} },
       onInstalled: { addListener() {} },
+      onMessage: { addListener() {} },
       lastError: null,
       reload() {},
     },
-    storage: { local: { get: async () => ({}), set: async () => {} } },
+    action: { onClicked: { addListener() {} } },
+    storage: {
+      local: { get: async () => ({}), set: async () => {} },
+      session: { get: async () => ({}), set: async () => {} },
+    },
     tabs: {
       query: async () => [],
       get: async (id) => ({ id, windowId: 1, active: true, url: 'https://example.test/', title: 'Example' }),
@@ -96,6 +101,12 @@ function polyfillDom(window) {
   window.TextEncoder = TextEncoder;
 }
 
+let docSeq = 0;
+
+/**
+ * 建一个 jsdom 文档并装好 helper。
+ * 文档句柄（d1、d2…）由扩展分配，这里模拟 ensureHelpers：每建一个文档就发一个新号。
+ */
 function setupDom(html, tabId = 1, background = null) {
   const dom = new JSDOM(html, {
     url: 'https://example.test/page',
@@ -104,8 +115,10 @@ function setupDom(html, tabId = 1, background = null) {
   });
   polyfillDom(dom.window);
   if (background) {
-    const helpers = pageEval(dom, background.installHelpers, tabId);
-    assert.equal(helpers, true);
+    const installed = pageEval(dom, background.installHelpers);
+    assert.equal(installed && installed.installed, true);
+    docSeq += 1;
+    pageRun(dom, `window.__ema2_helpers.setDocHandle('d${docSeq}')`);
   }
   return dom;
 }

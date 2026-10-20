@@ -82,8 +82,9 @@ async function fetchJson(url, options = {}) {
 }
 
 class McpClient {
-  constructor(url) {
+  constructor(url, token = null) {
     this.url = url;
+    this.token = token;
     this.sessionId = null;
     this.nextId = 1;
   }
@@ -96,6 +97,7 @@ class McpClient {
       params,
     };
     const headers = { 'content-type': 'application/json' };
+    if (this.token) headers.authorization = `Bearer ${this.token}`;
     if (this.sessionId) headers['mcp-session-id'] = this.sessionId;
     const response = await fetch(this.url, {
       method: 'POST',
@@ -113,11 +115,13 @@ class McpClient {
   }
 
   async initialize() {
-    await this.request('initialize', {
+    const data = await this.request('initialize', {
       protocolVersion: '2025-06-18',
       capabilities: {},
       clientInfo: { name: 'ema2-edge-acceptance', version: '1.0.0' },
     });
+    this.initResult = data.result;
+    return this.initResult;
   }
 
   async tool(name, args = {}) {
@@ -197,6 +201,60 @@ async function cdpEvaluate(webSocketUrl, expression, options = {}) {
   });
 }
 
+/**
+ * 增量读取 SSE：保存全部已收到的文本，并支持等待某个片段出现。
+ * 用于验证 GET /mcp 真的能收到服务端通知（P1-1）。
+ */
+function createSseReader(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let done = false;
+  const waiters = [];
+
+  const pump = (async () => {
+    try {
+      for (;;) {
+        const { value, done: finished } = await reader.read();
+        if (finished) break;
+        text += decoder.decode(value, { stream: true });
+        for (const waiter of waiters.slice()) {
+          if (text.includes(waiter.needle)) {
+            waiters.splice(waiters.indexOf(waiter), 1);
+            waiter.resolve(text);
+          }
+        }
+      }
+    } catch (_) { /* closed by us */ }
+    done = true;
+    for (const waiter of waiters.splice(0)) {
+      waiter.reject(new Error(`SSE closed before "${waiter.needle}"; received: ${text.slice(-400)}`));
+    }
+  })();
+
+  return {
+    text: () => text,
+    waitFor(needle, timeoutMs, label = needle) {
+      if (text.includes(needle)) return Promise.resolve(text);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`SSE did not receive ${label} within ${timeoutMs}ms; received: ${text.slice(-500)}`));
+        }, timeoutMs);
+        waiters.push({
+          needle,
+          resolve: (value) => { clearTimeout(timer); resolve(value); },
+          reject: (error) => { clearTimeout(timer); reject(error); },
+        });
+      });
+    },
+    async close() {
+      try { await reader.cancel(); } catch (_) { /* ignore */ }
+      await pump;
+      return done;
+    },
+  };
+}
+
 function createTestServer() {
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
@@ -210,6 +268,35 @@ function createTestServer() {
       setTimeout(() => response.write('second-chunk|'), 700);
       setTimeout(() => response.write('third-chunk|'), 1400);
       setTimeout(() => response.end('end'), 2200);
+      return;
+    }
+    if (url.pathname === '/drip') {
+      // 先发响应头、3s 后才发第一块数据：hook 的 preview reader 会一直等在
+      // 第一次 read 上（deadline 只在两次 read 之间检查），因此条目会稳定处于
+      // preview=pending，足以让多次 observe 观察到 streaming 语义。
+      response.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8',
+        'cache-control': 'no-store',
+        connection: 'keep-alive',
+      });
+      response.flushHeaders();
+      let tick = 0;
+      let timer = null;
+      const start = setTimeout(() => {
+        timer = setInterval(() => {
+          tick += 1;
+          if (tick > 20) {
+            clearInterval(timer);
+            response.end('done');
+            return;
+          }
+          response.write(`tick-${tick}|`);
+        }, 300);
+      }, 3000);
+      request.on('close', () => {
+        clearTimeout(start);
+        if (timer) clearInterval(timer);
+      });
       return;
     }
     if (url.pathname.startsWith('/api/')) {
@@ -245,6 +332,7 @@ function createTestServer() {
       <span id="removed"></span>
       <button id="disabled" disabled>Disabled</button>
       <button id="stream">Stream</button>
+      <button id="drip">Drip</button>
       <button id="burst">Burst</button>
       <button id="logs">Logs</button>
       <div id="root">前言<p>正文</p><span>强调</span>结尾</div>
@@ -269,6 +357,9 @@ function createTestServer() {
           } catch (error) {
             window.__streamError = String(error);
           }
+        });
+        document.getElementById('drip').addEventListener('click', () => {
+          window.__drip = fetch('/drip').then(response => response.text());
         });
         document.getElementById('burst').addEventListener('click', () => {
           window.__burstDone = 0;
@@ -325,14 +416,39 @@ async function main() {
   if (!fs.existsSync(EDGE)) throw new Error(`Edge not found: ${EDGE}`);
   if (!fs.existsSync(RELAY)) throw new Error(`relay not found: ${RELAY}. Run scripts\\setup.cmd first.`);
 
+  // 验收统一使用显式匿名中继（隔离 profile），避免外层 shell 的 EDGE_MCP_TOKEN
+  // 泄漏进被测进程，导致“有 token / 无 token”两组断言互相干扰。
+  delete process.env.EDGE_MCP_TOKEN;
+  delete process.env.EDGE_MCP_ALLOW_ANONYMOUS;
+
   const relayPort = Number(process.env.EMA2_EDGE_PORT) || await freePort();
   let debugPort = Number(process.env.EMA2_EDGE_DEBUG_PORT) || 0;
-  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ema2-edge-profile-'));
+  let profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ema2-edge-profile-'));
   const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ema2-edge-output-'));
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ema2-edge-state-'));
+  // 隔离的 HOME：配对时中继会往这里写各终端配置，绝不碰真实用户配置。
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ema2-edge-home-'));
+  const appDataDir = path.join(homeDir, 'AppData', 'Roaming');
+  const opencodeDir = path.join(homeDir, '.config', 'opencode');
+  fs.mkdirSync(opencodeDir, { recursive: true });
+  fs.writeFileSync(path.join(opencodeDir, 'opencode.jsonc'), [
+    '{',
+    '  // keep this comment',
+    '  "$schema": "https://opencode.ai/config.json",',
+    '  "provider": { "lod": { "options": { "baseURL": "http://127.0.0.1:8080/v1" } } }',
+    '}',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(homeDir, '.claude.json'), JSON.stringify({ numStartups: 3, mcpServers: {} }, null, 2));
+  fs.mkdirSync(path.join(homeDir, '.codex'), { recursive: true });
+  fs.writeFileSync(path.join(homeDir, '.codex', 'config.toml'), 'model = "gpt-5"\n\n[tui]\nnotifications = true\n');
+  fs.mkdirSync(path.join(homeDir, '.pi', 'agent'), { recursive: true });
+  fs.mkdirSync(path.join(appDataDir, 'Claude'), { recursive: true });
+  fs.writeFileSync(path.join(appDataDir, 'Claude', 'claude_desktop_config.json'), '{"mcpServers":{}}');
   const relayLogPath = path.join(outputDir, 'relay.log');
   const relayLogFd = fs.openSync(relayLogPath, 'a');
-  const edgeLogPath = path.join(outputDir, 'edge.log');
-  const edgeLogFd = fs.openSync(edgeLogPath, 'a');
+  let edgeLogPath = path.join(outputDir, 'edge.log');
+  let edgeLogFd = fs.openSync(edgeLogPath, 'a');
   const testServer = createTestServer();
   let relay = null;
   let edge = null;
@@ -354,9 +470,19 @@ async function main() {
   try {
     log(`profile=${profileDir}`);
 
+    // 全新 state 目录 + 无 token：中继进入待授权态，由扩展走真实配对流程。
     relay = spawn(RELAY, ['run', '--port', String(relayPort)], {
       cwd: ROOT,
-      env: { ...process.env, EDGE_MCP_OUTPUT_DIR: outputDir },
+      env: {
+        ...process.env,
+        EDGE_MCP_OUTPUT_DIR: outputDir,
+        EDGE_MCP_STATE_DIR: stateDir,
+        EDGE_MCP_TOKEN: '',
+        EDGE_MCP_ALLOW_ANONYMOUS: '',
+        USERPROFILE: homeDir,
+        HOME: homeDir,
+        APPDATA: appDataDir,
+      },
       stdio: ['ignore', relayLogFd, relayLogFd],
       windowsHide: true,
     });
@@ -365,71 +491,103 @@ async function main() {
     });
 
     await waitFor(async () => {
-      const status = await fetchJson(`http://127.0.0.1:${relayPort}/status`);
+      // 待授权态 /status 是 503；用无鉴权的 /pair/status 判断中继已就绪。
+      const status = await fetchJson(`http://127.0.0.1:${relayPort}/pair/status`);
       return status.status === 200 && status.body && status.body.name === 'ema2';
-    }, 15000, 'relay /status');
+    }, 15000, 'relay /pair/status');
 
     testServer.listen(0, '127.0.0.1');
     await new Promise(resolve => testServer.once('listening', resolve));
     const baseUrl = `http://127.0.0.1:${testServer.address().port}`;
     log(`relay port=${relayPort} test server=${testServer.address().port}`);
 
-    const edgeArgs = [
-      `--user-data-dir=${profileDir}`,
-      `--load-extension=${EDGE_EXTENSION}`,
-      `--disable-extensions-except=${EDGE_EXTENSION}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-sync',
-      '--disable-background-networking',
-      '--disable-component-update',
-      '--disable-gpu',
-      '--disable-features=CalculateNativeWinOcclusion',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-      '--disable-background-timer-throttling',
-      '--force-device-scale-factor=1',
-      '--window-size=1280,900',
-      `--remote-debugging-port=${debugPort || 0}`,
-      ...(HEADLESS ? ['--headless=new'] : []),
-      'about:blank',
-    ];
-    edge = spawn(EDGE, edgeArgs, {
-      cwd: ROOT,
-      stdio: ['ignore', edgeLogFd, edgeLogFd],
-      windowsHide: false,
-      detached: false,
-    });
-    edgePid = edge.pid;
-    edge.on('exit', (code) => log(`Edge exited: ${code}`));
-
-    if (!debugPort) {
-      const devtoolsPortFile = path.join(profileDir, 'DevToolsActivePort');
-      debugPort = await waitFor(() => {
-        try {
-          const rawPort = fs.readFileSync(devtoolsPortFile, 'utf8');
-          const port = Number(rawPort.trim().split(String.fromCharCode(10))[0]);
-          return Number.isFinite(port) && port > 0 ? port : null;
-        } catch (_) { return null; }
-      }, 30000, 'Edge DevToolsActivePort');
-    }
-    log(`Edge debug port=${debugPort}`);
-
-    const configuredWorker = await waitFor(async () => {
-      const response = await fetchJson(`http://127.0.0.1:${debugPort}/json/list`);
-      if (response.status !== 200 || !Array.isArray(response.body)) return null;
-      const worker = response.body.find(target =>
-        target.type === 'service_worker' && /\/background\.js$/.test(target.url || ''));
-      if (!worker || !worker.webSocketDebuggerUrl) return null;
-      try {
-        const configured = await cdpEvaluate(worker.webSocketDebuggerUrl,
-          `new Promise((resolve) => chrome.storage.local.set({ wsUrl: 'ws://127.0.0.1:${relayPort}' }, () => resolve(true)))`,
-          { timeoutMs: 5000 });
-        return configured === true ? worker : null;
-      } catch (_) {
-        return null;
+    let configuredWorker = null;
+    // Edge 偶尔会在首次启动隔离 profile 时丢掉解包扩展的 service worker；
+    // 换一个全新 profile 重试一次，避免把环境抖动记成产品缺陷。
+    for (let attempt = 1; attempt <= 2 && !configuredWorker; attempt++) {
+      if (attempt > 1) {
+        log('relaunching Edge with a fresh profile');
+        try { edge.kill(); } catch (_) { /* ignore */ }
+        try { fs.closeSync(edgeLogFd); } catch (_) { /* ignore */ }
+        try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+        await sleep(1500);
+        profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ema2-edge-profile-'));
+        log(`profile=${profileDir}`);
+        edgeLogPath = path.join(outputDir, `edge-${attempt}.log`);
+        edgeLogFd = fs.openSync(edgeLogPath, 'a');
+        debugPort = Number(process.env.EMA2_EDGE_DEBUG_PORT) || 0;
       }
-    }, 30000, 'configure extension WebSocket URL');
+
+      try {
+        const edgeArgs = [
+          `--user-data-dir=${profileDir}`,
+          `--load-extension=${EDGE_EXTENSION}`,
+          `--disable-extensions-except=${EDGE_EXTENSION}`,
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--disable-sync',
+          '--disable-background-networking',
+          '--disable-component-update',
+          '--disable-gpu',
+          '--disable-features=CalculateNativeWinOcclusion',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+          '--disable-background-timer-throttling',
+          '--force-device-scale-factor=1',
+          '--window-size=1280,900',
+          `--remote-debugging-port=${debugPort || 0}`,
+          ...(HEADLESS ? ['--headless=new'] : []),
+          'about:blank',
+        ];
+        edge = spawn(EDGE, edgeArgs, {
+          cwd: ROOT,
+          stdio: ['ignore', edgeLogFd, edgeLogFd],
+          windowsHide: false,
+          detached: false,
+        });
+        edgePid = edge.pid;
+        edge.on('exit', (code) => log(`Edge exited: ${code}`));
+
+        if (!debugPort) {
+          const devtoolsPortFile = path.join(profileDir, 'DevToolsActivePort');
+          debugPort = await waitFor(() => {
+            try {
+              const rawPort = fs.readFileSync(devtoolsPortFile, 'utf8');
+              const port = Number(rawPort.trim().split(String.fromCharCode(10))[0]);
+              return Number.isFinite(port) && port > 0 ? port : null;
+            } catch (_) { return null; }
+          }, 30000, 'Edge DevToolsActivePort');
+        }
+        log(`Edge debug port=${debugPort}`);
+
+        let lastTargetSnapshot = '';
+        configuredWorker = await waitFor(async () => {
+          const response = await fetchJson(`http://127.0.0.1:${debugPort}/json/list`);
+          if (response.status !== 200 || !Array.isArray(response.body)) return null;
+          const snapshot = response.body
+            .map(target => `${target.type}:${String(target.url || '').split('/').pop()}`)
+            .join(',');
+          if (snapshot !== lastTargetSnapshot) {
+            lastTargetSnapshot = snapshot;
+            log(`Edge targets: ${snapshot}`);
+          }
+          const worker = response.body.find(target =>
+            target.type === 'service_worker' && /\/background\.js$/.test(target.url || ''));
+          if (!worker || !worker.webSocketDebuggerUrl) return null;
+          try {
+            const configured = await cdpEvaluate(worker.webSocketDebuggerUrl,
+              `new Promise((resolve) => chrome.storage.local.set({ wsUrl: 'ws://127.0.0.1:${relayPort}' }, () => resolve(true)))`,
+              { timeoutMs: 5000 });
+            return configured === true ? worker : null;
+          } catch (_) {
+            return null;
+          }
+        }, 45000, 'configure extension WebSocket URL');
+      } catch (error) {
+        log(`Edge launch attempt ${attempt} failed: ${error.message}`);
+        if (attempt === 2) throw error;
+      }
+    }
 
     try {
       await cdpEvaluate(configuredWorker.webSocketDebuggerUrl,
@@ -437,15 +595,78 @@ async function main() {
         { awaitPromise: false, timeoutMs: 3000 });
     } catch (_) { /* reconnect is also retried by the extension watchdog */ }
 
+    // 首次配对：调用与授权页按钮相同的 pairWithRelay()，再从中继状态文件取 token。
+    const initialState = await fetchJson(`http://127.0.0.1:${relayPort}/pair/status`);
+    check(
+      initialState.status === 200 && initialState.body && initialState.body.pairing === true,
+      `fresh relay is not in pairing mode: ${initialState.text}`,
+    );
+    const paired = await cdpEvaluate(
+      configuredWorker.webSocketDebuggerUrl,
+      `pairWithRelay(${relayPort}).then(r => JSON.stringify(r)).catch(e => 'ERR:' + e.message)`,
+      { awaitPromise: true, timeoutMs: 25000 },
+    );
+    check(typeof paired === 'string' && paired.startsWith('{'), `initial pairing failed: ${paired}`);
+    check(JSON.parse(paired).ok === true, `initial pairing not ok: ${paired}`);
+
+    const relayState = JSON.parse(fs.readFileSync(path.join(stateDir, 'state.json'), 'utf8'));
+    const relayToken = relayState.token;
+    check(typeof relayToken === 'string' && relayToken.length === 64, 'pairing did not persist a token');
+    log(`paired with relay (token ${relayToken.slice(0, 6)}…)`);
+
+    // 真实合并结果：注释保留、各终端格式正确、token 一致。
+    const opencodeText = fs.readFileSync(path.join(opencodeDir, 'opencode.jsonc'), 'utf8');
+    check(opencodeText.includes('// keep this comment'), 'jsonc comments were lost');
+    check(opencodeText.includes('"mcp"') && opencodeText.includes(relayToken), 'opencode.jsonc was not merged');
+    const claudeCode = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude.json'), 'utf8'));
+    check(claudeCode.numStartups === 3, 'claude-code config lost unrelated keys');
+    check(
+      claudeCode.mcpServers && claudeCode.mcpServers['edge-browser']
+        && claudeCode.mcpServers['edge-browser'].headers.Authorization === `Bearer ${relayToken}`,
+      'claude-code mcpServers entry missing',
+    );
+    const codexText = fs.readFileSync(path.join(homeDir, '.codex', 'config.toml'), 'utf8');
+    check(codexText.includes('[mcp_servers.edge-browser]'), 'codex TOML entry missing');
+    check(codexText.includes('model = "gpt-5"'), 'codex TOML lost unrelated keys');
+    const piConfig = JSON.parse(fs.readFileSync(path.join(homeDir, '.pi', 'agent', 'mcp.json'), 'utf8'));
+    check(piConfig.mcpServers['edge-browser'].url.endsWith(`:${relayPort}/mcp`), 'pi mcp.json missing');
+    const desktop = JSON.parse(fs.readFileSync(path.join(appDataDir, 'Claude', 'claude_desktop_config.json'), 'utf8'));
+    check(desktop.mcpServers['edge-browser'], 'claude desktop config missing');
+
+    // 备份必须紧邻原文件，且内容等于“本次修改前”。
+    const opencodeBackup = fs.readFileSync(path.join(opencodeDir, 'opencode.jsonc.ema2.bak'), 'utf8');
+    check(opencodeBackup.includes('// keep this comment'), 'opencode backup does not hold the pre-change content');
+    const claudeBackup = fs.readFileSync(path.join(homeDir, '.claude.json.ema2.bak'), 'utf8');
+    check(claudeBackup.includes('numStartups'), 'claude-code backup does not hold the pre-change content');
+    const piBackupPath = path.join(homeDir, '.pi', 'agent', 'mcp.json.ema2.bak');
+    check(fs.existsSync(piBackupPath), 'newly created pi config has no backup marker');
+    check(fs.statSync(piBackupPath).size === 0, 'pi backup should be empty when the file did not exist');
+
     await waitFor(async () => {
-      const status = await fetchJson(`http://127.0.0.1:${relayPort}/status`);
+      const status = await fetchJson(`http://127.0.0.1:${relayPort}/status`, {
+        headers: { authorization: `Bearer ${relayToken}` },
+      });
       return status.status === 200 && status.body && status.body.extension_connected === true;
     }, 30000, 'extension connection to isolated relay');
     log('extension connected to isolated relay');
     await focusEdgeWindow(edgePid);
 
-    mcp = new McpClient(`http://127.0.0.1:${relayPort}/mcp`);
+    mcp = new McpClient(`http://127.0.0.1:${relayPort}/mcp`, relayToken);
     await mcp.initialize();
+    check(
+      mcp.initResult && mcp.initResult.serverInfo && mcp.initResult.serverInfo.name === 'ema2',
+      `initialize did not identify EMA2: ${JSON.stringify(mcp.initResult && mcp.initResult.serverInfo)}`,
+    );
+    check(
+      /NOT a headless browser/.test((mcp.initResult && mcp.initResult.instructions) || ''),
+      'initialize.instructions must rule out the headless-browser misconception',
+    );
+    const listedTools = (await mcp.request('tools/list', {})).result.tools;
+    check(
+      listedTools.length === 11
+        && listedTools.every(tool => tool.title && /real/i.test(tool.description) && /edge/i.test(tool.description)),
+      `tool metadata does not identify the real Edge browser: ${JSON.stringify(listedTools.map(tool => [tool.name, tool.title, tool.description]))}`,
+    );
 
     const scenario = async (name, run) => {
       const started = Date.now();
@@ -557,6 +778,32 @@ async function main() {
       });
       check(/#\d+ GET 200\b/.test(observed), `network observation did not record a real stream response:\n${observed}`);
       return `headers=${state.headersMs}ms first=${state.firstMs}ms`;
+    });
+
+    await scenario('P2-4 slow body is reported as streaming without stalling the cursor', async () => {
+      await mcp.ok('open', { tabId: appTab, url: baseUrl + '/app', wait: 'load' });
+      // 由页面自身发起请求（命中 hook），而不是从 debugger 上下文直接 fetch。
+      await mcp.ok('js', { tabId: appTab, code: "document.getElementById('drip').click(); 'started'" });
+
+      // preview 最多等 1.5s；/drip 在 3s 内不发数据，这之前 observe 应看到
+      // streaming=1 + pending footer。
+      let streaming = '';
+      let last = '';
+      for (let round = 0; round < 4 && !streaming; round++) {
+        last = await mcp.ok('observe', {
+          kind: 'network', tabId: appTab, filter: '/drip', budget: 4000,
+        });
+        if (/streaming=1/.test(last)) streaming = last;
+      }
+      check(streaming, `no streaming=1 marker observed for a slow response body; last observe:\n${last}`);
+      check(/#\d+ GET 200 [^\n]*\/drip/.test(streaming), `drip record missing:\n${streaming}`);
+      check(/pending=\d+ seqs=\d+/.test(streaming), `streaming record missing pending footer:\n${streaming}`);
+      check(/next=\d+/.test(streaming), `streaming record must still advance next:\n${streaming}`);
+
+      // preview 结束后记录仍然可读（不会因为 preview 截断而从观测里消失）。
+      const after = await mcp.ok('observe', { kind: 'network', tabId: appTab, filter: '/drip', budget: 4000 });
+      check(/#\d+ GET 200 [^\n]*\/drip/.test(after), `drip record disappeared after streaming:\n${after}`);
+      return 'streaming=1 + pending seqs';
     });
 
     await scenario('F07 network pagination covers more than 80 entries and HAR saves', async () => {
@@ -744,8 +991,138 @@ async function main() {
       return 'upload-fixture.txt';
     });
 
+    await scenario('P1-1 GET /mcp delivers extension disconnect/connect notifications', async () => {
+      const response = await fetch(mcp.url, {
+        headers: { 'mcp-session-id': mcp.sessionId, authorization: `Bearer ${relayToken}` },
+      });
+      check(response.status === 200, `GET /mcp returned ${response.status}`);
+      check(
+        /text\/event-stream/.test(response.headers.get('content-type') || ''),
+        `GET /mcp is not an SSE stream: ${response.headers.get('content-type')}`,
+      );
+      const sse = createSseReader(response);
+      try {
+        // 流建立后先收到注释帧，确认服务端没有把连接挂起。
+        await sse.waitFor('ema2 stream ready', 8000, 'stream-ready comment');
+
+        // 从扩展 service worker 主动断开 WS：中继应推 disconnected，扩展自动重连后再推 connected。
+        await cdpEvaluate(
+          configuredWorker.webSocketDebuggerUrl,
+          "(() => { try { if (typeof socket !== 'undefined' && socket) socket.close(); } catch (_) {}; return true; })()",
+          { awaitPromise: false, timeoutMs: 3000 },
+        );
+        await sse.waitFor('extension disconnected', 15000, 'extension disconnected notification');
+        await sse.waitFor('extension connected', 30000, 'extension connected notification');
+
+        await waitFor(async () => {
+          const status = await fetchJson(`http://127.0.0.1:${relayPort}/status`, {
+            headers: { authorization: `Bearer ${relayToken}` },
+          });
+          return status.status === 200 && status.body && status.body.extension_connected === true;
+        }, 30000, 'extension reconnect after SSE notifications');
+        const current = await mcp.ok('tabs', { action: 'current' });
+        check(/id=\d+/.test(current), `tool call failed after reconnect: ${current}`);
+      } finally {
+        await sse.close();
+      }
+      return 'disconnected + connected notifications';
+    });
+
+    await scenario('P0-1 token mode gates HTTP (401/200)', async () => {
+      const tokenPort = await freePort();
+      const token = 'acceptance-token-7f3c';
+      const tokenStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ema2-token-state-'));
+      const tokenRelay = spawn(RELAY, ['run', '--port', String(tokenPort)], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          EDGE_MCP_TOKEN: token,
+          EDGE_MCP_STATE_DIR: tokenStateDir,
+          EDGE_MCP_ALLOW_ANONYMOUS: '',
+        },
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      try {
+        await waitFor(async () => {
+          const status = await fetchJson(`http://127.0.0.1:${tokenPort}/status`, {
+            headers: { authorization: `Bearer ${token}` },
+          });
+          return status.status === 200 && status.body && status.body.name === 'ema2';
+        }, 15000, 'token relay /status');
+
+        const initBody = JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-06-18',
+            capabilities: {},
+            clientInfo: { name: 'ema2-token-check', version: '1' },
+          },
+        });
+        const anonymous = await fetch(`http://127.0.0.1:${tokenPort}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: initBody,
+        });
+        check(anonymous.status === 401, `unauthenticated initialize returned ${anonymous.status}`);
+
+        const authorized = await fetch(`http://127.0.0.1:${tokenPort}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+          body: initBody,
+        });
+        check(
+          authorized.status === 200 && authorized.headers.get('mcp-session-id'),
+          `authenticated initialize returned ${authorized.status}`,
+        );
+      } finally {
+        try { tokenRelay.kill(); } catch (_) { /* ignore */ }
+        await sleep(300);
+        try { fs.rmSync(tokenStateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      }
+      return '401/200 with token';
+    });
+
+    await scenario('unselecting a client removes its entry and refreshes the backup', async () => {
+      const response = await fetch(`http://127.0.0.1:${relayPort}/admin/clients`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${relayToken}`,
+        },
+        body: JSON.stringify({ clients: ['opencode'] }),
+      });
+      check(response.status === 200, `admin/clients returned ${response.status}`);
+      const result = await response.json();
+      const removed = (result.clients || []).filter(entry => entry.action === 'removed');
+      check(
+        removed.some(entry => entry.id === 'pi'),
+        `pi was not removed: ${JSON.stringify(result.clients)}`,
+      );
+
+      const piPath = path.join(homeDir, '.pi', 'agent', 'mcp.json');
+      check(!fs.readFileSync(piPath, 'utf8').includes('edge-browser'), 'pi entry still present after unselect');
+      const piBackup = fs.readFileSync(`${piPath}.ema2.bak`, 'utf8');
+      check(piBackup.includes('edge-browser'), 'pi backup was not refreshed before removal');
+
+      const opencodeText = fs.readFileSync(path.join(opencodeDir, 'opencode.jsonc'), 'utf8');
+      check(opencodeText.includes('edge-browser'), 'selected opencode entry was removed');
+
+      const status = await fetchJson(`http://127.0.0.1:${relayPort}/pair/status`);
+      const pi = (status.body.clients || []).find(client => client.id === 'pi');
+      check(pi && pi.selected === false, `pi still marked selected: ${JSON.stringify(pi)}`);
+      return `removed ${removed.length} unselected client(s), pi backup refreshed`;
+    });
+
     await scenario('F04 real bridge.ps1 status/stop/start/health', async () => {
-      const env = { EDGE_MCP_OUTPUT_DIR: outputDir };
+      // 中继默认要求 token；验收用显式匿名模式启动隔离实例。
+      const env = {
+        EDGE_MCP_OUTPUT_DIR: outputDir,
+        EDGE_MCP_STATE_DIR: stateDir,
+        EDGE_MCP_TOKEN: relayToken,
+      };
       const status = await runPowerShell([
         '-File', path.join(ROOT, 'scripts', 'bridge.ps1'),
         '-Action', 'status', '-Port', String(relayPort),
@@ -760,7 +1137,9 @@ async function main() {
       check(stop.code === 0, `stop failed (${stop.code}): ${stop.stderr || stop.stdout}`);
       await waitFor(async () => {
         try {
-          await fetchJson(`http://127.0.0.1:${relayPort}/status`);
+          await fetchJson(`http://127.0.0.1:${relayPort}/status`, {
+            headers: { authorization: `Bearer ${relayToken}` },
+          });
           return false;
         } catch (_) { return true; }
       }, 5000, 'relay port closed after stop');
@@ -771,7 +1150,9 @@ async function main() {
       ], env);
       check(start.code === 0, `start failed (${start.code}): ${start.stderr || start.stdout}`);
       await waitFor(async () => {
-        const response = await fetchJson(`http://127.0.0.1:${relayPort}/status`);
+        const response = await fetchJson(`http://127.0.0.1:${relayPort}/status`, {
+          headers: { authorization: `Bearer ${relayToken}` },
+        });
         return response.status === 200 && response.body && response.body.extension_connected === true;
       }, 20000, 'extension reconnect after bridge start');
 
@@ -781,6 +1162,177 @@ async function main() {
       ], env);
       check(finalStop.code === 0, `final stop failed (${finalStop.code}): ${finalStop.stderr || finalStop.stdout}`);
       return 'status/stop/start/reconnect/stop';
+    });
+
+    await scenario('pairing: real extension authorizes against an unpaired relay', async () => {
+      const pairPort = await freePort();
+      const pairStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ema2-edge-pair-'));
+      const pairRelay = spawn(RELAY, ['run', '--port', String(pairPort)], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          EDGE_MCP_STATE_DIR: pairStateDir,
+          EDGE_MCP_TOKEN: '',
+          EDGE_MCP_ALLOW_ANONYMOUS: '',
+          EMA2_SKIP_CLIENT_CONFIG: '1',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      let pairLog = '';
+      pairRelay.stdout.on('data', (chunk) => { pairLog += chunk; });
+      pairRelay.stderr.on('data', (chunk) => { pairLog += chunk; });
+      try {
+        try {
+          await waitFor(async () => {
+            const status = await fetchJson(`http://127.0.0.1:${pairPort}/pair/status`);
+            return status.status === 200 && status.body && status.body.pairing === true;
+          }, 15000, 'unpaired relay /pair/status');
+        } catch (error) {
+          throw new Error(`${error.message}; relay log: ${pairLog.slice(-600)}`);
+        }
+
+        const before = await fetchJson(`http://127.0.0.1:${pairPort}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2025-06-18',
+              capabilities: {},
+              clientInfo: { name: 'ema2-pairing-check', version: '1' },
+            },
+          }),
+        });
+        check(before.status === 503, `unpaired /mcp returned ${before.status}, expected 503`);
+
+        const paired = await cdpEvaluate(
+          configuredWorker.webSocketDebuggerUrl,
+          `pairWithRelay(${pairPort}).then(r => JSON.stringify(r)).catch(e => 'ERR:' + e.message)`,
+          { awaitPromise: true, timeoutMs: 25000 },
+        );
+        check(typeof paired === 'string' && paired.startsWith('{'), `pairing failed: ${paired}`);
+        const result = JSON.parse(paired);
+        check(result.ok === true, `pairing result not ok: ${paired}`);
+
+        const state = JSON.parse(fs.readFileSync(path.join(pairStateDir, 'state.json'), 'utf8'));
+        check(
+          typeof state.token === 'string' && state.token.length === 64,
+          `token was not persisted: ${JSON.stringify(state)}`,
+        );
+
+        await waitFor(async () => {
+          const status = await fetchJson(`http://127.0.0.1:${pairPort}/status`, {
+            headers: { authorization: `Bearer ${state.token}` },
+          });
+          return status.status === 200 && status.body && status.body.extension_connected === true;
+        }, 20000, 'extension connected to the paired relay');
+
+        // 走完整链路：token → welcome 验签 → relayReady → tools/call。
+        const pairedClient = new McpClient(`http://127.0.0.1:${pairPort}/mcp`, state.token);
+        await pairedClient.initialize();
+        const current = await pairedClient.ok('tabs', { action: 'current' });
+        check(/id=\d+/.test(current), `tool call after pairing failed: ${current}`);
+
+        // 授权页本身也要能渲染并反映“已连接”。
+        await cdpEvaluate(
+          configuredWorker.webSocketDebuggerUrl,
+          "chrome.tabs.create({ url: chrome.runtime.getURL('pair.html') }).then(t => t.id)",
+          { awaitPromise: true, timeoutMs: 5000 },
+        );
+        await sleep(1200);
+        const targets = await fetchJson(`http://127.0.0.1:${debugPort}/json/list`);
+        const pairPage = (targets.body || []).find(
+          (target) => target.type === 'page' && /\/pair\.html$/.test(target.url || ''),
+        );
+        check(pairPage && pairPage.webSocketDebuggerUrl, 'pair.html did not open');
+        const pageStatus = await cdpEvaluate(
+          pairPage.webSocketDebuggerUrl,
+          "document.getElementById('status').textContent",
+          { timeoutMs: 5000 },
+        );
+        check(
+          typeof pageStatus === 'string' && pageStatus.trim() && !/正在检测/.test(pageStatus),
+          `pair page did not render a status: ${pageStatus}`,
+        );
+        const renderedClients = await cdpEvaluate(
+          pairPage.webSocketDebuggerUrl,
+          "document.querySelectorAll('#clientList li input[type=checkbox]').length",
+          { timeoutMs: 5000 },
+        );
+        check(
+          Number(renderedClients) >= 3,
+          `pair page did not list the detected AI clients: ${renderedClients}`,
+        );
+        return `token=${state.token.slice(0, 6)}… tools ok, page="${pageStatus.trim()}", clients=${renderedClients}`;
+      } finally {
+        try { pairRelay.kill(); } catch (_) { /* ignore */ }
+        await sleep(400);
+        try { fs.rmSync(pairStateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      }
+    });
+
+    await scenario('install detects the unpacked extension in the daily Edge profile', async () => {
+      // 配对场景把扩展的 wsUrl 指向了临时端口；先恢复成主中继端口再验证 install。
+      const targetsNow = await fetchJson(`http://127.0.0.1:${debugPort}/json/list`);
+      const worker = (targetsNow.body || []).find(
+        target => target.type === 'service_worker' && /\/background\.js$/.test(target.url || ''),
+      );
+      check(worker && worker.webSocketDebuggerUrl, 'extension service worker disappeared before install');
+      await cdpEvaluate(
+        worker.webSocketDebuggerUrl,
+        `new Promise((resolve) => chrome.storage.local.set({
+            wsUrl: 'ws://127.0.0.1:${relayPort}',
+            token: ${JSON.stringify(relayToken)},
+          }, () => resolve(true)))
+          .then(() => { try { if (socket) socket.close(); } catch (_) {} connect(); return true; })`,
+        { awaitPromise: true, timeoutMs: 8000 },
+      );
+
+      // install 默认面向日常 Edge：靠 Preferences 里的 path 找到已加载的解包扩展并原地更新。
+      const installed = await new Promise((resolve) => {
+        const child = spawn(RELAY, ['install', '--port', String(relayPort), '--no-browser', '--no-autostart'], {
+          cwd: ROOT,
+          env: {
+            ...process.env,
+            EDGE_MCP_STATE_DIR: stateDir,
+            EMA2_EDGE_USER_DATA: profileDir,
+            USERPROFILE: homeDir,
+            HOME: homeDir,
+            APPDATA: appDataDir,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+        });
+        let output = '';
+        child.stdout.on('data', (chunk) => { output += chunk; });
+        child.stderr.on('data', (chunk) => { output += chunk; });
+        child.on('close', (code) => resolve({ code, output }));
+      });
+      check(installed.code === 0, `install exited ${installed.code}: ${installed.output}`);
+      check(
+        installed.output.includes(`extension -> ${EDGE_EXTENSION}`),
+        `install did not reuse the loaded extension path:\n${installed.output}`,
+      );
+      check(
+        /reload\s+-> (extension reloaded|extension offline; new files apply on next start)/.test(installed.output),
+        `install did not reload or queue a reload:\n${installed.output}`,
+      );
+      let lastStatus = null;
+      try {
+        await waitFor(async () => {
+          const status = await fetchJson(`http://127.0.0.1:${relayPort}/status`, {
+            headers: { authorization: `Bearer ${relayToken}` },
+          });
+          lastStatus = { code: status.status, body: status.body };
+          return status.status === 200 && status.body && status.body.extension_connected === true;
+        }, 75000, 'extension reconnect after install reload');
+      } catch (error) {
+        throw new Error(`${error.message}; last /status = ${JSON.stringify(lastStatus)}`);
+      }
+      return 'reused loaded path + reload applied';
     });
 
     log('');
@@ -810,8 +1362,9 @@ async function main() {
     }
     await new Promise(resolve => testServer.close(resolve));
     try { fs.closeSync(relayLogFd); } catch (_) { /* ignore */ }
-    const keep = KEEP && results.some(result => !result.ok);
-    if (results.some(result => !result.ok)) {
+    const earlyFailure = results.length === 0;
+    const keep = KEEP && (earlyFailure || results.some(result => !result.ok));
+    if (earlyFailure || results.some(result => !result.ok)) {
       try { log(`edge log tail:
 ${fs.readFileSync(edgeLogPath, 'utf8').slice(-2000)}`); } catch (_) { /* ignore */ }
     }
@@ -823,9 +1376,13 @@ ${fs.readFileSync(edgeLogPath, 'utf8').slice(-2000)}`); } catch (_) { /* ignore 
     if (!keep) {
       try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
       try { fs.rmSync(outputDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      try { fs.rmSync(homeDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
     } else {
       log(`kept profile=${profileDir}`);
       log(`kept output=${outputDir}`);
+      log(`kept state=${stateDir}`);
+      log(`kept home=${homeDir}`);
     }
   }
 }

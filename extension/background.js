@@ -12,8 +12,9 @@
  * 工具：tabs / open / read / snapshot / act / wait / js / observe / shot
  *
  * WS：默认 ws://127.0.0.1:8765，可在 chrome.storage.local 设 wsUrl 覆盖。
- * 鉴权：中继设了 EDGE_MCP_TOKEN 时，在这里设同一个 token：
+ * 鉴权：中继默认**必须**配置 EDGE_MCP_TOKEN；在扩展里设同一个值：
  *   chrome.storage.local.set({ token: '<EDGE_MCP_TOKEN>' })
+ * 只有中继显式以 --insecure-allow-no-token 启动时才不需要 token。
  */
 
 const DEFAULT_WS_URL = 'ws://127.0.0.1:8765';
@@ -38,9 +39,22 @@ let connecting = false;
 let retryAttempt = 0;
 let reconnectTimer = null;
 let relayReady = false;
+let tokenHintShown = false;
+// `var`：service worker 里行为等价，但让测试 VM 能把它们当作全局属性读写。
+var authToken = null;          // 当前连接使用的 token；null 表示未配对
+var currentChallenge = '';     // 本次连接的随机 challenge（验签用）
+let currentPort = 8765;
+let lastError = '';            // 连接/验签错误，授权页展示
+let pairingWelcome = false;    // 当前连接是配对通道
+let autoOpenedPairPage = false;
 let debuggerQueue = Promise.resolve();
 let heartbeatTimer = null;
 const observedDocs = new Map(); // tabId -> last observe document epoch
+const SESSION_TABS_KEY = 'ema2_session_tabs';
+// 本会话由 open/batch 打开的标签（有序）。service worker 会被回收，所以落 storage.session：
+// 浏览器重启即清空，正好是本会话的自然边界。
+let sessionTabs = [];
+let sessionTabsLoaded = false;
 
 class ToolError extends Error {
   constructor(code, message, hint, lines) {
@@ -90,23 +104,37 @@ async function getWsUrl(settings) {
     base = DEFAULT_WS_URL;
   }
   const token = typeof stored.token === 'string' ? stored.token.trim() : '';
-  if (!token) return base;
   const url = new URL(base);
-  url.searchParams.set('token', token);
+  // 有 token 走正常鉴权连接；没有 token 走首次授权通道（中继未配对时才接受）。
+  if (token) url.searchParams.set('token', token);
+  else url.searchParams.set('pair', '1');
   return validateWsUrl(url.href);
+}
+
+function randomHex(bytes) {
+  const buffer = new Uint8Array(bytes);
+  crypto.getRandomValues(buffer);
+  return [...buffer].map((value) => value.toString(16).padStart(2, '0')).join('');
 }
 
 async function connect() {
   if (connecting) return;
   if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) return;
   connecting = true;
+  const settings = await readSettings();
+  authToken = typeof settings.token === 'string' && settings.token.trim() ? settings.token.trim() : null;
+  if (!authToken && retryAttempt >= 2 && !tokenHintShown) {
+    tokenHintShown = true;
+    console.warn('[EMA2] no token yet: waiting for authorization in the EMA2 extension page');
+  }
   let url;
-  try { url = await getWsUrl(); } catch (error) {
+  try { url = await getWsUrl(settings); } catch (error) {
     connecting = false;
     console.error('[EMA2] WebSocket URL rejected:', error.message);
     scheduleReconnect();
     return;
   }
+  try { currentPort = Number(new URL(url).port) || 8765; } catch (_) { /* keep previous */ }
   let ws;
   try { ws = new WebSocket(url); } catch (error) {
     connecting = false;
@@ -116,6 +144,8 @@ async function connect() {
   }
   connecting = false;
   socket = ws;
+  currentChallenge = randomHex(16);
+  pairingWelcome = false;
 
   ws.onopen = () => {
     retryAttempt = 0;
@@ -128,6 +158,7 @@ async function connect() {
       method: 'bridge/hello',
       role: 'extension',
       version: chrome.runtime.getManifest().version,
+      challenge: currentChallenge,
     }));
   };
   ws.onmessage = (event) => {
@@ -139,13 +170,15 @@ async function connect() {
     relayReady = false;
     stopHeartbeat();
     scheduleReconnect();
+    maybeDropStaleToken().catch(() => {});
   };
   ws.onerror = () => {};
 }
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  const delayMs = Math.min(30000, 1000 * Math.pow(2, retryAttempt++));
+  // 本地回环：中继重启后最多等 10s，不要退避到 30s（install 更新时尤其明显）。
+  const delayMs = Math.min(10000, 1000 * Math.pow(2, retryAttempt++));
   reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delayMs);
   chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: 0.5 });
 }
@@ -174,16 +207,249 @@ function ensureWatchdog() {
   chrome.alarms.create(WATCHDOG_ALARM, { periodInMinutes: 0.5 });
 }
 
+// ---------------------------------------------------------------- pairing
+
+function hexToBytes(hex) {
+  if (typeof hex !== 'string' || hex.length === 0 || hex.length % 2 !== 0) return null;
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let index = 0; index < bytes.length; index++) {
+    const value = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+    if (Number.isNaN(value)) return null;
+    bytes[index] = value;
+  }
+  return bytes;
+}
+
+async function hmacVerify(token, message, proofHex) {
+  const signature = hexToBytes(proofHex);
+  if (!signature || signature.length !== 32) return false;
+  try {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw', encoder.encode(token), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'],
+    );
+    return await crypto.subtle.verify('HMAC', key, signature, encoder.encode(message));
+  } catch (_) {
+    return false;
+  }
+}
+
+/** 中继必须证明自己持有 token，否则任何占用 8765 的本地进程都能冒充它。 */
+async function verifyWelcome(welcome) {
+  if (!authToken) return true; // 匿名中继：没有可验证的共享密钥
+  if (welcome.auth !== 'hmac-v1' || typeof welcome.proof !== 'string') return false;
+  return await hmacVerify(authToken, `ema2-welcome|${currentChallenge}`, welcome.proof);
+}
+
+async function probeRelay(port) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/pair/status`, { cache: 'no-store' });
+    if (!response.ok) return { reachable: true, error: `HTTP ${response.status}` };
+    return { reachable: true, ...(await response.json()) };
+  } catch (error) {
+    return { reachable: false, error: String((error && error.message) || error) };
+  }
+}
+
+let pendingPair = null;
+
+function settlePair(granted, error) {
+  const pending = pendingPair;
+  if (!pending) return;
+  pendingPair = null;
+  if (error) pending.reject(error);
+  else pending.resolve(granted);
+}
+
+function openPairPage() {
+  if (autoOpenedPairPage) return;
+  autoOpenedPairPage = true;
+  try {
+    const created = chrome.tabs.create({ url: chrome.runtime.getURL('pair.html') });
+    if (created && typeof created.catch === 'function') created.catch(() => {});
+  } catch (_) { /* ignore */ }
+}
+
+async function waitForPairSocket(port) {
+  if (pairingWelcome && socket && socket.readyState === WebSocket.OPEN && currentPort === port) {
+    return { ws: socket, temporary: false };
+  }
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/?pair=1`);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch (_) { /* ignore */ }
+      reject(new Error('连接中继超时'));
+    }, 8000);
+    ws.onopen = () => ws.send(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'bridge/hello',
+      role: 'extension',
+      version: chrome.runtime.getManifest().version,
+    }));
+    ws.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (_) { return; }
+      if (msg.method === 'bridge/welcome') { clearTimeout(timer); resolve(); return; }
+      if (msg.method === 'bridge/pair-granted') { settlePair(msg, null); return; }
+      if (msg.method === 'bridge/pair-denied') settlePair(null, new Error(msg.reason || 'authorization denied'));
+    };
+    ws.onerror = () => { clearTimeout(timer); reject(new Error('无法连接 EMA2 中继')); };
+    ws.onclose = () => { clearTimeout(timer); reject(new Error('配对连接已关闭')); };
+  });
+  return { ws, temporary: true };
+}
+
+/** 用户点击授权按钮后调用：claim → 拿到 token → 立即用 token 重连。 */
+async function pairWithRelay(port, clients) {
+  const status = await probeRelay(port);
+  if (!status.reachable) throw new Error('EMA2 中继未运行，请先执行 ema2.exe install');
+  if (status.anonymous) throw new Error('中继以匿名模式运行，无需授权');
+  if (!status.pairing) throw new Error('EMA2 已绑定其他扩展；先运行 ema2.exe pair --reset');
+
+  const { ws, temporary } = await waitForPairSocket(port);
+  try {
+    const granted = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingPair = null;
+        reject(new Error('授权超时'));
+      }, 15000);
+      pendingPair = {
+        resolve: (msg) => { clearTimeout(timer); resolve(msg); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      };
+      try {
+        const claim = { jsonrpc: '2.0', method: 'bridge/pair-claim' };
+        if (Array.isArray(clients)) claim.clients = clients;
+        ws.send(JSON.stringify(claim));
+      } catch (error) {
+        clearTimeout(timer);
+        pendingPair = null;
+        reject(error);
+      }
+    });
+
+    const selection = Array.isArray(granted.selection)
+      ? granted.selection
+      : (Array.isArray(clients) ? clients : []);
+    await chrome.storage.local.set({
+      token: granted.token,
+      wsUrl: `ws://127.0.0.1:${port}`,
+      pairedClients: selection,
+    });
+    authToken = granted.token;
+    tokenHintShown = false;
+    lastError = '';
+    const old = socket;
+    socket = null;
+    relayReady = false;
+    pairingWelcome = false;
+    if (old) { try { old.close(); } catch (_) { /* ignore */ } }
+    if (temporary) { try { ws.close(); } catch (_) { /* ignore */ } }
+    setTimeout(() => { connect(); }, 0);
+    return { ok: true, clients: Array.isArray(granted.clients) ? granted.clients : [] };
+  } catch (error) {
+    if (temporary) { try { ws.close(); } catch (_) { /* ignore */ } }
+    throw error;
+  }
+}
+
+async function configureClients(port, clients) {
+  if (!authToken) throw new Error('尚未授权');
+  const body = JSON.stringify(Array.isArray(clients) ? { clients } : {});
+  const response = await fetch(`http://127.0.0.1:${port}/admin/clients`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${authToken}`, 'content-type': 'application/json' },
+    body,
+  });
+  if (!response.ok) throw new Error(`写入配置失败：HTTP ${response.status}`);
+  return { ok: true, ...(await response.json()) };
+}
+
+async function handlePageMessage(message) {
+  const port = Number(message.port) || currentPort || 8765;
+  switch (message.type) {
+    case 'ema2/state': {
+      const status = await probeRelay(port);
+      return {
+        ok: true,
+        status,
+        hasToken: !!authToken,
+        relayReady,
+        lastError,
+        port,
+        extensionVersion: chrome.runtime.getManifest().version,
+        connected: !!socket && socket.readyState === WebSocket.OPEN && relayReady,
+      };
+    }
+    case 'ema2/authorize':
+      return await pairWithRelay(port, message.clients);
+    case 'ema2/configure':
+      return await configureClients(port, message.clients);
+    case 'ema2/reconnect': {
+      try { if (socket) socket.close(); } catch (_) { /* ignore */ }
+      socket = null;
+      connect();
+      return { ok: true };
+    }
+    default:
+      return { ok: false, error: `unknown message: ${message.type}` };
+  }
+}
+
+let staleProbeCounter = 0;
+
+/** 中继被 reset 后会拒绝旧 token；探测到“未配对”时丢弃本地 token 并回到授权流程。 */
+async function maybeDropStaleToken() {
+  if (!authToken) return;
+  staleProbeCounter += 1;
+  if (staleProbeCounter % 3 !== 0) return;
+  const status = await probeRelay(currentPort);
+  if (status.reachable && status.pairing) {
+    await chrome.storage.local.remove('token');
+    authToken = null;
+    console.warn('[EMA2] relay was reset; waiting for authorization again');
+    openPairPage();
+  }
+}
+
 // ---------------------------------------------------------------- mcp plumbing
 
 async function handleMCPMessage(data, ws) {
   if (typeof data !== 'string' || data.length > MAX_INCOMING_CHARS) return;
+  if (ws !== socket) return; // 旧连接的迟到消息不得影响当前状态
   let req;
   try { req = JSON.parse(data); } catch (_) { return; }
   if (!req || typeof req !== 'object') return;
 
   const hasId = Object.prototype.hasOwnProperty.call(req, 'id');
-  if (req.method === 'bridge/welcome') { relayReady = true; return; }
+  if (req.method === 'bridge/welcome') {
+    if (req.pairing) {
+      // 未配对：这是一条授权通道，不能执行任何工具调用。
+      pairingWelcome = true;
+      relayReady = false;
+      openPairPage();
+      return;
+    }
+    if (!(await verifyWelcome(req))) {
+      relayReady = false;
+      lastError = 'relay_identity_failed';
+      console.error('[EMA2] relay identity check failed; refusing to run tools');
+      try { ws.close(); } catch (_) { /* ignore */ }
+      return;
+    }
+    pairingWelcome = false;
+    relayReady = true;
+    lastError = '';
+    return;
+  }
+  if (req.method === 'bridge/pair-granted') {
+    settlePair(req, null);
+    return;
+  }
+  if (req.method === 'bridge/pair-denied') {
+    settlePair(null, new Error(req.reason || 'authorization denied'));
+    return;
+  }
   if (req.method === 'bridge/reload') {
     // 开发用：中继要求扩展重新加载自身（等价于 edge://extensions 点“重新加载”）。
     if (hasId) sendResponse(ws, req.id, { result: {} });
@@ -297,7 +563,75 @@ function footer(total, shown, next) {
   return `total=${total} shown=${shown} next=${next == null ? 'none' : next}`;
 }
 
+/**
+ * 截断提示：只有 total/shown/next 时，模型容易把「读到这里」当成「全部读到了」。
+ * 明确说出被截断、以及下一次该传什么。
+ */
+function truncationHint(toolName, total, shown, next, cursor, unit) {
+  if (next == null) return '';
+  const where = cursor ? ` (from cursor=${cursor})` : '';
+  return `hint=truncated: returned ${shown} of ${total} ${unit || 'chars'}${where}; call ${toolName} with cursor=${next} to continue`;
+}
+
 // ---------------------------------------------------------------- tabs
+
+/** 会话标签登记：open/batch 打开的标签按顺序记下来，供复用与批量关闭使用。 */
+async function loadSessionTabs() {
+  if (sessionTabsLoaded) return sessionTabs;
+  sessionTabsLoaded = true;
+  try {
+    const store = chrome.storage && chrome.storage.session;
+    if (!store) return sessionTabs;
+    const stored = (await store.get(SESSION_TABS_KEY)) || {};
+    const ids = stored[SESSION_TABS_KEY];
+    if (Array.isArray(ids)) sessionTabs = ids.filter(id => Number.isInteger(id) && id >= 0);
+  } catch (_) { /* storage.session 不可用：退化为进程内登记 */ }
+  return sessionTabs;
+}
+
+async function persistSessionTabs() {
+  try {
+    const store = chrome.storage && chrome.storage.session;
+    if (store) await store.set({ [SESSION_TABS_KEY]: sessionTabs });
+  } catch (_) { /* 忽略：内存登记仍然可用 */ }
+}
+
+async function rememberSessionTab(tabId) {
+  await loadSessionTabs();
+  sessionTabs = sessionTabs.filter(id => id !== tabId).concat(tabId);
+  await persistSessionTabs();
+}
+
+async function forgetSessionTab(tabId) {
+  await loadSessionTabs();
+  if (!sessionTabs.includes(tabId)) return;
+  sessionTabs = sessionTabs.filter(id => id !== tabId);
+  await persistSessionTabs();
+}
+
+/** 最近一个仍然存在的会话标签；不存在时返回 null（调用方新建标签）。 */
+async function lastLiveSessionTab() {
+  await loadSessionTabs();
+  for (let index = sessionTabs.length - 1; index >= 0; index--) {
+    try { return await chrome.tabs.get(sessionTabs[index]); } catch (_) { /* 已被关掉 */ }
+  }
+  return null;
+}
+
+async function closeTabIds(ids) {
+  const closed = [];
+  for (const id of ids) {
+    try {
+      await chrome.tabs.remove(id);
+      observedDocs.delete(id);
+      closed.push(id);
+    } catch (_) { /* 已经不存在：跳过，不算失败 */ }
+  }
+  await loadSessionTabs();
+  sessionTabs = sessionTabs.filter(id => !closed.includes(id));
+  await persistSessionTabs();
+  return closed;
+}
 
 function isInternalUrl(url) {
   return /^(edge|chrome|about|devtools|view-source|chrome-extension|extension):/.test(url || '');
@@ -326,7 +660,11 @@ async function tabsTool(args) {
   if (action === 'list') {
     const tabs = await chrome.tabs.query({});
     const lines = tabs.map(tabLine);
-    return lines.join('\n') + '\n' + footer(lines.length, lines.length, null);
+    await loadSessionTabs();
+    const live = sessionTabs.filter(id => tabs.some(tab => tab.id === id));
+    // 会话标签单独一行，不混进 TSV 行数，避免 total 计到非标签行。
+    if (live.length) lines.push(`session_tabs=${live.join(',')}`);
+    return lines.join('\n') + '\n' + footer(tabs.length, tabs.length, null);
   }
   if (action === 'current') {
     const tab = await activeTab();
@@ -336,12 +674,33 @@ async function tabsTool(args) {
     const url = args.url;
     if (!url) fail('missing_url', 'tabs new requires url', 'call open instead');
     const tab = await chrome.tabs.create({ url, active: args.active !== false });
+    await rememberSessionTab(tab.id);
     return `id=${tab.id}\nurl=${tab.pendingUrl || tab.url || url}\nwindow=${tab.windowId}`;
   }
   if (action === 'close') {
+    if (args.scope !== undefined && args.scope !== 'session') {
+      fail('invalid_argument', 'scope must be session', 'use scope="session" to close tabs opened this session');
+    }
+    if (args.scope === 'session') {
+      await loadSessionTabs();
+      const closed = await closeTabIds([...sessionTabs]);
+      return `closed=${closed.length ? closed.join(',') : 'none'}\ncount=${closed.length}`;
+    }
+    if (Array.isArray(args.tabIds) && args.tabIds.length) {
+      if (args.tabIds.length > MAX_BATCH_TABS) {
+        fail('invalid_argument', `tabIds must contain 1..${MAX_BATCH_TABS} entries`, 'split the close call');
+      }
+      for (const [index, tabId] of args.tabIds.entries()) {
+        if (!Number.isInteger(tabId) || tabId < 0) {
+          fail('invalid_argument', `tabIds[${index}] must be a non-negative integer`, 'call tabs to list ids');
+        }
+      }
+      const closed = await closeTabIds(args.tabIds);
+      if (!closed.length) fail('tab_not_found', 'none of tabIds exist', 'call tabs to list ids');
+      return `closed=${closed.join(',')}\ncount=${closed.length}`;
+    }
     const tab = await resolveTab(args);
-    await chrome.tabs.remove(tab.id);
-    observedDocs.delete(tab.id);
+    await closeTabIds([tab.id]);
     return `closed=${tab.id}`;
   }
   if (action === 'activate') {
@@ -354,17 +713,52 @@ async function tabsTool(args) {
 
 // ---------------------------------------------------------------- open / wait
 
+/** 主文档的导航计时：真实 HTTP 状态与重定向次数（Chromium 109+ 的 responseStatus）。 */
+async function navigationTiming(tabId) {
+  try {
+    return await runInTab(tabId, () => {
+      const entries = performance.getEntriesByType ? performance.getEntriesByType('navigation') : [];
+      const nav = entries && entries[0];
+      if (!nav) return null;
+      return {
+        status: typeof nav.responseStatus === 'number' ? nav.responseStatus : 0,
+        redirects: nav.redirectCount || 0,
+        type: nav.type || '',
+      };
+    }, []);
+  } catch (_) {
+    return null;
+  }
+}
+
 async function openTool(args) {
   const wait = args.wait || 'load';
   let tab;
-  if (args.tabId === undefined) {
-    tab = await chrome.tabs.create({ url: args.url, active: true });
-  } else {
+  let reuse = 'new';
+  let previousUrl = '';
+  if (args.tabId !== undefined) {
+    // 显式导航用户已有的标签：不改会话登记，scope=session 不会关掉用户的标签。
     tab = await resolveTab(args);
-    await chrome.tabs.update(tab.id, { url: args.url });
+    previousUrl = await navigateTab(tab, args.url);
+    reuse = 'tabId';
+  } else if (args.replace === true) {
+    tab = await activeTab();
+    previousUrl = await navigateTab(tab, args.url);
+    reuse = 'replace';
+  } else if (args.reuse === 'session') {
+    const live = await lastLiveSessionTab();
+    if (live) {
+      tab = live;
+      previousUrl = await navigateTab(tab, args.url);
+      reuse = 'session';
+    }
+  }
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: args.url, active: true });
+    await rememberSessionTab(tab.id);
   }
   if (wait !== 'none') {
-    await waitForReady(tab.id, wait === 'load' ? 'complete' : 'interactive', 15000);
+    await waitForDocument(tab.id, args.url, previousUrl, wait === 'load' ? 'complete' : 'interactive', 15000);
   }
   const current = await chrome.tabs.get(tab.id);
   // 等页面稳定后自动装网络 hook，这样后续 fetch/XHR 都能被 observe network 看到。
@@ -372,7 +766,77 @@ async function openTool(args) {
   let hook = false;
   try { hook = await ensureNetworkHook(tab.id); } catch (_) { hook = false; }
   try { await ensureConsoleHook(tab.id); } catch (_) { /* ignore */ }
-  return `id=${current.id}\nurl=${current.url || args.url}\ntitle=${oneLine(current.title || '')}\nnet_hook=${hook ? 'on' : 'off'}`;
+  const timing = wait === 'none' ? null : await navigationTiming(tab.id);
+  const status = !timing ? 'pending' : timing.status > 0 ? String(timing.status) : 'unknown';
+  const lines = [
+    `id=${current.id}`,
+    `url=${current.url || args.url}`,
+    `title=${oneLine(current.title || '')}`,
+    `status=${status}`,
+    `reuse=${reuse}`,
+    `net_hook=${hook ? 'on' : 'off'}`,
+  ];
+  if (timing && timing.redirects > 0) lines.push(`redirects=${timing.redirects}`);
+  if (timing && timing.status >= 400) {
+    lines.push(`hint=http ${timing.status}: the page is probably the site's own error page, not the content you asked for`);
+  } else if (timing && timing.status > 0 && timing.status >= 300 && timing.status < 400) {
+    lines.push(`hint=http ${timing.status}: redirect left in place (page may need a click to follow)`);
+  }
+  return lines.join('\n');
+}
+
+/** 两个 URL 是否指向同一页面（忽略 hash 与结尾斜杠）。 */
+function samePageTarget(a, b) {
+  const normalize = (value) => {
+    try {
+      const url = new URL(value);
+      url.hash = '';
+      return url.href.replace(/\/$/, '');
+    } catch (_) {
+      return String(value || '').replace(/#.*$/, '').replace(/\/$/, '');
+    }
+  };
+  return normalize(a) === normalize(b);
+}
+
+/**
+ * 等目标文档真正接位再判定就绪。
+ * 只判 readyState 会被旧文档骗过：tabs.update 之后新文档尚未提交时，
+ * 旧文档仍是 complete，于是 open 返回的 url/title/正文都停留在上一页。
+ * 这里同时看 document 的 location.href：只要确认已经离开旧文档（或落到目标/重定向后的地址）
+ * 且 readyState 达标，才算加载完成。
+ */
+async function waitForDocument(tabId, targetUrl, previousUrl, state, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const reloadingSamePage = samePageTarget(previousUrl, targetUrl);
+  while (Date.now() < deadline) {
+    let info = null;
+    try {
+      info = await runInTab(
+        tabId,
+        () => ({ href: location.href, ready: document.readyState }),
+        [],
+      );
+    } catch (_) { /* 导航中：旧文档已销毁、新文档未就绪 */ }
+    if (info) {
+      const arrived = reloadingSamePage
+        ? samePageTarget(info.href, previousUrl || targetUrl)
+        : !samePageTarget(info.href, previousUrl);
+      const readyOk = state === 'interactive'
+        ? info.ready === 'interactive' || info.ready === 'complete'
+        : info.ready === 'complete';
+      if (arrived && readyOk) return true;
+    }
+    await sleep(120);
+  }
+  return false;
+}
+
+/** 导航到指定 URL，返回导航前的地址（供 waitForDocument 判断新旧文档）。 */
+async function navigateTab(tab, url) {
+  const before = tab.url || '';
+  await chrome.tabs.update(tab.id, { url });
+  return before;
 }
 
 async function waitForReady(tabId, state, timeoutMs) {
@@ -454,8 +918,8 @@ async function runInTab(tabId, func, args, world, attempts = 2) {
 }
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
-function installHelpers(tabId) {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 2) return true;
+function installHelpers() {
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 3) return { installed: false };
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
   const shortUrl = (url) => {
     try { const u = new URL(url); return (u.pathname + u.search).slice(0, 80); } catch (_) { return String(url).slice(0, 80); }
@@ -561,30 +1025,18 @@ function installHelpers(tabId) {
     return roots;
   };
 
-  const makeDocumentEpoch = () => {
-    let random = '';
-    try {
-      const bytes = new Uint32Array(2);
-      crypto.getRandomValues(bytes);
-      random = bytes[0].toString(36) + bytes[1].toString(36);
-    } catch (_) {
-      random = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
-    }
-    const tab = String(tabId == null ? '0' : tabId).replace(/[^0-9a-zA-Z]/g, '');
-    return ('t' + tab + '-' + random).slice(0, 18);
-  };
-  const docEpoch = () => {
-    if (!window.__ema2_doc_epoch) window.__ema2_doc_epoch = makeDocumentEpoch();
-    return window.__ema2_doc_epoch;
-  };
+  // 文档句柄（d1、d2…）由扩展侧统一分配：页面自己生成会撞 id，跨文档的 ref 就失去校验意义。
+  // 页面只负责持有它，导航后的新文档由扩展重新下发。
+  const docEpoch = () => window.__ema2_doc_handle || '';
+  const setDocHandle = (handle) => { window.__ema2_doc_handle = String(handle || ''); };
   const parseRef = (value) => {
     const text = String(value == null ? '' : value).trim().replace(/^\[|\]$/g, '').replace(/"/g, '');
-    const match = /^e(\d+)@([a-z0-9-]+)$/i.exec(text);
+    const match = /^e(\d+)@(d\d+)$/i.exec(text);
     return match ? { seq: Number(match[1]), epoch: match[2] } : null;
   };
   const refIsCurrent = (value) => {
     const parsed = parseRef(value);
-    return !!parsed && parsed.epoch === docEpoch();
+    return !!parsed && !!docEpoch() && parsed.epoch === docEpoch();
   };
 
   const refOf = (el) => {
@@ -651,6 +1103,22 @@ function installHelpers(tabId) {
     return out;
   };
 
+  /** 能承载动作的角色；其余角色只在有名称时才值得占一行。 */
+  const ACTIONABLE_ROLES = new Set([
+    'link', 'button', 'textbox', 'searchbox', 'combobox', 'listbox', 'checkbox', 'radio',
+    'switch', 'slider', 'spinbutton', 'tab', 'option', 'menuitem', 'menuitemcheckbox',
+    'menuitemradio', 'treeitem', 'file', 'summary', 'input', 'textarea', 'select',
+  ]);
+
+  /**
+   * 额外属性（主要是 href）是所有字段里最占预算的：实测占 snapshot 字符的 39%，p90 达 84 字符。
+   * 截到 40 字符保留路径主干，需要完整 URL 时用 read/js；filter=links 是专门取链接的场景，不截。
+   */
+  const clipExtra = (extra, keepFull) => {
+    if (!extra || keepFull) return extra;
+    return extra.length > 40 ? extra.slice(0, 40) + '…' : extra;
+  };
+
   /** snapshot 过滤器：links / buttons / form。 */
   const filterFor = (name) => {
     if (name === 'links') return (el) => el.tagName === 'A' && !!el.getAttribute('href');
@@ -689,9 +1157,15 @@ function installHelpers(tabId) {
           continue;
         }
         if (predicate && !predicate(el)) continue;
+        const role = roleOf(el);
+        const name = nameOf(el);
+        // 无名称又不可操作：点了也没意义，只占预算（x.com 这类站点能到 20%）。
+        // filter=full 是「无损视图」，保持原样。
+        if (filter !== 'full' && !name && !ACTIONABLE_ROLES.has(role)) continue;
         refs++;
-        const extra = extraOf(el);
-        lines.push(describe(el) + (extra ? ' ' + extra : '') + (frame ? ' frame=' + frame : ''));
+        const extra = clipExtra(extraOf(el), filter === 'links');
+        lines.push('[' + refOf(el) + '] ' + role + ' "' + name + '"'
+          + (extra ? ' ' + extra : '') + (frame ? ' frame=' + frame : ''));
       }
     }
     const total = lines.length;
@@ -856,14 +1330,62 @@ function installHelpers(tabId) {
 
   window.__ema2_helpers = {
     snapshot, markdown, plainText, mainRoot, find, refOf, clean, candidates,
-    collectRoots, roleOf, nameOf, marks, docEpoch, parseRef, refIsCurrent, setValue,
+    collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent, setValue,
   };
-  window.__ema2_helpers_version = 2;
-  return true;
+  window.__ema2_helpers_version = 3;
+  return { installed: true };
 }
 
+// 必须用 local 而不是 session：session 在扩展重载/更新时会被清空，
+// 计数器归零后新文档会重新拿到 d1、d2…，和仍然开着的旧页面撞号，
+// 于是旧 ref 就能在另一个文档上通过校验。
+const DOC_SEQ_KEY = 'ema2_doc_seq';
+let docHandleSeq = 0;
+let docSeqReady = null;
+
+/**
+ * 只从 storage.session 读一次。
+ * 必须缓存「读取过程」而不是「读取结果」：两个 tab 同时首次取号时，
+ * 各自 await 一次 get() 会把已经自增过的值重新覆盖回 0，于是两边都拿到 d1。
+ */
+function ensureDocSeq() {
+  if (!docSeqReady) {
+    docSeqReady = (async () => {
+      try {
+        const stored = await chrome.storage.local.get(DOC_SEQ_KEY);
+        docHandleSeq = Number(stored && stored[DOC_SEQ_KEY]) || 0;
+      } catch (_) {
+        docHandleSeq = 0;
+      }
+    })();
+  }
+  return docSeqReady;
+}
+
+/** 下一个文档句柄（d1、d2…）。初始化之后的自增是同步的，两个文档不会拿到同一个号。 */
+async function nextDocHandle() {
+  await ensureDocSeq();
+  docHandleSeq += 1;
+  try {
+    chrome.storage.local.set({ [DOC_SEQ_KEY]: docHandleSeq });
+  } catch (_) { /* 没有 storage 就只在内存里递增 */ }
+  return 'd' + docHandleSeq;
+}
+
+/**
+ * 注入页面 helper，并给新文档分配一个短句柄。
+ * 句柄只在「本次真的装了 helper」时分配：已装好的页面不消耗号，号就不会被空调用推高。
+ */
 async function ensureHelpers(tabId) {
-  return runInTab(tabId, installHelpers, [tabId]);
+  const result = await runInTab(tabId, installHelpers, []);
+  // 注入结果丢了（帧刚切走）时按「装了」处理：宁可变废旧 ref，也不能让页面带着空句柄跑。
+  const installed = result == null || result === true || result.installed === true;
+  if (!installed) return true;
+  const handle = await nextDocHandle();
+  try {
+    await runInTab(tabId, (value) => window.__ema2_helpers.setDocHandle(value), [handle]);
+  } catch (_) { /* 途中导航：新文档会重新安装并拿到新句柄 */ }
+  return true;
 }
 
 /** 在 MAIN/isolated world 中执行一次完整的“查找 + 校验 + 动作”，失败结果由调用方映射为错误。 */
@@ -1701,30 +2223,68 @@ function withDebugger(tabId, run, options = {}) {
   return task;
 }
 
+/** Runtime.evaluate 的语法错误（编译期）与运行时抛出的 SyntaxError 都带 className=SyntaxError。 */
+function isSyntaxErrorDetails(details) {
+  if (!details) return false;
+  const exception = details.exception || {};
+  return exception.className === 'SyntaxError' || /\bSyntaxError\b/.test(details.text || '');
+}
+
+function jsErrorHint(details) {
+  if (isSyntaxErrorDetails(details)) {
+    return 'syntax error: send an expression (`document.title`) or a statement body with optional top-level return/await; unbalanced brackets or a stray `{ }` block are the usual causes';
+  }
+  return 'runtime error: the code parsed but threw; read the page first (snapshot/read) or guard with try/catch';
+}
+
+function evaluateInTab(tabId, expression) {
+  return chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+}
+
 async function jsTool(args) {
   const tab = await resolveTab(args);
   if (isInternalUrl(tab.url)) fail('internal_page', 'browser internal pages cannot run JS', 'open an http(s) page');
   return withDebugger(tab.id, async () => {
-    const result = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
-      expression: args.code,
-      returnByValue: true,
-      awaitPromise: true,
-    });
+    let result = await evaluateInTab(tab.id, args.code);
+    // 顶层 return / 多条语句不是合法表达式：按 async 函数体再跑一次，
+    // 与常见 codemode 沙箱的语义保持一致。
+    if (result.exceptionDetails && isSyntaxErrorDetails(result.exceptionDetails)) {
+      result = await evaluateInTab(tab.id, `(async () => {\n${args.code}\n})()`);
+      if (result.exceptionDetails) {
+        const details = result.exceptionDetails;
+        const message = details.exception && details.exception.description || details.text || 'JS error';
+        fail('js_exception', oneLine(message).slice(0, 300), jsErrorHint(details));
+      }
+      const wrappedValue = result.result ? result.result.value : undefined;
+      const budget = normalizeBudget(args.budget === undefined ? 8000 : args.budget);
+      const text = wrappedValue === undefined ? 'undefined' : stringifyValue(wrappedValue);
+      const slice = sliceText(text, budget, 0);
+      const lines = [slice.text];
+      if (slice.next != null) lines.push(footer(slice.total, slice.text.length, slice.next));
+      if (wrappedValue === undefined) {
+        lines.push('note=ran as an async function body; add `return <value>` to get a value back');
+      }
+      return lines.join('\n');
+    }
     if (result.exceptionDetails) {
       const details = result.exceptionDetails;
       const message = details.exception && details.exception.description || details.text || 'JS error';
-      fail('js_exception', oneLine(message).slice(0, 300), 'fix the expression; read the page with snapshot/read first');
+      fail('js_exception', oneLine(message).slice(0, 300), jsErrorHint(details));
     }
     const value = result.result ? result.result.value : undefined;
-    let text;
-    if (typeof value === 'string') text = value;
-    else {
-      try { text = JSON.stringify(value); } catch (_) { text = String(value); }
-    }
     const budget = normalizeBudget(args.budget === undefined ? 8000 : args.budget);
-    const slice = sliceText(text == null ? 'null' : text, budget, 0);
+    const slice = sliceText(value === undefined ? 'undefined' : stringifyValue(value), budget, 0);
     return slice.text + (slice.next == null ? '' : '\n' + footer(slice.total, slice.text.length, slice.next));
   });
+}
+
+function stringifyValue(value) {
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch (_) { return String(value); }
 }
 
 function buildHar(items, pageUrl) {
@@ -1812,35 +2372,92 @@ function validateBatchInner(toolName, inner) {
   }
 }
 
-/** 在多个标签页上并发执行 read/snapshot/js/wait，返回每页一块结果。 */
+/**
+ * 在多个标签页上并发执行 read/snapshot/js/wait/open，返回每页一块结果。
+ * 传 `urls` 时先打开（新标签）再执行目标工具——「打开→读取」因此只需一次调用。
+ */
 async function batchTool(args) {
-  const allowed = ['read', 'snapshot', 'js', 'wait'];
+  const allowed = ['open', 'read', 'snapshot', 'js', 'wait'];
   const toolName = args.tool;
   if (!allowed.includes(toolName)) {
-    fail('invalid_tool', `batch cannot run ${toolName}`, 'use read|snapshot|js|wait');
+    fail('invalid_tool', `batch cannot run ${toolName}`, 'use open|read|snapshot|js|wait');
   }
+  const urls = Array.isArray(args.urls) ? args.urls : [];
   const tabIds = Array.isArray(args.tabIds) ? args.tabIds : [];
-  if (!tabIds.length || tabIds.length > MAX_BATCH_TABS) {
-    fail('invalid_argument', `batch tabIds must contain 1..${MAX_BATCH_TABS} entries`, 'fix tabIds');
+  if (urls.length && tabIds.length) {
+    fail('invalid_argument', 'batch takes either tabIds or urls, not both', 'use urls to open new tabs, or tabIds for tabs you already have');
   }
-  for (const [index, tabId] of tabIds.entries()) {
-    if (!Number.isInteger(tabId) || tabId < 0) {
-      fail('invalid_argument', `tabIds[${index}] must be a non-negative integer`, 'call tabs to list ids');
+  const targets = urls.length ? urls : tabIds;
+  if (!targets.length || targets.length > MAX_BATCH_TABS) {
+    fail('invalid_argument', `batch needs 1..${MAX_BATCH_TABS} tabIds or urls`, 'fix tabIds/urls');
+  }
+  if (urls.length) {
+    for (const [index, url] of urls.entries()) {
+      if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+        fail('invalid_argument', `urls[${index}] must be an http(s) url`, 'fix urls');
+      }
+    }
+  } else {
+    for (const [index, tabId] of tabIds.entries()) {
+      if (!Number.isInteger(tabId) || tabId < 0) {
+        fail('invalid_argument', `tabIds[${index}] must be a non-negative integer`, 'call tabs to list ids');
+      }
     }
   }
   const inner = args.args === undefined ? {} : args.args;
-  validateBatchInner(toolName, inner);
+  if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
+    fail('invalid_argument', 'batch args must be an object', 'see tools/list');
+  }
+  if (urls.length) {
+    // 复合模式的内层参数属于目标工具；open 自身只接受 wait/replace/reuse。
+    validateBatchInner(toolName, inner);
+    if (inner.wait !== undefined && !['load', 'dom', 'none'].includes(inner.wait)) {
+      fail('invalid_argument', 'wait must be load|dom|none', 'fix the inner arguments');
+    }
+    if (inner.replace !== undefined && typeof inner.replace !== 'boolean') {
+      fail('invalid_argument', 'replace must be a boolean', 'fix the inner arguments');
+    }
+    if (inner.reuse !== undefined && inner.reuse !== 'session') {
+      fail('invalid_argument', 'reuse must be session', 'fix the inner arguments');
+    }
+  } else {
+    validateBatchInner(toolName, inner);
+  }
   const requested = args.concurrency === undefined ? 2 : Number(args.concurrency);
   if (!Number.isFinite(requested) || requested < 1 || requested > 4 || Math.round(requested) !== requested) {
     fail('invalid_argument', 'concurrency must be an integer between 1 and 4', 'fix concurrency');
   }
   const concurrency = requested;
-  const results = new Array(tabIds.length);
+  const results = new Array(targets.length);
   let cursor = 0;
   async function worker() {
     for (;;) {
       const index = cursor++;
-      if (index >= tabIds.length) return;
+      if (index >= targets.length) return;
+      if (urls.length) {
+        const url = urls[index];
+        try {
+          const openArgs = { ...inner, url };
+          const openedText = resultText(await executeTool('open', openArgs));
+          if (toolName === 'open') {
+            results[index] = `url=${url}\n` + openedText;
+          } else {
+            const tabId = Number((/^id=(\d+)/m.exec(openedText) || [])[1]);
+            if (!Number.isInteger(tabId)) {
+              results[index] = `url=${url}\n` + openedText;
+            } else {
+              const innerArgs = { ...inner, tabId };
+              delete innerArgs.replace;
+              delete innerArgs.reuse;
+              const value = await executeTool(toolName, innerArgs);
+              results[index] = `url=${url}\ntab=${tabId}\n` + resultText(value);
+            }
+          }
+        } catch (error) {
+          results[index] = `url=${url}\n` + formatError(error);
+        }
+        continue;
+      }
       const tabId = tabIds[index];
       try {
         const value = await executeTool(toolName, { ...inner, tabId });
@@ -1963,6 +2580,40 @@ function paginateRecords(records, budget) {
   return { items, next: items.length < records.length ? items[items.length - 1].seq : null };
 }
 
+const BODY_FILTER_MAX_CHARS = 512;
+const BODY_FILTER_TEXT_MAX_CHARS = 2000;
+// 灾难性回溯的两个典型来源：量词套量词 `(a+)+`、量词组内再分支 `(a|a)+`。
+const BODY_FILTER_NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*{](?:[^()\\]|\\.)*\)\s*[+*{]/;
+const BODY_FILTER_QUANTIFIED_ALTERNATION = /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*[+*{]/;
+
+/**
+ * 编译 `bodyFilter`，并拒绝已知会指数回溯的形态。
+ *
+ * JS 正则没有超时机制，`RegExp.test` 一旦进入灾难性回溯会阻塞 service worker
+ * （心跳、重连和所有工具调用一起卡住）。这里做长度上限 + 形态拒绝 + 输入截断三层防护；
+ * 这是启发式而非证明，剩余风险由 ≤800 字符的 body 预览兜底。
+ */
+function compileBodyFilter(source) {
+  const pattern = String(source);
+  if (pattern.length > BODY_FILTER_MAX_CHARS) {
+    fail('invalid_regex', `bodyFilter is limited to ${BODY_FILTER_MAX_CHARS} chars`, 'shorten the pattern');
+  }
+  if (BODY_FILTER_NESTED_QUANTIFIER.test(pattern) || BODY_FILTER_QUANTIFIED_ALTERNATION.test(pattern)) {
+    fail('invalid_regex', 'bodyFilter uses a quantified group that can backtrack exponentially',
+      'rewrite it without nested quantifiers, e.g. use two separate filters or a plain substring');
+  }
+  try {
+    return new RegExp(pattern, 'i');
+  } catch (error) {
+    fail('invalid_regex', `bodyFilter is not a valid regex: ${error.message}`, 'fix the regex');
+  }
+}
+
+/** bodyFilter 只在受控长度的预览上执行，避免把整页文本交给用户正则。 */
+function bodyFilterMatches(regex, body) {
+  return regex.test(String(body || '').slice(0, BODY_FILTER_TEXT_MAX_CHARS));
+}
+
 async function observeTool(args) {
   const tab = await resolveTab(args);
   const kind = args.kind;
@@ -2005,15 +2656,12 @@ async function observeTool(args) {
   }
 
   if (kind === 'network') {
+    // 先编译/校验正则，非法或高风险模式在触碰页面之前就失败。
+    const bodyRegex = args.bodyFilter ? compileBodyFilter(args.bodyFilter) : null;
     await ensureNetworkHook(tab.id);
     const withBodies = args.bodies !== false || !!args.har;
     await setNetworkBodyCapture(tab.id, withBodies);
     if (args.wait) await sleep(Math.min(10000, Math.round(args.wait * 1000)));
-    let bodyRegex = null;
-    if (args.bodyFilter) {
-      try { bodyRegex = new RegExp(String(args.bodyFilter), 'i'); }
-      catch (_) { fail('invalid_regex', `bodyFilter is not a valid regex: ${args.bodyFilter}`, 'fix the regex'); }
-    }
     const knownDoc = observedDocs.get(tab.id);
     const currentDoc = await runInTab(tab.id, () => (window.__ema2_net ? window.__ema2_net.epoch || '' : ''), [], 'MAIN');
     const forceReset = !!knownDoc && since > 0 && currentDoc !== knownDoc;
@@ -2038,14 +2686,18 @@ async function observeTool(args) {
     }, [since, args.filter || null, forceReset], 'MAIN');
     if (data.epoch) observedDocs.set(tab.id, data.epoch);
     let items = data.items;
-    let pending = false;
+    let pendingSeqs = [];
     if (bodyRegex) {
-      const firstPending = items.findIndex(entry => entry.preview === 'pending');
-      if (firstPending >= 0) {
-        items = items.slice(0, firstPending);
-        pending = true;
+      // bodyFilter 只能判断已经读完的 preview；pending 条目无法凭空匹配，
+      // 记录它们的 seq 让调用方精确补读，而不是把后续已就绪的条目一起丢掉。
+      const matched = [];
+      for (const entry of items) {
+        if (entry.preview === 'pending') { pendingSeqs.push(entry.seq); continue; }
+        if (bodyFilterMatches(bodyRegex, entry.body)) matched.push(entry);
       }
-      items = items.filter(entry => bodyRegex.test(entry.body || ''));
+      items = matched;
+    } else {
+      pendingSeqs = items.filter(entry => entry.preview === 'pending').map(entry => entry.seq);
     }
     if (args.har) {
       const har = buildHar(items, tab.url);
@@ -2058,20 +2710,24 @@ async function observeTool(args) {
         path = (parsed.pathname + parsed.search).slice(0, 100);
       } catch (_) { /* keep raw */ }
       const body = entry.body ? ' body=' + oneLine(entry.body).slice(0, 200) : '';
+      // 保留整条记录（method/status/url 始终有效），只把“body 还没读完”标出来。
+      const streaming = entry.preview === 'pending' ? ' streaming=1' : '';
       return {
         seq: entry.seq,
-        line: `#${entry.seq} ${entry.method} ${entry.status} ${entry.ms}ms ${path}${body}`,
+        line: `#${entry.seq} ${entry.method} ${entry.status} ${entry.ms}ms ${path}${body}${streaming}`,
       };
     });
     const page = paginateRecords(records, budget);
-    const next = pending
-      ? (page.items.length ? page.items[page.items.length - 1].seq : (data.reset ? 0 : since))
-      : (page.next == null ? data.seq : page.next);
+    const next = page.next == null ? data.seq : page.next;
     const dropped = Math.max(0, (data.firstSeq || 1) - (data.reset ? 0 : since) - 1);
     const parts = [page.items.map(item => item.line).join('\n')];
     parts.push(footer(records.length, page.items.length, next));
     if (dropped > 0) parts.push(`dropped=${dropped}`);
-    if (pending) parts.push('pending=1');
+    if (pendingSeqs.length) {
+      const listed = pendingSeqs.slice(0, 20).join(',');
+      parts.push(`pending=${pendingSeqs.length} seqs=${listed}${pendingSeqs.length > 20 ? ',...' : ''}`);
+      parts.push('hint=body still streaming; pass since=<first seq - 1> to read those entries again');
+    }
     if (data.reset) parts.push('reset=1');
     return parts.filter(Boolean).join('\n');
   }
@@ -2115,7 +2771,10 @@ async function readTool(args) {
     fail('selector_not_found', `selector not found: ${selector}`, 'call snapshot to see available refs/roles');
   }
   const slice = sliceText(data.text || '', budget, cursor);
-  return [data.header, slice.text, footer(slice.total, slice.text.length, slice.next)].join('\n');
+  const parts = [data.header, slice.text, footer(slice.total, slice.text.length, slice.next)];
+  const hint = truncationHint('read', slice.total, slice.text.length, slice.next, cursor);
+  if (hint) parts.push(hint);
+  return parts.join('\n');
 }
 
 async function snapshotTool(args) {
@@ -2132,6 +2791,8 @@ async function snapshotTool(args) {
   const parts = [data.header];
   if (data.body) parts.push(data.body);
   parts.push(footer(data.total, data.shown, data.next));
+  const hint = truncationHint('snapshot', data.total, data.shown, data.next, cursor, 'refs');
+  if (hint) parts.push(hint);
   const refs = Number((/refs=(\d+)/.exec(data.header) || [])[1] || 0);
   const visual = Number((/visual=(\d+)/.exec(data.header) || [])[1] || 0);
   if (refs === 0 && visual > 0) {
@@ -2160,6 +2821,17 @@ async function executeTool(name, args) {
       const url = requireStringArg(args, 'url', 8192, false);
       if (!url) fail('missing_url', 'url is required', 'pass an http(s) url');
       if (!/^https?:\/\//i.test(url)) fail('invalid_url', 'url must use http or https', 'fix the url');
+      if (args.reuse !== undefined && args.reuse !== 'session') {
+        fail('invalid_argument', 'reuse must be session', 'use reuse:"session" or replace:true');
+      }
+      if (args.replace !== undefined && typeof args.replace !== 'boolean') {
+        fail('invalid_argument', 'replace must be a boolean', 'use replace:true to navigate the current tab');
+      }
+      const modes = [args.tabId !== undefined, args.replace === true, args.reuse !== undefined]
+        .filter(Boolean).length;
+      if (modes > 1) {
+        fail('invalid_argument', 'use only one of tabId, replace:true, reuse:"session"', 'pick one navigation target');
+      }
       return openTool({ ...args, url });
     }
     case 'read': return readTool(args);
@@ -2184,4 +2856,24 @@ function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 ensureWatchdog();
 connect();
 chrome.runtime.onStartup.addListener(() => { ensureWatchdog(); connect(); });
-chrome.runtime.onInstalled.addListener(() => { ensureWatchdog(); connect(); });
+chrome.runtime.onInstalled.addListener((details) => {
+  ensureWatchdog();
+  connect();
+  if (details && details.reason === 'install') openPairPage();
+});
+if (chrome.action && chrome.action.onClicked) {
+  chrome.action.onClicked.addListener(() => {
+    try {
+      const created = chrome.tabs.create({ url: chrome.runtime.getURL('pair.html') });
+      if (created && typeof created.catch === 'function') created.catch(() => {});
+    } catch (_) { /* ignore */ }
+  });
+}
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || typeof message.type !== 'string' || !message.type.startsWith('ema2/')) return undefined;
+  handlePageMessage(message).then(
+    (result) => sendResponse(result),
+    (error) => sendResponse({ ok: false, error: String((error && error.message) || error) }),
+  );
+  return true;
+});

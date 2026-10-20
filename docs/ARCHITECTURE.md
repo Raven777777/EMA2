@@ -1,4 +1,4 @@
-# EMA2 (Rust) 架构说明 · v1.8.0
+# EMA2 (Rust) 架构说明 · v1.12.1
 
 ## 总览
 
@@ -26,20 +26,23 @@ WebSocket 桥接，让 AI 直接控制真实浏览器（真实指纹、真实登
 
 v1.4 是**面向 AI 的重新设计**，与 v1.3 的工具名不兼容；
 v1.5–v1.7 逐步补上深度 DOM、文件、网络、并发与视觉兜底。
-当前为 **v1.8.0：11 个工具**（参数与输出协议见 [TOOLS.md](TOOLS.md)，
+当前为 **v1.12.1：11 个工具**（参数与输出协议见 [TOOLS.md](TOOLS.md)，
 版本历史见 [CHANGELOG.md](CHANGELOG.md)）。
 
 ## 组件
 
 | 文件 | 职责 |
 |---|---|
-| `main.rs` | clap：`run`（优雅退出）/ `status`（带 token） |
-| `http.rs` | axum 路由 + Host/Origin/Content-Type 守卫 + 会话管理 |
+| `main.rs` | clap：`install`（日常 Edge 部署/自启/卸载）/ `run` / `pair` / `status` / `reload` |
+| `http.rs` | axum 路由 + Host/Origin/Content-Type 守卫 + 会话/事件流管理 |
 | `mcp.rs` | 协议：版本协商、tools、工具调用、截图落盘、工具错误封装 |
 | `relay.rs` | 扩展 WS 连接、`hello`→`welcome` 握手、保活 |
-| `state.rs` | 扩展连接（generation + sender）、pending 映射、会话/事件流 |
+| `state.rs` | 扩展连接（generation + sender）、pending 映射、会话/事件流、抗毒化的锁封装 |
 | `tools.rs` | 11 个工具的**唯一**注册表（schema + 校验 + 超时） |
-| `config.rs` | 端口/保活/token/输出目录 |
+| `pair.rs` | token 生成/持久化、HMAC 挑战应答 |
+| `clients.rs` | 五类终端检测与配置合并（opencode / Claude Code / Claude Desktop / Codex / Pi） |
+| `jsonc.rs` | 文本级 JSONC 编辑：只增删一个成员，保留注释与排版 |
+| `config.rs` | 端口/保活/token/状态目录/输出目录 |
 
 ## 工具面（11 个）
 
@@ -133,8 +136,11 @@ Markdown 转换时跳过 `NAV/HEADER/FOOTER/ASIDE/FORM`，显著降低页面样�
 - **先返回原始 Response**，再在独立异步任务里读取 `response.clone()` 的有限前缀：
   最多 8KB / 1.5s，读完主动 cancel；事件流和二进制类型默认跳过
 - `bodies=false` 会真正关闭新响应的 clone/读取，而不只是隐藏已采集正文
-- `since` 用上次返回的 `next` 做增量；`next` 只推进到**已完整交付**的记录，
-  环形缓冲溢出时回 `dropped=`，导航后序号回绕时回 `reset=1`
+- `since` 用上次返回的 `next` 做增量；环形缓冲溢出时回 `dropped=`，导航后序号回绕时回 `reset=1`
+- 预览未完成的条目不会被截断丢弃：行尾标 `streaming=1`，尾部给 `pending=<n> seqs=...`；
+  分页水位始终前进，不会因某条 body 一直 pending 而卡死
+- `bodyFilter` 只对已就绪的 body 求值，并在编译期拒绝量词嵌套/量词组内分支这类
+  会指数回溯的形态（JS 正则没有超时，阻塞 service worker 等于整个桥接停摆）
 - `wait` 给异步请求留时间（最多 10s）
 - `open` / `act` 之后会自动安装 hook（`open` 输出里带 `net_hook=on|off`）
 - 首次安装会用 `performance` 资源条目回填历史（`status=-1`，表示拿不到状态码）
@@ -150,7 +156,7 @@ Markdown 转换时跳过 `NAV/HEADER/FOOTER/ASIDE/FORM`，显著降低页面样�
 `shot annotate=true` 先做一次 `snapshot` 分配 ref，再取当前视口内每个 ref 的
 `getBoundingClientRect`，用 `OffscreenCanvas` 在截图上画框和编号，返回：
 
-- 文本：`[e12@doc] button "提交" @x,y wxh`（不依赖视觉模型也能用）
+- 文本：`[e12@d1] button "提交" @x,y wxh`（不依赖视觉模型也能用）
 - 图片：标注后的 PNG（Rust 默认落盘，只回 path；`inline=true` 回图片）
 
 ## snapshot 过滤与局部（v1.6）
@@ -187,24 +193,55 @@ Markdown 转换时跳过 `NAV/HEADER/FOOTER/ASIDE/FORM`，显著降低页面样�
 
 ## 扩展自刷新（v1.5）
 
-- `POST /reload`（回环 + 可选 token）→ 中继向扩展发 `bridge/reload`
+- `POST /reload`（回环 + token）→ 扩展在线时发 `bridge/reload`（200）；离线返回 202，
+  扩展下次启动 worker 时会直接从磁盘读新文件，不额外排队重载
 - 扩展收到后 `chrome.runtime.reload()`，等价于在 `edge://extensions` 点“重新加载”
 - CLI：`ema2.exe reload` 先 GET `/status` 确认中继可达且扩展已连接，再 bump
   `extension/manifest.json` 的 patch 版本并 POST `/reload`
   （Edge 按 manifest 版本缓存扩展脚本，只发 reload 不会重读磁盘）；
-  服务不通或扩展未连接时不会改版本号
+  服务不通或扩展未连接时不会改版本号；reload 失败时把 manifest 原样写回，不留版本漂移
 - 注意：扩展必须已经加载了带该 handler 的版本，之后才能自刷新
 
-## ref 快照模型（v1.8）
+## ref 快照模型（v1.8，v1.12 瘦身）
 
-`snapshot` 在页面里给交互元素打 `data-ema2-ref="e12@<documentEpoch>"`。epoch 由
-tabId + 随机串组成、每个 document 一份；`window.__ema2_ref_seq` 在同一 document 内单调递增，
-因此同一元素在多次快照间保持同一 ref，而硬导航、同 URL reload、另一个 tab 都不会复用旧 ref。
-`snapshot` 头部回 `doc=<epoch>`。
+`snapshot` 在页面里给交互元素打 `data-ema2-ref="e12@d3"`。`window.__ema2_ref_seq` 在同一 document
+内单调递增，因此同一元素在多次快照间保持同一 ref，而硬导航、同 URL reload、另一个 tab 都不会复用旧 ref。
+`snapshot` 头部回 `doc=d3`。
+
+### 为什么句柄由扩展分配（v1.12）
+
+v1.8 的 epoch 是 `t<tabId>-<随机串>`，在页内生成。它解决了唯一性，但每行要背 18 个字符：
+跨 12 个站点实测，文档标记占 snapshot 字符的 **28%**（x.com 这种短行页面高达 43%）。
+
+改成短句柄 `d1、d2…` 时，**分配必须留在扩展侧**：
+- 页面自己数序号会跨源重置（sessionStorage 按 origin 分区），同一 tab 换了域名后可能重号；
+- 页面自己取随机短串（4 字符）在 500 个文档量级下碰撞率约 0.07%，而这正是防止「旧 ref 点错元素」的那把锁。
+
+所以 `ensureHelpers` 只在「本次真的注入了 helper」时才从 `chrome.storage.local` 自增取号
+（同步自增，两个文档不会撞号），再用一次注入 `setDocHandle()` 下发给页面。已装好的页面不消耗号，
+号不会被空调用推高。页面侧 `refIsCurrent` 同时要求句柄非空且与当前文档一致。
+
+计数器落 **local** 而不是 session：session 在扩展重载/更新时会被清空，归零后新文档重新拿到 d1、d2…，
+会和仍然开着的旧页面撞号，旧 ref 就能在另一个文档上通过校验。
+
+### 输出瘦身（v1.12）
+
+跨 12 站点、942 行、73k 字符的字节构成：
+
+| 成分 | 占比 | 处理 |
+|---|---|---|
+| `href=` 等额外属性 | 39% | 截到 40 字符（`filter=links` 不截） |
+| 文档标记 | 28% | 短句柄 `@d1`，每行从 22 字符降到 5 |
+| 名称 | 19% | 已在 60 字符封顶 |
+| 角色词 | 7% | 保留 |
+| 引号 | 2% | 保留（分隔 name 与额外属性） |
+
+另外「无名称且不可操作」的节点（`presentation ""`、`banner ""`）默认不输出——它们在 x.com 占 20% 的行、
+其余站点 0~1%；`filter=full` 保持无损视图。
 
 ```
-[e12@t7-k3a9] button "提交" disabled
-[e13@t7-k3a9] textbox "搜索" name=q
+[e12@d3] button "提交" disabled
+[e13@d3] textbox "搜索" name=q
 ```
 
 `act`/`files` 用 `[data-ema2-ref="..."]` 找回元素，并先校验 ref 内嵌 epoch 是否属于当前 document；
@@ -237,8 +274,13 @@ batch 预算会把 tab 数、并发和子工具参数一起计算；`js` 按全�
 
 ## 会话与连接
 
-- `initialize` 创建 `Mcp-Session-Id`；非 initialize 必须携带（否则 400/404）
-- `GET /mcp` 服务端事件流按 `(session, stream_id)` 登记，旧流清理不误删新流
+- `initialize` 返回 `capabilities.tools` 与 `capabilities.logging`，并创建 `Mcp-Session-Id`；
+  非 initialize 必须携带（否则 400/404）
+- `GET /mcp` 是真正的服务端事件流：扩展连接/断开时 relay 调 `broadcast_event`，
+  向每个打开的流推送 `notifications/message`（`logger=ema2`），客户端无需等下一次
+  `tools/call` 才知道扩展掉线
+- 每个 session 只保留一条事件流：重复 `GET /mcp` 会替换旧流并立即关闭旧连接
+  （日志记录被替换的 stream id），不会叠加注册
 - legacy SSE：`GET /sse` + `POST /messages?sessionId=`
 - 每 60s GC 10 分钟未活跃会话
 - 扩展连接用 generation 区分；重连后旧响应被丢弃；pending 用 Drop guard
@@ -252,27 +294,120 @@ batch 预算会把 tab 数、并发和子工具参数一起计算；`js` 按全�
 - 30s watchdog alarm 兜底重连（1s→30s 指数退避）
 - `act` 的 `steps` 每步重新注入 helper，因此可跨导航执行
 
+## 安装、配对与客户端配置（v1.10）
+
+目标：AI 零配置直接用，人只点一次授权，扩展部署/更新由 exe 负责。
+
+```text
+ema2.exe install
+  ├─ 在 Edge User Data 的 Preferences 里找已加载的 EMA2 扩展
+  │    ├─ 找到（location=4 解包 / 8 命令行）→ 原地覆盖该目录（日常 Edge，升级即生效）
+  │    └─ 没找到 → 部署到 %LOCALAPPDATA%\EMA2\extension，打开 edge://extensions 并打印指引
+  │    （商店/策略安装的只读目录不会被覆盖）
+  ├─ 注册登录自启（Startup 目录的 EMA2.vbs → 隐藏启动中继）
+  └─ 中继以待授权态启动：只开 /pair/status 与 ?pair=1
+
+扩展（未配对）→ ws://127.0.0.1:8765/?pair=1
+  → bridge/hello → welcome{pairing:true} → 自动打开 pair.html
+  → 授权页列出检测到的终端，人勾选后点“授权此浏览器”
+  → bridge/pair-claim{clients:[...]}
+  → 中继生成 32B token、写 state.json、按选择写终端配置
+  → bridge/pair-granted{token, selection} → 扩展存 storage 并用 ?token= 重连
+```
+
+- 待授权态 `/mcp` 一律 503；配对通道不注册为工具连接，只接受 hello / pair-claim
+- 配对一次性：已有 token 时 `?pair=1` → 409，`ema2.exe pair --reset` 后重来
+- 每次连接扩展发随机 challenge，中继回 `HMAC-SHA256(token, "ema2-welcome|" + challenge)`；
+  扩展验签失败立即断开且不置 ready（防止本地进程抢占 8765 冒充中继）
+- token 优先级：`EDGE_MCP_TOKEN` > `state.json`；状态文件原子写
+- `install --uninstall`：删除 Startup 自启、五类终端里的 `edge-browser` 条目、托管 profile、
+  部署的扩展与状态文件；浏览器内的扩展只能由用户在 `edge://extensions` 移除
+
+### 客户端配置合并
+
+| 终端 | 键 | 形状 | 策略 |
+|---|---|---|---|
+| opencode | `mcp.edge-browser` | `type=remote` + `headers` | JSONC 文本级插入/替换 |
+| Claude Code | `mcpServers.edge-browser` | `type=http` + `headers` | JSON 文本级插入/替换（必须仍是严格 JSON） |
+| Claude Desktop | `mcpServers.edge-browser` | `url` + `headers` | 同上 |
+| Codex | `[mcp_servers.edge-browser]` | `url` + `http_headers` | TOML 表段替换/追加，保留其他表 |
+| Pi | `mcpServers.edge-browser` | `url` + `headers` | 写 `~/.pi/agent/mcp.json` |
+
+- `jsonc.rs` 只扫描对象成员边界（字符串/注释内的括号不计数），在文本上插入或删除目标成员；
+  除新增条目外不改动任何字节，注释、键顺序、缩进、CRLF 都保留
+- 写入前先用 `validate()` 完整解析原文件，畸形配置直接报 `invalid JSON/JSONC`，不做文本手术
+- 写入后再次解析并确认 `edge-browser` 的 url/token 正确；Codex 结果用 `toml` 解析校验
+- 幂等：只比较 `url` 与 `Authorization`，用户给该条目加的额外键不会被反复覆盖
+- **每次**改写/移除前都把当前内容写入 `<file>.ema2.bak`（覆盖旧备份）；文件原本不存在时写 0 字节备份；
+  结果里带 `backup` 路径，授权页直接展示
+- `apply(selection)`：写入勾选项，并移除未勾选项里的 `edge-browser`。只移除“像 EMA2 写的”条目
+  （url 指向 `127.0.0.1:*/mcp`，或 Authorization 是 64 位 hex bearer）；别的条目原样保留
+- `EMA2_SKIP_CLIENT_CONFIG=1` 可整体禁用
+
+## MCP 自我描述（v1.10.1）
+
+`initialize` 的结果决定模型怎么理解这组工具：
+
+- `instructions`：明确“操作的是用户真实、可见的 Microsoft Edge（真实 cookie/登录态），
+  不是无头、远程或沙箱”，并明确要求模型不得声称“没有控制浏览器的工具”
+- `serverInfo.name = "ema2"`，`title = "EMA2 — user's real Microsoft Edge browser"`
+- 11 个工具都带 `title`，描述统一以 “On the user's real, visible Microsoft Edge browser...” 开头
+- `tools/list` 的 schema 体积上限相应放宽到 7KB
+
+没有这段说明时，实测模型会把 `tabs/open/read` 当成通用网页或无头工具，甚至一边否认
+一边成功调用；这些字段就是给模型的“身份说明”。
+
+## 标签复用与会话收尾（v1.11）
+
+长会话里“每次 open 都新开一个标签 + 手工记 tabId”是主要摩擦来源，因此：
+
+- 扩展维护 `sessionTabs`（有序 id 列表），落在 `chrome.storage.session`：
+  MV3 service worker 随时会被回收，只放内存会丢；放 `local` 又会跨浏览器重启残留。
+  `session` 的生命周期正好是“本次浏览器会话”
+- 只有真正**新建**的标签（`open` 默认分支、`tabs new`）进入会话；
+  `open tabId=`/`replace=true` 导航的是用户已有的标签，登记会造成
+  `scope=session` 误关用户页面，所以明确排除
+- `tabs close scope=session` 逐个 `tabs.remove`，对已不存在的 id 静默跳过（用户可能已手动关掉）
+- `open` 的导航目标三选一（`tabId` / `replace` / `reuse=session`），校验在中继与扩展两侧同源，
+  避免“看起来指定了但实际导航了别的标签”
+
+## 真实状态码（v1.11）
+
+`open` 在页面就绪后读 `performance.getEntriesByType('navigation')[0]`：
+`responseStatus` 给出主文档真实 HTTP 状态、`redirectCount` 给出重定向次数。
+选它而不选 `Network.responseReceived` 的原因：后者要求常驻 debugger 会话，
+每次 `open` 都会在浏览器顶部留一条“正在调试此浏览器”的横幅，且与 `js`/`shot` 的全局
+串行 debugger 队列相互阻塞。`wait=none` 时导航尚未完成，返回 `status=pending`。
+
+同一个坑还有一处：`tabs.update` 之后旧文档依旧是 `complete`，只看 `readyState` 会立刻判「已就绪」，
+于是 `replace`/`reuse`/`tabId` 导航返回的是上一页的 `url/title`。所以 `open` 的就绪判定改成
+`waitForDocument()`：同时读页内 `location.href` 与 `readyState`，必须确认**已离开旧文档**
+（重定向到别的地址同样算离开）且 `readyState` 达标才返回。
+
 ## 安全
 
 - 只绑 `127.0.0.1`；Host/Origin 只允许回环与 `chrome-extension://`
 - 强制 `Content-Type: application/json`（阻止简单请求绕过 CORS 预检）
-- 可选 token：HTTP `Authorization: Bearer`，扩展 WS `?token=`；常量时间比较
+- **token 默认必填**：未设 `EDGE_MCP_TOKEN` 且未显式 `--insecure-allow-no-token`
+  （或 `EDGE_MCP_ALLOW_ANONYMOUS=1`）时拒绝启动，退出码 2；匿名启动会打 `ERROR` 日志
+- token 传输：HTTP `Authorization: Bearer`，扩展 WS `?token=`；常量时间比较
 - `bridge/welcome` 握手：扩展不对未知服务执行指令
+- `panic = "unwind"` + `state::lock` 忽略锁中毒：单个任务 panic 不会带走整个中继
 
 ## 测试
 
 完整测试矩阵、覆盖映射和真实 Edge 验收边界见 [TESTING.md](TESTING.md)。
 
 ```bash
-# Rust：49 个单元测试（含超时预算、batch 内层校验、SSE Drop 清理）
+# Rust：98 个单元测试（含 JSONC/TOML 合并、选择/移除、备份、MCP 元数据、SSE、配对/HMAC）
 cd rust && cargo test --locked --offline
 cargo clippy --locked --all-targets -- -D warnings
 
-# 扩展/脚本回归：19 项（Node 24 + jsdom devDependency）
+# 扩展/脚本回归：45 项（Node 22+ + jsdom devDependency）
 npm install
 npm run test:js
 
-# 真实 Edge/MV3 验收：16 场景（隔离 profile）
+# 真实 Edge/MV3 验收：22 场景（隔离 profile + 隔离 HOME）
 npm run test:edge
 
 # Windows 进程管理自检与外部分占用者保护
@@ -280,8 +415,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bridge.ps1 -SelfTest
 ```
 
 覆盖：协议版本协商、11 工具 schema/参数校验（含 null/枚举/范围）、
-wait 与 batch 超时预算、pending 代际隔离与取消释放、token、事件流清理与 Drop、
-会话 GC、截图落盘/失败、Host/Origin/Content-Type 拦截、notification 202；
+wait 与 batch 超时预算、pending 代际隔离与取消释放、token 必需性、事件流投递/替换与 Drop、
+锁中毒后仍可用、会话 GC、截图落盘/失败、Host/Origin/Content-Type 拦截、notification 202；
 扩展侧覆盖 F01–F13 的网络非阻塞、敏感信息、文档作用域 ref、debugger deadline、
 截图活动页、观测分页、Markdown、动作结果、press 目标、跨文档网络水位和参数边界。
 真实 Edge 验收已在 Edge 155.0.4283.62 上 16/16 通过（独立临时 profile）；

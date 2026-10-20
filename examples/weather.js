@@ -2,9 +2,9 @@
 'use strict';
 
 /**
- * EMA2 v1.8 示例：通过 MCP 控制真实 Edge，在 Google 查天气并读取结果。
+ * EMA2 v1.12 示例：通过 MCP 控制真实 Edge，在 Google 查天气并读取结果。
  *
- * v1.8 工具面（11 个）：tabs / open / read / snapshot / act / wait / js / observe / files / shot / batch
+ * 工具面（11 个）：tabs / open / read / snapshot / act / wait / js / observe / files / shot / batch
  * 输出是行式紧凑文本，错误是 `error=<code> msg=... hint=...`。
  */
 
@@ -107,7 +107,7 @@ async function queryWeather(location, options = {}) {
 function printUsage() {
   console.log('Usage: node examples/weather.js <city or place> [--json] [--keep-tab]');
   console.log('Example: node examples/weather.js "Tokyo"');
-  console.log('Requires the EMA2 relay (v1.4) and the Edge extension to be connected.');
+  console.log('Requires the EMA2 relay (v1.12.1) and the Edge extension to be connected.');
 }
 
 async function main(argv) {

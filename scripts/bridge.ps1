@@ -90,7 +90,13 @@ function Test-Health([int]$WantedPort) {
         $status = Invoke-RestMethod -Uri "http://127.0.0.1:$WantedPort/status" -Headers $headers -TimeoutSec 3
         return ($status.name -eq 'ema2')
     } catch {
-        return $false
+        # 尚未授权时 /status 是 503；/pair/status 能证明中继已经在监听。
+        try {
+            $pair = Invoke-RestMethod -Uri "http://127.0.0.1:$WantedPort/pair/status" -TimeoutSec 3
+            return ($pair.name -eq 'ema2')
+        } catch {
+            return $false
+        }
     }
 }
 
@@ -145,6 +151,10 @@ switch ($Action) {
             }
             [Console]::Error.WriteLine("EMA2 owns port $resolvedPort but /status is not healthy; not starting a second copy.")
             exit 3
+        }
+
+        if (-not $env:EDGE_MCP_TOKEN -and $env:EDGE_MCP_ALLOW_ANONYMOUS -notmatch '^(1|true|yes|on)$') {
+            Write-Output "No EDGE_MCP_TOKEN: the relay will wait for browser authorization."
         }
 
         $process = Start-Process -FilePath $exePath -ArgumentList @('run', '--port', "$resolvedPort") -WindowStyle Hidden -PassThru

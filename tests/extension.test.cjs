@@ -1,6 +1,8 @@
 'use strict';
 
 const { test } = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   assert,
   createChrome,
@@ -10,6 +12,7 @@ const {
   pageRun,
   refsIn,
   expectToolError,
+  ROOT,
 } = require('./helpers.cjs');
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -456,16 +459,18 @@ test('F10 actions fail on disabled/read-only/unsupported controls and use one in
   assert.equal(unsupported.ok, false);
   assert.equal(unsupported.code, 'unsupported_control');
 
-  // 新实现只有一次页面注入（ensureHelpers + performActionInPage），不存在二次 find 后假成功。
+  // 新实现只有一次动作注入（ensureHelpers + performActionInPage），不存在二次 find 后假成功。
+  // ensureHelpers 在「真的装了 helper」时会多一次注入，用来下发文档句柄。
   const other = loadBackground();
   const calls = [];
   other.runInTab = async (_tabId, func) => {
-    calls.push(func.name);
-    if (func.name === 'installHelpers') return true;
+    calls.push(func.name || 'setDocHandle');
+    if (func.name === 'installHelpers') return { installed: true };
+    if (!func.name) return true;
     return { found: true, ok: true, info: 'ref=e1@test' };
   };
   const info = await other.runStep({ id: 1 }, { action: 'click', ref: 'e1@test' });
-  assert.deepEqual(calls, ['installHelpers', 'performActionInPage']);
+  assert.deepEqual(calls, ['installHelpers', 'setDocHandle', 'performActionInPage']);
   assert.match(info, /ref=e1@test/);
 });
 
@@ -564,4 +569,654 @@ test('F12 batch and wait reject resource-range bypasses before doing browser wor
   });
   assert.match(output, /tab=1\nwait:1/);
   assert.match(output, /tab=2\nwait:2/);
+});
+
+test('P2-4 network observe keeps ready records that follow a streaming preview', async () => {
+  const background = loadBackground();
+  background.runInTab = async (_tabId, func, args) => {
+    const source = func.toString();
+    if (source.includes('__ema2_net') && args.length === 0) return 'n-test';
+    if (source.includes('__ema2_net') && args.length === 3) {
+      return {
+        seq: 3,
+        epoch: 'n-test',
+        reset: false,
+        firstSeq: 1,
+        items: [
+          { seq: 1, type: 'fetch', method: 'GET', url: 'https://example.test/a', status: 200, ms: 1, body: '', preview: 'pending' },
+          { seq: 2, type: 'fetch', method: 'GET', url: 'https://example.test/b', status: 201, ms: 2, body: 'ok', preview: 'done' },
+          { seq: 3, type: 'fetch', method: 'GET', url: 'https://example.test/c', status: 204, ms: 3, body: '', preview: 'done' },
+        ],
+      };
+    }
+    return true;
+  };
+
+  const output = await background.observeTool({ kind: 'network', budget: 4000, tabId: 1, since: 0 });
+  assert.match(output, /#2 GET 201 2ms \/b body=ok/, 'ready records after a pending one must not be dropped');
+  assert.match(output, /#3 GET 204 3ms \/c/);
+  assert.match(output, /#1 GET 200 1ms \/a streaming=1/, 'the streaming record is reported without inventing a body');
+  assert.match(output, /pending=1 seqs=1/);
+  assert.match(output, /next=3/, 'pagination must advance, not stall on the streaming entry');
+  assert.match(output, /hint=body still streaming/);
+});
+
+test('P2-1 bodyFilter rejects exponential backtracking and still matches safe patterns', async () => {
+  const background = loadBackground();
+  background.runInTab = async (_tabId, func, args) => {
+    const source = func.toString();
+    if (source.includes('__ema2_net') && args.length === 0) return 'n-test';
+    if (source.includes('__ema2_net') && args.length === 3) {
+      return {
+        seq: 2,
+        epoch: 'n-test',
+        reset: false,
+        firstSeq: 1,
+        items: [
+          { seq: 1, type: 'fetch', method: 'GET', url: 'https://example.test/a', status: 200, ms: 1, body: 'ok', preview: 'done' },
+          { seq: 2, type: 'fetch', method: 'GET', url: 'https://example.test/b', status: 500, ms: 2, body: 'boom', preview: 'done' },
+        ],
+      };
+    }
+    return true;
+  };
+
+  await assert.rejects(
+    background.observeTool({ kind: 'network', bodyFilter: '(a+)+$', tabId: 1 }),
+    expectToolError('invalid_regex'),
+  );
+  await assert.rejects(
+    background.observeTool({ kind: 'network', bodyFilter: '(a|a)+$', tabId: 1 }),
+    expectToolError('invalid_regex'),
+  );
+  await assert.rejects(
+    background.observeTool({ kind: 'network', bodyFilter: '('.repeat(1) + 'a'.repeat(600) + ')', tabId: 1 }),
+    expectToolError('invalid_regex'),
+  );
+
+  const filtered = await background.observeTool({ kind: 'network', bodyFilter: 'boom', budget: 4000, tabId: 1, since: 0 });
+  assert.match(filtered, /#2 GET 500/);
+  assert.doesNotMatch(filtered, /#1 GET 200/);
+});
+
+test('extension icons cover every manifest size and are valid RGBA PNGs', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension', 'manifest.json'), 'utf8'));
+  const declared = { ...manifest.icons, ...manifest.action.default_icon };
+  for (const size of ['16', '48', '128']) {
+    assert.ok(declared[size], `manifest must declare a ${size}px icon`);
+  }
+
+  const byFile = new Map();
+  for (const [size, file] of Object.entries(declared)) {
+    byFile.set(file, Number(size));
+  }
+  for (const [file, size] of byFile) {
+    const bytes = fs.readFileSync(path.join(ROOT, 'extension', file));
+    assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', `${file} is not a PNG`);
+    assert.equal(bytes.readUInt32BE(16), size, `${file} width must be ${size}px`);
+    assert.equal(bytes.readUInt32BE(20), size, `${file} height must be ${size}px`);
+    assert.equal(bytes[25], 6, `${file} must be RGBA so the toolbar background shows through`);
+  }
+});
+
+test('pairing: ws URL carries token or the pairing flag', async () => {
+  const background = loadBackground();
+  const anon = await background.getWsUrl({ wsUrl: 'ws://127.0.0.1:8765' });
+  assert.match(anon, /\?pair=1$/, `expected pairing URL, got ${anon}`);
+  const paired = await background.getWsUrl({ wsUrl: 'ws://127.0.0.1:8765', token: 'tok' });
+  assert.match(paired, /\?token=tok$/, `expected token URL, got ${paired}`);
+});
+
+test('pairing: welcome proof is verified against the shared token', async () => {
+  const nodeCrypto = require('node:crypto');
+  const background = loadBackground();
+  const token = 's3cret-token';
+  const challenge = '0123456789abcdef';
+  const proof = nodeCrypto
+    .createHmac('sha256', token)
+    .update(`ema2-welcome|${challenge}`)
+    .digest('hex');
+
+  background.authToken = token;
+  background.currentChallenge = challenge;
+  assert.equal(await background.verifyWelcome({ auth: 'hmac-v1', proof }), true);
+  assert.equal(await background.verifyWelcome({ auth: 'hmac-v1', proof: '00'.repeat(32) }), false);
+  assert.equal(await background.verifyWelcome({ auth: 'hmac-v1' }), false, 'missing proof must fail');
+  assert.equal(await background.verifyWelcome({ proof }), false, 'missing auth marker must fail');
+
+  // 匿名中继没有共享密钥，保持旧的“信任 welcome”行为。
+  background.authToken = null;
+  assert.equal(await background.verifyWelcome({}), true);
+});
+
+test('pairing: authorize stores the granted token and reconnects with it', async () => {
+  const grantedToken = 'a'.repeat(64);
+  const sent = [];
+
+  class FakeSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.sent = sent;
+      setTimeout(() => {
+        this.readyState = 1;
+        if (this.onopen) this.onopen();
+      }, 0);
+    }
+
+    send(payload) {
+      sent.push(JSON.parse(payload));
+      const message = JSON.parse(payload);
+      if (message.method === 'bridge/hello') {
+        setTimeout(() => this.onmessage && this.onmessage({
+          data: JSON.stringify({ jsonrpc: '2.0', method: 'bridge/welcome', pairing: true }),
+        }), 0);
+      }
+      if (message.method === 'bridge/pair-claim') {
+        setTimeout(() => this.onmessage && this.onmessage({
+          data: JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'bridge/pair-granted',
+            token: grantedToken,
+            port: 8765,
+            selection: ['opencode', 'codex'],
+            clients: [{ id: 'opencode', label: 'opencode', path: 'C:/x/opencode.json', action: 'updated' }],
+          }),
+        }), 0);
+      }
+    }
+
+    close() { this.readyState = 3; if (this.onclose) this.onclose(); }
+  }
+
+  const store = {};
+  const chrome = createChrome({
+    storage: {
+      local: {
+        get: async () => ({ ...store }),
+        set: async (values) => { Object.assign(store, values); },
+        remove: async (key) => { delete store[key]; },
+      },
+    },
+  });
+  const background = loadBackground(chrome);
+  background.WebSocket = FakeSocket;
+  // 配对成功后扩展会尝试重连；本测试只验证授权结果，不需要真的跑重连循环。
+  background.connect = async () => {};
+  background.fetch = async () => ({
+    ok: true,
+    json: async () => ({ reachable: true, pairing: true, paired: false }),
+  });
+
+  const result = await background.pairWithRelay(8765, ['opencode', 'codex']);
+  assert.equal(result.ok, true);
+  assert.equal(result.clients[0].id, 'opencode');
+  assert.equal(store.token, grantedToken);
+  assert.equal(store.wsUrl, 'ws://127.0.0.1:8765');
+  assert.deepEqual(Array.from(store.pairedClients), ['opencode', 'codex'], 'selection must be remembered');
+  assert.equal(background.authToken, grantedToken);
+  const claim = sent.find((message) => message.method === 'bridge/pair-claim');
+  assert.deepEqual(claim.clients, ['opencode', 'codex'], 'selection must be sent with the claim');
+});
+
+test('pairing: configure posts only the selected client ids', async () => {
+  const background = loadBackground();
+  background.authToken = 'tok';
+  let captured = null;
+  background.fetch = async (url, options) => {
+    captured = { url, options };
+    return { ok: true, json: async () => ({ clients: [], selection: ['codex'] }) };
+  };
+
+  const result = await background.configureClients(8765, ['codex']);
+  assert.match(captured.url, /\/admin\/clients$/);
+  assert.equal(captured.options.method, 'POST');
+  assert.equal(captured.options.headers['content-type'], 'application/json');
+  assert.deepEqual(JSON.parse(captured.options.body), { clients: ['codex'] });
+  assert.equal(result.ok, true);
+});
+
+// ---------------------------------------------------------------- v1.11：tab 复用 / 状态码 / 截断 / js 函数体
+
+function tabWorld() {
+  const state = {
+    nextId: 91,
+    tabs: new Map([[7, { id: 7, windowId: 1, active: true, url: 'https://user.example/', title: 'User tab' }]]),
+    removed: [],
+    navigated: [],
+  };
+  const chrome = createChrome({
+    tabs: {
+      query: async () => [...state.tabs.values()],
+      get: async (id) => {
+        const tab = state.tabs.get(id);
+        if (!tab) throw new Error(`no tab ${id}`);
+        return tab;
+      },
+      create: async ({ url }) => {
+        const tab = { id: state.nextId++, windowId: 1, active: true, url, title: 'T' };
+        state.tabs.set(tab.id, tab);
+        return tab;
+      },
+      update: async (id, patch) => {
+        const tab = state.tabs.get(id);
+        if (!tab) throw new Error(`no tab ${id}`);
+        if (patch.url) { tab.url = patch.url; state.navigated.push({ id, url: patch.url }); }
+        return tab;
+      },
+      remove: async (id) => {
+        if (!state.tabs.has(id)) throw new Error('no tab ' + id);
+        state.removed.push(id);
+        state.tabs.delete(id);
+      },
+    },
+  });
+  return { chrome, state };
+}
+
+/**
+ * open 需要「文档身份 / 导航计时 / hook」三类注入结果。
+ * 文档身份必须跟着 tab.url 走：open 会等人真正落到目标文档后才回读 url/title。
+ */
+function stubOpenRuntime(background, state, status = 200) {
+  background.runInTab = async (tabId, func) => {
+    const source = func.toString();
+    const tab = state ? state.tabs.get(tabId) : null;
+    if (source.includes('getEntriesByType')) return { status, redirects: 0, type: 'navigate' };
+    if (source.includes('document.readyState')) {
+      return { href: (tab && tab.url) || '', ready: 'complete' };
+    }
+    return true;
+  };
+}
+
+test('open reports the real document status, reuse mode and keeps user tabs out of the session list', async () => {
+  const { chrome, state } = tabWorld();
+  const background = loadBackground(chrome);
+  stubOpenRuntime(background, state, 200);
+
+  const fresh = await background.executeTool('open', { url: 'https://a.example/' });
+  assert.match(fresh, /^id=91$/m);
+  assert.match(fresh, /^status=200$/m);
+  assert.match(fresh, /^reuse=new$/m);
+  assert.equal(state.tabs.size, 2, 'default open must create exactly one tab');
+
+  // replace：导航当前活动 tab，不新建，也不把用户的 tab 记进会话。
+  const replaced = await background.executeTool('open', { url: 'https://b.example/', replace: true });
+  assert.match(replaced, /^id=7$/m);
+  assert.match(replaced, /^reuse=replace$/m);
+  assert.equal(state.tabs.size, 2, 'replace must not create a tab');
+  assert.deepEqual(state.navigated.at(-1), { id: 7, url: 'https://b.example/' });
+
+  const list = await background.tabsTool({ action: 'list' });
+  assert.match(list, /session_tabs=91/, 'only tabs EMA2 opened belong to the session');
+});
+
+test('open reuse=session navigates the last tab this session opened instead of piling up tabs', async () => {
+  const { chrome, state } = tabWorld();
+  const background = loadBackground(chrome);
+  stubOpenRuntime(background, state);
+
+  await background.executeTool('open', { url: 'https://a.example/' });
+  const second = await background.executeTool('open', { url: 'https://c.example/', reuse: 'session' });
+  assert.match(second, /^id=91$/m, 'reuse=session must land on tab 91');
+  assert.match(second, /^reuse=session$/m);
+  assert.equal(state.tabs.size, 2, 'reuse must not open a second tab');
+
+  // 会话 tab 被用户关掉后，复用要退回新建，而不是失败。
+  state.tabs.delete(91);
+  const third = await background.executeTool('open', { url: 'https://d.example/', reuse: 'session' });
+  assert.match(third, /^reuse=new$/m);
+});
+
+test('tabs close scope=session closes only the tabs EMA2 opened', async () => {
+  const { chrome, state } = tabWorld();
+  const background = loadBackground(chrome);
+  stubOpenRuntime(background, state);
+
+  await background.executeTool('open', { url: 'https://a.example/' });
+  await background.executeTool('open', { url: 'https://b.example/' });
+  const closed = await background.tabsTool({ action: 'close', scope: 'session' });
+  assert.match(closed, /^closed=91,92$/m);
+  assert.match(closed, /^count=2$/m);
+  assert.deepEqual(state.removed, [91, 92]);
+  assert.ok(state.tabs.has(7), 'the user tab must survive');
+
+  const again = await background.tabsTool({ action: 'close', scope: 'session' });
+  assert.match(again, /^closed=none$/m);
+  assert.match(again, /^count=0$/m);
+});
+
+test('tabs close tabIds[] closes a batch and ignores ids that are already gone', async () => {
+  const { chrome, state } = tabWorld();
+  const background = loadBackground(chrome);
+  const closed = await background.tabsTool({ action: 'close', tabIds: [7, 404] });
+  assert.match(closed, /^closed=7$/m);
+  assert.match(closed, /^count=1$/m);
+  assert.deepEqual(state.removed, [7]);
+  await assert.rejects(
+    background.tabsTool({ action: 'close', tabIds: ['7'] }),
+    expectToolError('invalid_argument'),
+  );
+});
+
+test('open surfaces an http error status instead of pretending the page is fine', async () => {
+  const { chrome, state } = tabWorld();
+  const background = loadBackground(chrome);
+  stubOpenRuntime(background, state, 404);
+  const out = await background.executeTool('open', { url: 'https://a.example/missing' });
+  assert.match(out, /^status=404$/m);
+  assert.match(out, /hint=http 404/);
+});
+
+test('open rejects conflicting navigation targets before touching the browser', async () => {
+  const { chrome, state } = tabWorld();
+  const background = loadBackground(chrome);
+  stubOpenRuntime(background, state);
+  await assert.rejects(
+    background.executeTool('open', { url: 'https://a.example/', replace: true, tabId: 7 }),
+    expectToolError('invalid_argument'),
+  );
+  await assert.rejects(
+    background.executeTool('open', { url: 'https://a.example/', reuse: 'all' }),
+    expectToolError('invalid_argument'),
+  );
+  assert.equal(state.tabs.size, 1, 'no tab may be created when arguments are rejected');
+});
+
+test('read says explicitly that the text was truncated and which cursor continues it', async () => {
+  const background = loadBackground(createChrome());
+  background.runInTab = async () => ({ text: 'x'.repeat(1000), header: 'url=https://x.example/ title=T' });
+
+  const out = await background.readTool({ budget: 400, tabId: 1 });
+  assert.match(out, /^total=1000 shown=400 next=400$/m);
+  assert.match(out, /hint=truncated: returned 400 of 1000 chars; call read with cursor=400 to continue/);
+
+  const tail = await background.readTool({ budget: 400, cursor: 400, tabId: 1 });
+  assert.match(tail, /^total=1000 shown=400 next=800$/m);
+  assert.match(tail, /from cursor=400/);
+
+  const done = await background.readTool({ budget: 2000, cursor: 0, tabId: 1 });
+  assert.doesNotMatch(done, /hint=truncated/, 'no hint when everything fits');
+});
+
+test('js accepts a function body with top-level return, like the codemode sandbox', async () => {
+  const background = loadBackground(createChrome());
+  const seen = [];
+  background.chrome.debugger.sendCommand = async (_target, _method, params) => {
+    seen.push(params.expression);
+    if (params.expression.startsWith('(async () =>')) {
+      return { result: { type: 'string', value: 'https://detail.example/42' } };
+    }
+    return {
+      exceptionDetails: {
+        text: 'Uncaught',
+        exception: { className: 'SyntaxError', description: 'SyntaxError: Illegal return statement' },
+      },
+    };
+  };
+
+  const code = 'const a = 1;\nreturn location.href;';
+  const out = await background.jsTool({ code, tabId: 1 });
+  assert.equal(out.trim(), 'https://detail.example/42');
+  assert.equal(seen.length, 2, 'expression attempt first, then the async function body');
+  assert.ok(seen[1].startsWith('(async () => {'), seen[1]);
+  assert.ok(seen[1].includes(code), 'the wrapped body must keep the original code');
+});
+
+test('js flags a body that produced no value instead of silently returning nothing', async () => {
+  const background = loadBackground(createChrome());
+  let first = true;
+  background.chrome.debugger.sendCommand = async () => {
+    if (first) {
+      first = false;
+      return {
+        exceptionDetails: {
+          text: 'Uncaught',
+          exception: { className: 'SyntaxError', description: 'SyntaxError: Illegal return statement' },
+        },
+      };
+    }
+    return { result: { type: 'undefined' } };
+  };
+
+  const out = await background.jsTool({ code: 'document.title = "x";', tabId: 1 });
+  assert.match(out, /^undefined$/m);
+  assert.match(out, /note=ran as an async function body/);
+});
+
+test('js keeps a real runtime error and gives a hint that matches the failure kind', async () => {
+  const background = loadBackground(createChrome());
+  background.chrome.debugger.sendCommand = async () => ({
+    exceptionDetails: {
+      text: 'Uncaught',
+      exception: { className: 'TypeError', description: 'TypeError: Cannot read properties of null' },
+    },
+  });
+
+  await assert.rejects(
+    background.jsTool({ code: 'document.querySelector("x").click()', tabId: 1 }),
+    (error) => {
+      assert.equal(error.code, 'js_exception');
+      assert.match(error.hint, /runtime error/);
+      return true;
+    },
+  );
+});
+
+test('js reports a syntax error after the body fallback and points at the real cause', async () => {
+  const background = loadBackground(createChrome());
+  let calls = 0;
+  background.chrome.debugger.sendCommand = async () => {
+    calls++;
+    return {
+      exceptionDetails: {
+        text: 'Uncaught',
+        exception: { className: 'SyntaxError', description: 'SyntaxError: Unexpected token }' },
+      },
+    };
+  };
+
+  await assert.rejects(background.jsTool({ code: 'if (a) {', tabId: 1 }), (error) => {
+    assert.equal(error.code, 'js_exception');
+    assert.match(error.hint, /statement body/);
+    return true;
+  });
+  assert.equal(calls, 2);
+});
+
+test('batch urls opens each url and then runs the tool on that new tab', async () => {
+  const background = loadBackground(createChrome());
+  const order = [];
+  background.openTool = async ({ url }) => {
+    order.push(`open:${url}`);
+    const id = url.includes('a.example') ? 11 : 12;
+    return { content: [{ type: 'text', text: `id=${id}\nurl=${url}\ntitle=A\nstatus=200\nreuse=new\nnet_hook=on` }] };
+  };
+  background.readTool = async ({ tabId }) => {
+    order.push(`read:${tabId}`);
+    return `url=https://x/${tabId}\nbody of ${tabId}`;
+  };
+
+  const out = await background.batchTool({
+    tool: 'read',
+    urls: ['https://a.example/', 'https://b.example/'],
+    concurrency: 2,
+    args: { mode: 'md' },
+  });
+  assert.match(out, /^url=https:\/\/a\.example\/\ntab=11\nurl=https:\/\/x\/11$/m);
+  assert.match(out, /^url=https:\/\/b\.example\/\ntab=12\nurl=https:\/\/x\/12$/m);
+  assert.deepEqual(order.sort(), [
+    'open:https://a.example/',
+    'open:https://b.example/',
+    'read:11',
+    'read:12',
+  ]);
+});
+
+test('batch open accepts urls without tabIds and rejects mixing the two', async () => {
+  const background = loadBackground(createChrome());
+  background.openTool = async ({ url }) => ({
+    content: [{ type: 'text', text: `id=5\nurl=${url}\nstatus=200\nreuse=new\nnet_hook=on` }],
+  });
+  const out = await background.batchTool({ tool: 'open', urls: ['https://a.example/'] });
+  assert.match(out, /^url=https:\/\/a\.example\/\nid=5/m);
+
+  await assert.rejects(
+    background.batchTool({ tool: 'open', urls: ['https://a.example/'], tabIds: [1] }),
+    expectToolError('invalid_argument'),
+  );
+  await assert.rejects(
+    background.batchTool({ tool: 'read', urls: ['file:///etc/passwd'] }),
+    expectToolError('invalid_argument'),
+  );
+  await assert.rejects(
+    background.batchTool({ tool: 'act', urls: ['https://a/'] }),
+    expectToolError('invalid_tool'),
+  );
+});
+
+test('open waits for the new document instead of reporting the page it just left', async () => {
+  // 真实浏览器里 tabs.update 之后旧文档还活着且 readyState=complete，
+  // 只判 readyState 会让 open 立刻返回上一页的 url/title。
+  const tab = { id: 7, windowId: 1, active: true, url: 'https://user.example/', title: 'User tab', status: 'complete' };
+  let committed = 'https://user.example/';
+  let docHref = 'https://user.example/';
+  let probes = 0;
+  const chrome = createChrome({
+    tabs: {
+      query: async () => [tab],
+      get: async () => ({ ...tab, url: committed }),
+      update: async (_id, patch) => {
+        tab.pendingUrl = patch.url;
+        return { ...tab, url: committed };
+      },
+      create: async () => { throw new Error('replace must not create a tab'); },
+    },
+  });
+  const background = loadBackground(chrome);
+  background.runInTab = async (_tabId, func) => {
+    const source = func.toString();
+    if (source.includes('getEntriesByType')) return { status: 200, redirects: 0, type: 'navigate' };
+    if (source.includes('document.readyState')) {
+      probes += 1;
+      if (probes > 3) {
+        docHref = tab.pendingUrl;
+        committed = tab.pendingUrl;
+      }
+      return { href: docHref, ready: 'complete' };
+    }
+    return true;
+  };
+
+  const out = await background.executeTool('open', { url: 'https://b.example/', replace: true });
+  assert.ok(out.includes('url=https://b.example/'), 'url must be the new document, got: ' + out);
+  assert.ok(out.includes('reuse=replace'));
+  assert.ok(probes > 3, 'must keep polling until the document really changed');
+});
+
+// ---------------------------------------------------------------- v1.12：快照瘦身
+
+test('snapshot drops nameless containers, clips long hrefs and stays lossless for filter=full', () => {
+  const background = loadBackground();
+  const dom = setupDom(
+    '<div role="presentation"></div>' +
+    '<div role="banner"></div>' +
+    '<a href="/short">Short</a>' +
+    '<a href="/a/very/long/path/that/exceeds/forty/chars/for/sure">Long</a>' +
+    '<button id="icon"></button>',
+    1,
+    background,
+  );
+  const helpers = dom.window.__ema2_helpers;
+
+  const body = helpers.snapshot('interactive', 8000, 0).body;
+  assert.doesNotMatch(body, /presentation/, 'nameless non-actionable nodes are noise');
+  assert.doesNotMatch(body, /banner/);
+  assert.match(body, /link "Short" href=\/short/);
+  assert.match(body, /…/, 'long href must be clipped with an ellipsis');
+  assert.match(body, /button ""/, 'an actionable control survives even without a name');
+
+  const full = helpers.snapshot('full', 8000, 0).body;
+  assert.match(full, /presentation/, 'filter=full keeps the lossless view');
+
+  const links = helpers.snapshot('links', 8000, 0).body;
+  assert.match(links, /\/a\/very\/long\/path\/that\/exceeds\/forty\/chars\/for\/sure/, 'filter=links keeps full urls');
+});
+
+test('refs carry a short document handle and long-form refs are rejected', () => {
+  const background = loadBackground();
+  const dom = setupDom('<button>Go</button>', 7, background);
+  const helpers = dom.window.__ema2_helpers;
+  const ref = refsIn(helpers.snapshot('interactive', 8000, 0).body)[0];
+
+  assert.match(ref, /^e\d+@d\d+$/, 'ref must be short, got ' + ref);
+  assert.ok(helpers.refIsCurrent(ref));
+  assert.equal(helpers.refIsCurrent('e1@t7-k3a9'), false, 'the old tab-random form is gone');
+  assert.equal(helpers.find('e1@t7-k3a9', null, null), null);
+  assert.equal(helpers.refIsCurrent('e1'), false, 'a bare ref is not enough to identify a document');
+});
+
+test('each new document gets its own handle and repeat injections do not burn numbers', async () => {
+  const background = loadBackground();
+  const handles = [];
+  let pendingInstall = true;
+  background.runInTab = async (_tabId, func, args) => {
+    if (func && func.name === 'installHelpers') {
+      const installed = pendingInstall;
+      pendingInstall = false;
+      return { installed };
+    }
+    handles.push(args[0]);
+    return true;
+  };
+
+  await background.ensureHelpers(1);
+  await background.ensureHelpers(1);
+  assert.deepEqual(handles, ['d1'], 'a page that is already wired must not consume a handle');
+
+  pendingInstall = true; // 同一个 tab 上换了一个文档
+  await background.ensureHelpers(1);
+  assert.deepEqual(handles, ['d1', 'd2']);
+});
+
+test('two tabs installing at the same moment never share a document handle', async () => {
+  const background = loadBackground(createChrome({
+    storage: {
+      local: { get: async () => ({}), set: async () => {} },
+      session: {
+        // 慢一点，让两个 tab 的首次读取真正重叠
+        get: async () => { await new Promise(resolve => setTimeout(resolve, 5)); return { ema2_doc_seq: 0 }; },
+        set: async () => {},
+      },
+    },
+  }));
+  const handles = [];
+  background.runInTab = async (_tabId, func, args) => {
+    if (func && func.name === 'installHelpers') return { installed: true };
+    handles.push(args[0]);
+    return true;
+  };
+
+  await Promise.all([background.ensureHelpers(1), background.ensureHelpers(2)]);
+  assert.equal(new Set(handles).size, 2, 'handles must be unique, got ' + handles.join(','));
+});
+
+test('document handles resume from the persisted counter instead of restarting at d1', async () => {
+  // 扩展重载会清空 session storage；计数器必须落 local，否则新文档的 d1 会和旧页面撞号。
+  const background = loadBackground(createChrome({
+    storage: {
+      local: { get: async () => ({ ema2_doc_seq: 41 }), set: async () => {} },
+      session: { get: async () => ({}), set: async () => {} },
+    },
+  }));
+  const handles = [];
+  background.runInTab = async (_tabId, func, args) => {
+    if (func && func.name === 'installHelpers') return { installed: true };
+    handles.push(args[0]);
+    return true;
+  };
+
+  await background.ensureHelpers(1);
+  assert.deepEqual(handles, ['d42'], 'must continue from the stored counter');
 });

@@ -1,5 +1,155 @@
 # 变更记录
 
+## v1.12.1 — 游标参数接受数字字符串
+
+真机验收时踩到：`snapshot` 尾部写 `next=23`，把它抄成 `cursor: "23"` 会被中继拒掉
+（`cursor must be a finite number`），而扩展侧本来就用 `Number()` 做了容错——只有校验层偏严。
+游标/`since` 是「从输出里抄回来的值」，两种写法都该收：
+
+- `cursor` 与 `observe` 的 `since` 同时接受数字与数字字符串（含前后空格），仍拒绝非整数与负数
+- 报错文案改成可操作的说法：`use the numeric value from the previous output`
+
+- 新增 `scripts/live-check.py`：对着用户真实在跑的 Edge 跑 59 项只读断言（维基 / GitHub / HN / 京东 / Bing），
+  覆盖快照结构、ref 句柄、act 解析、batch 复合、截断续读与参数容错——这次的字符串游标问题就是它发现的
+- 版本号 1.12.1；测试：Rust 98（+1）、Node 45、真机 59
+
+文档与示例整理：测试分层计数对齐实测（扩展 42 + 脚本 3 = 45，Rust 98）；
+`examples/` 去掉 v1.8–v1.10 的旧版本标注；`.gitignore` 补构建/编辑残留（`bin/*.old`、`.pytest_cache/`、`.venv/`）。
+
+## v1.12.0 — 快照瘦身：短 ref、去空节点、URL 截断
+
+`snapshot` 的输出结构是「模型每次操作都要读一遍」的东西，跨 12 个结构差异大的站点（x.com / 维基 /
+Bing / GitHub / MDN / HN / 淘宝 / 京东 / docs.rs / 知乎 / 百度 / stackoverflow）实测 942 行、73k 字符，
+字节构成是：`href=` 等额外属性 39%、文档标记 28%、名称 19%、角色词 7%、引号 2%。
+
+- **ref 改为短句柄**：`[e12@t1618196868-b62neq]` → `[e12@d1]`，每行从 22 字符降到 5。
+  句柄 `d1/d2…` 由扩展分配并落 `chrome.storage.local`——页面自己生成会撞 id：序号跨源会重置
+  （sessionStorage 按 origin 分区），4 字符随机串在 500 文档量级碰撞率约 0.07%，
+  而这把锁正是用来防止「旧 ref 点到另一个元素」。页面侧只持有句柄，校验仍要求句柄属于当前文档
+- **无名称且不可操作的节点不再输出**：`presentation ""`、`banner ""` 这类在 x.com 占 20% 的行、
+  其余站点 0~1%；`filter=full` 保持无损视图
+- **URL 截到 40 字符**（`…` 结尾）：额外属性是最大单项开销（京东 62%、淘宝 49%），
+  `filter=links` 是专门取链接的场景，不截断，需要完整地址也可以用 `read`/`js`
+- **不再向前兼容旧 ref**：`e1@t7-k3a9` 这类旧格式直接 `stale_ref`，没有历史包袱（这也是发布版行为）
+- `name` 保持 60 字符封顶（已存在，本次未改）；引号与角色词保留，压缩它们换不来可读性的对价
+
+实测（2500 预算，一次调用能看到的可操作元素）：维基 32→49、京东 28→47、淘宝 27→45、
+Bing 33→46、HN 36→47、MDN 30→38、GitHub 37→45、知乎 36→43；x.com 从 2 次翻页降到 1 次。
+
+- 版本号 1.12.0；测试：Rust 97、Node 45（+5）
+
+## v1.11.0 — 标签复用、真实状态码与截断续读
+
+针对一份真实抓取会话的体验反馈（必应/知乎/头条/定价页），修掉 5 处「知道但只能绕」的摩擦：
+
+- **`open` 可复用标签**：新增 `replace: true`（在当前活动 tab 里导航）与 `reuse: "session"`
+  （复用本会话最近打开的 tab），默认仍是新开；`tabId`/`replace`/`reuse` 三者互斥，
+  同时给会返回 `invalid_argument`，避免「哪个 tab 被导航」不可预测
+- **会话标签可批量收尾**：`tabs close` 支持 `tabIds: [..]`（≤8）与 `scope: "session"`，
+  后者关掉本会话由 `open`/`tabs new` 打开的标签；登记落 `chrome.storage.session`，
+  service worker 被回收后仍在；`tabs list` 追加 `session_tabs=` 行。
+  用 `tabId`/`replace` 导航的**用户标签不计入会话**，收尾不会误关用户自己的页面
+- **`open` 返回真实 HTTP 状态**：`status=` 取自主文档的 `PerformanceNavigationTiming.responseStatus`，
+  4xx/5xx 直接给 `hint=http 404 ...`，不再需要靠 `title="404错误页"` 猜；有重定向时另给 `redirects=`
+- **`batch` 支持 `open` 与「打开→读取」一次调用**：新增 `urls: [..]`，`tool=open` 并行开多页，
+  `tool=read` 内部完成 打开→等待→读取（每块头部 `url=` + `tab=`）；`tabIds` 与 `urls` 互斥，
+  预算把 open 成本计入 600s 上限
+- **截断不再静默**：`read`/`snapshot` 被 budget 截断时尾部追加
+  `hint=truncated: returned 4000 of 12345 chars; call read with cursor=4000 to continue`
+- **`js` 接受语句体**：先按表达式执行，遇语法错误再按 async 函数体执行一次，
+  顶层 `return`/`await`/多语句与常见 codemode 沙箱一致；错误 `hint` 区分
+  `syntax error` 与 `runtime error`，函数体无返回值时提示 `note=ran as an async function body`
+- **`open` 等的是「新文档」而不是 `readyState`**：在真实 Edge 上自测发现，`tabs.update` 之后
+  旧文档仍处于 `complete`，`waitForReady` 立刻通过，于是 `replace`/`reuse`/`tabId` 三种导航都会把
+  **上一页**的 `url`/`title` 报回来（正文也要等下次调用才跟上）。改为同时校验文档身份：
+  `location.href` 确认已离开旧文档（重定向到别的地址也算）且 `readyState` 达标才返回
+- 版本号 1.11.0；测试：Rust 97（+3）、Node 40（+14）
+
+## v1.10.1 — 备份、取消勾选与 MCP 自我描述修复
+
+- **备份每次刷新**：`<file>.ema2.bak` 现在保存“本次修改前”的内容，每次写入/移除都覆盖；
+  文件原本不存在时生成 0 字节备份（表示无旧配置可还原），不再出现“改了但没有备份”
+- **取消勾选真正还原**：新增 `clients::apply()`，保存选择时写入勾选项、移除未勾选项里的
+  `edge-browser` 条目（仅移除 url 指向 `127.0.0.1:*/mcp` 或带 64 位 hex bearer 的条目），
+  授权、二次保存、配对都走同一套逻辑；每条结果带 `backup` 路径
+- **MCP 明确说明操作对象**：`initialize` 增加 `instructions`，写明操作的是用户**真实、可见**的
+  Microsoft Edge（真实登录态，不是无头/远程/沙箱），并明确禁止“我没有控制浏览器的工具”这类回答；
+  `serverInfo.name=ema2`、新增 `title`；11 个工具全部新增 `title`，描述统一标注 real Edge
+- 授权页：未勾选但已配置的终端显示“将移除”；保存结果展示备份路径
+- 版本号 1.10.1；测试：Rust 94、Node 26、真实 Edge 22 场景
+
+## v1.10.0 — 日常 Edge / 五类终端 / 无损配置
+
+- **JSONC 无损合并**：新增 `jsonc.rs`，在文本层定位对象成员并只插入/删除 `mcp.edge-browser`；
+  注释、键顺序、缩进、CRLF 原样保留；写入前后各做一次完整解析校验，畸形文件直接报错不落盘
+- **终端覆盖扩到 5 类**：opencode（`.json` / `.jsonc`）、Claude Code（`~/.claude.json`）、
+  Claude Desktop、Codex（`~/.codex/config.toml` 的 `[mcp_servers.edge-browser]` + `http_headers`）、
+  Pi（`~/.pi/agent/mcp.json`）；未安装的终端只展示不创建
+- **授权页可选择终端**：列出检测结果、路径、格式、是否已配置；勾选后授权只写所选；
+  已授权后可“更新所选终端配置”（`POST /admin/clients`）；页面同时展示中继版本、端口、运行时长、
+  扩展版本、配对时间与 token 指纹
+- **install 默认面向日常 Edge**：读取 Edge `User Data` 的 `Preferences`，找到已加载的 EMA2 扩展就
+  原地覆盖更新，否则部署到 `%LOCALAPPDATA%\EMA2\extension` 并打开 `edge://extensions` 给出一次性
+  加载指引；`--managed-profile` 保留旧的独立窗口模式
+- **登录自启改为 Startup 目录**：不再写 `HKCU\...\Run`（受管机器上 `reg.exe` 可能被禁用），
+  卸载时同时清理旧版遗留的 Run 值（通过 `winreg`，不调用外部命令）
+- **新增 `install --uninstall`**：删除自启、五类终端里的 `edge-browser` 条目、托管 profile、
+  部署的扩展与 `state.json`；`--purge-output` 一并删除截图/HAR
+- 版本号 1.10.0；测试：Rust 87、Node 26、真实 Edge 21 场景（含五类终端真实合并 + install 识别已加载扩展）
+
+## v1.9.0 — 一次安装、一次授权
+
+- 新增 `ema2.exe install`：展开扩展到 `%LOCALAPPDATA%\EMA2\extension`、注册登录自启（隐藏启动）、
+  打开独立 EMA2 Edge 窗口（`--load-extension` + 独立 profile，不碰日常 Edge）、拉起中继等待授权
+- 新增首次授权流程：无 token 时中继进入待授权态，只开放 `/pair/status` 与 `?pair=1` 配对通道，
+  `/mcp` 一律 503；扩展自动打开 `pair.html`，点一次「授权此浏览器」完成配对
+- 新增中继身份校验：扩展每次连接带随机 challenge，校验
+  `HMAC-SHA256(token, "ema2-welcome|"+challenge)` 通过后才执行工具调用，
+  修复“任何本地进程占用 8765 并回 welcome 就能控制浏览器”的既有缺口
+- 配对完成后自动写入 opencode / Claude Desktop 的 MCP 配置（改前 `.ema2.bak` 备份；
+  检测到 `opencode.jsonc` 时跳过，避免生成同名 `.json` 覆盖）；
+  `EMA2_SKIP_CLIENT_CONFIG=1` 可关闭
+- `ema2.exe status` 未授权时读 `/pair/status`；新增 `ema2.exe pair [--reset]`
+- `bridge.ps1` 把 `/pair/status` 也视为健康，支持待授权态启动
+- 版本号 1.9.0；测试：Rust 72、Node 25、真实 Edge 20 场景（新增真实配对 + 授权页渲染）
+
+## v1.8.1 — 安全与可用性加固
+
+对应 2026-10-20 代码审查的 P0-1/P0-2/P1/P2/P3：
+
+- **P0-1 默认鉴权**：未设 `EDGE_MCP_TOKEN` 且未显式声明时中继拒绝启动（退出码 2），
+  只接受 `--insecure-allow-no-token` 或 `EDGE_MCP_ALLOW_ANONYMOUS=1` 作为显式例外；
+  匿名启动会打 `ERROR` 日志；`bridge.ps1` 在启动前拦截并给出配置指引；
+  扩展在无 token 且反复重连时打印设置提示
+- **P0-2 panic/锁**：`panic = "abort"` 改为 `"unwind"`；所有 `std::sync::Mutex`
+  取锁走 `state::lock` 忽略毒化；扩展 WS 任务用 Drop guard 注销 generation，
+  任务 panic 也不会让中继一直认为扩展在线
+- **P1-1 死端 SSE**：`GET /mcp` 现在真的会收到消息——扩展连接/断开时 relay 广播
+  `notifications/message`；流建立时先发注释帧确认；新增端到端测试
+- **P1-2 download-dir**：`files` 的 description 明确标注 Edge 固定返回
+  `download_dir_unsupported`，减少无效调用；文档同步
+- **P2-1 bodyFilter ReDoS**：编译期拒绝量词嵌套 `(a+)+` 与量词组内分支 `(a|a)+`，
+  限制 512 字符，匹配前截断输入到 2000 字符（预览本身 ≤800）
+- **P2-2 manifest 版本漂移**：`reload` 失败（含 POST 失败）时把 `extension/manifest.json`
+  原样写回；仅在 `/status` 确认扩展已连接后才 bump
+- **P2-3 事件流叠加**：明确“一个 session 一条流”语义，重复 `GET /mcp` 替换并立即关闭旧流，
+  返回被替换的 stream id 写入日志，不再依赖未定义行为
+- **P2-4 observe pending**：不再截断 pending 之后的已就绪条目；记录行照常输出并标
+  `streaming=1`，尾部给 `pending=<n> seqs=...`，分页水位始终前进
+- **P3-1** id 生成统一到 `next_id()`，去掉误导性的 `+ 1`
+- **P3-2** batch 预算收敛为单一 `batch_budget()`，`timeout_for` 与参数校验共用
+- **P3-3** 新增测试：事件流投递、同 session 重复注册替换旧流、锁中毒后仍可用、
+  config 鉴权裁决、observe pending 与 bodyFilter 形态、扩展图标尺寸（Rust 49→56，Node 19→22）
+- **P3-4** `Cargo.toml` 声明 `rust-version = "1.85"`，README 增加构建要求
+- **P3-5** 文档标注 `js` 超时的 `Runtime.terminateExecution` 会终止该 tab 全部 JS
+- **品牌**：扩展图标（16/48/128）改为由 `docs/img/ema2log.svg` 光栅化的 RGBA PNG
+  （内容裁切 viewBox `64 32 384 384`，保证 16px 可辨）；README 顶部加入
+  `docs/img/ema2log_t.svg` 横幅
+- **真机验收**：新增 3 个真实 Edge 场景——P1-1（真实 WS 断开/重连触发 SSE 通知）、
+  P0-1（无 token 启动被拒 + token 模式 401/200）、P2-4（3s 无 body 的慢响应标
+  `streaming=1`/`pending`）；隔离 profile 偶发丢扩展 worker 时自动换 profile 重试一次；
+  19/19 通过（Edge 155.0.4283.62）
+
 ## v1.8.0 — 浏览器正确性与可观测性修复
 
 对应 2026-10-19 代码审查的 F01–F13：

@@ -4,7 +4,10 @@
     "edge-browser": {
       "type": "remote",
       "url": "http://127.0.0.1:8765/mcp",
-      "enabled": true
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer change-me"
+      }
     }
   }
 }
