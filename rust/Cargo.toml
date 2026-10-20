@@ -1,41 +1,34 @@
 [package]
 name = "ema2"
-version = "1.12.1"
+version = "2.1.4"
 edition = "2024"
 # edition 2024 需要 Rust 1.85+；写在 manifest 里让旧工具链给出明确报错而不是晦涩的语法错误。
 rust-version = "1.85"
-description = "Edge MCP Agent 2 (Rust) - single-process relay between AI (MCP over HTTP) and the Edge browser extension"
+description = "EMA2 - single-exe daemon + CLI that lets AI drive the user's real Edge browser via an extension"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["ws", "json", "http1", "tokio", "query", "form"] }
+axum = { version = "0.8", features = ["ws", "json", "http1", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
-async-stream = "0.3"
 tower-http = { version = "0.6", features = ["limit"] }
 base64 = "0.22"
-hmac = "0.12"
-sha2 = "0.10"
-rand = "0.9"
-# 只用于校验 Codex 的 TOML 合并结果（写入仍是文本级编辑，保留用户原有排版）
-toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
-# 卸载时清理旧版本写过的 HKCU Run 值；不依赖 reg.exe（受管机器可能禁用）。
-[target.'cfg(windows)'.dependencies]
-winreg = "0.55"
-
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
-# 必须是 unwind：单个任务 panic 只应结束该任务，而不是让整个中继（所有 MCP 会话 +
+# 必须是 unwind：单个任务 panic 只应结束该任务，而不是让整个 daemon（所有 CLI 请求 +
 # 扩展 WS 连接）一起消失。锁中毒由 `state::lock` 统一兜底。
 panic = "unwind"

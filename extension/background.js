@@ -1,7 +1,5 @@
-'use strict';
-
 /**
- * EMA2 Edge 扩展 · v1.4（AI 专用浏览器接口）
+ * EMA2 Edge 扩展 · v2.0（AI 专用浏览器接口）
  * -------------------------------------------
  * 设计前提：这是给 AI 用的浏览器，不是给人用的自动化工具。
  *   - 输出一律行式紧凑文本（key=value / TSV / [ref]），不 pretty-print JSON
@@ -9,15 +7,14 @@
  *   - 错误统一 `error=<code> msg=... hint=...`，让模型能自我纠正
  *   - snapshot 给可引用 ref，act 按 ref 操作，避免 AI 猜 CSS 选择器
  *
- * 工具：tabs / open / read / snapshot / act / wait / js / observe / shot
+ * 工具：tabs / open / read / snapshot / act / wait / js / observe / files / shot / batch
  *
- * WS：默认 ws://127.0.0.1:8765，可在 chrome.storage.local 设 wsUrl 覆盖。
- * 鉴权：中继默认**必须**配置 EDGE_MCP_TOKEN；在扩展里设同一个值：
- *   chrome.storage.local.set({ token: '<EDGE_MCP_TOKEN>' })
- * 只有中继显式以 --insecure-allow-no-token 启动时才不需要 token。
+ * WS：默认 ws://127.0.0.1:7744，端口由扩展 popup 配置（chrome.storage.local.port）。
+ * 无 token、无配对、无验签：扩展裸连本机 daemon。
  */
 
-const DEFAULT_WS_URL = 'ws://127.0.0.1:8765';
+const DEFAULT_PORT = 7744;
+const DEFAULT_WS_URL = `ws://127.0.0.1:${DEFAULT_PORT}`;
 const RECONNECT_ALARM = 'ema2-reconnect';
 const WATCHDOG_ALARM = 'ema2-watchdog';
 const MAX_INCOMING_CHARS = 2 * 1024 * 1024;
@@ -33,20 +30,19 @@ const NET_PREVIEW_CHARS = 800;
 const NET_PREVIEW_TIMEOUT_MS = 1500;
 const NET_MAX_ENTRIES = 300;
 const MAX_BATCH_TABS = 8;
+const LAST_ACT_KEY = 'ema2_last_act';
+const LAST_ACT_TTL_MS = 5 * 60 * 1000;
+const SETTLE_NAV_MS = 3000;
+const SETTLE_PAGE_MS = 800;
+const SETTLE_NONE_MS = 100;
 
 let socket = null;
 let connecting = false;
 let retryAttempt = 0;
 let reconnectTimer = null;
 let relayReady = false;
-let tokenHintShown = false;
-// `var`：service worker 里行为等价，但让测试 VM 能把它们当作全局属性读写。
-var authToken = null;          // 当前连接使用的 token；null 表示未配对
-var currentChallenge = '';     // 本次连接的随机 challenge（验签用）
-let currentPort = 8765;
-let lastError = '';            // 连接/验签错误，授权页展示
-let pairingWelcome = false;    // 当前连接是配对通道
-let autoOpenedPairPage = false;
+let currentPort = DEFAULT_PORT;
+let lastError = '';            // 连接错误，popup 展示
 let debuggerQueue = Promise.resolve();
 let heartbeatTimer = null;
 const observedDocs = new Map(); // tabId -> last observe document epoch
@@ -55,6 +51,7 @@ const SESSION_TABS_KEY = 'ema2_session_tabs';
 // 浏览器重启即清空，正好是本会话的自然边界。
 let sessionTabs = [];
 let sessionTabsLoaded = false;
+let lastActContext = null;
 
 class ToolError extends Error {
   constructor(code, message, hint, lines) {
@@ -91,30 +88,35 @@ function validateWsUrl(value) {
 }
 
 async function readSettings() {
-  try { return await chrome.storage.local.get(['wsUrl', 'token']); } catch (_) { return {}; }
+  try { return await chrome.storage.local.get(['port', 'wsUrl']); } catch (_) { return {}; }
+}
+
+/** popup 存的 port 优先；旧版本的 wsUrl 只作为一次性迁移来源。 */
+function resolvePort(stored) {
+  const direct = Number(stored && stored.port);
+  if (Number.isInteger(direct) && direct > 0 && direct < 65536) return direct;
+  const raw = stored && stored.wsUrl;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = Number(new URL(raw).port);
+      // 旧默认 8765 直接迁到新默认 7744；自定义端口保留。
+      if (Number.isInteger(parsed) && parsed > 0 && parsed < 65536) {
+        return parsed === 8765 ? DEFAULT_PORT : parsed;
+      }
+    } catch (_) { /* fall through */ }
+  }
+  return DEFAULT_PORT;
 }
 
 async function getWsUrl(settings) {
   const stored = settings || await readSettings();
-  let base;
+  const port = resolvePort(stored);
   try {
-    base = validateWsUrl(stored.wsUrl || DEFAULT_WS_URL);
+    return validateWsUrl(`ws://127.0.0.1:${port}`);
   } catch (error) {
     console.error(`[EMA2] ${error.message}; falling back to ${DEFAULT_WS_URL}`);
-    base = DEFAULT_WS_URL;
+    return DEFAULT_WS_URL;
   }
-  const token = typeof stored.token === 'string' ? stored.token.trim() : '';
-  const url = new URL(base);
-  // 有 token 走正常鉴权连接；没有 token 走首次授权通道（中继未配对时才接受）。
-  if (token) url.searchParams.set('token', token);
-  else url.searchParams.set('pair', '1');
-  return validateWsUrl(url.href);
-}
-
-function randomHex(bytes) {
-  const buffer = new Uint8Array(bytes);
-  crypto.getRandomValues(buffer);
-  return [...buffer].map((value) => value.toString(16).padStart(2, '0')).join('');
 }
 
 async function connect() {
@@ -122,11 +124,6 @@ async function connect() {
   if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) return;
   connecting = true;
   const settings = await readSettings();
-  authToken = typeof settings.token === 'string' && settings.token.trim() ? settings.token.trim() : null;
-  if (!authToken && retryAttempt >= 2 && !tokenHintShown) {
-    tokenHintShown = true;
-    console.warn('[EMA2] no token yet: waiting for authorization in the EMA2 extension page');
-  }
   let url;
   try { url = await getWsUrl(settings); } catch (error) {
     connecting = false;
@@ -134,7 +131,7 @@ async function connect() {
     scheduleReconnect();
     return;
   }
-  try { currentPort = Number(new URL(url).port) || 8765; } catch (_) { /* keep previous */ }
+  try { currentPort = Number(new URL(url).port) || DEFAULT_PORT; } catch (_) { /* keep previous */ }
   let ws;
   try { ws = new WebSocket(url); } catch (error) {
     connecting = false;
@@ -144,8 +141,6 @@ async function connect() {
   }
   connecting = false;
   socket = ws;
-  currentChallenge = randomHex(16);
-  pairingWelcome = false;
 
   ws.onopen = () => {
     retryAttempt = 0;
@@ -158,26 +153,25 @@ async function connect() {
       method: 'bridge/hello',
       role: 'extension',
       version: chrome.runtime.getManifest().version,
-      challenge: currentChallenge,
     }));
   };
   ws.onmessage = (event) => {
-    handleMCPMessage(event.data, ws).catch((error) => console.error('[EMA2] handler failed:', error));
+    handleRelayMessage(event.data, ws).catch((error) => console.error('[EMA2] handler failed:', error));
   };
   ws.onclose = () => {
     if (socket !== ws) return;
     socket = null;
     relayReady = false;
+    lastError = 'relay disconnected';
     stopHeartbeat();
     scheduleReconnect();
-    maybeDropStaleToken().catch(() => {});
   };
-  ws.onerror = () => {};
+  ws.onerror = () => { lastError = 'websocket error'; };
 }
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  // 本地回环：中继重启后最多等 10s，不要退避到 30s（install 更新时尤其明显）。
+  // 本地回环：中继重启后最多等 10s，不要退避到 30s（扩展更新/重启时尤其明显）。
   const delayMs = Math.min(10000, 1000 * Math.pow(2, retryAttempt++));
   reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delayMs);
   chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: 0.5 });
@@ -207,187 +201,44 @@ function ensureWatchdog() {
   chrome.alarms.create(WATCHDOG_ALARM, { periodInMinutes: 0.5 });
 }
 
-// ---------------------------------------------------------------- pairing
+// ---------------------------------------------------------------- popup / relay probe
 
-function hexToBytes(hex) {
-  if (typeof hex !== 'string' || hex.length === 0 || hex.length % 2 !== 0) return null;
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let index = 0; index < bytes.length; index++) {
-    const value = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-    if (Number.isNaN(value)) return null;
-    bytes[index] = value;
-  }
-  return bytes;
-}
-
-async function hmacVerify(token, message, proofHex) {
-  const signature = hexToBytes(proofHex);
-  if (!signature || signature.length !== 32) return false;
-  try {
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      'raw', encoder.encode(token), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'],
-    );
-    return await crypto.subtle.verify('HMAC', key, signature, encoder.encode(message));
-  } catch (_) {
-    return false;
-  }
-}
-
-/** 中继必须证明自己持有 token，否则任何占用 8765 的本地进程都能冒充它。 */
-async function verifyWelcome(welcome) {
-  if (!authToken) return true; // 匿名中继：没有可验证的共享密钥
-  if (welcome.auth !== 'hmac-v1' || typeof welcome.proof !== 'string') return false;
-  return await hmacVerify(authToken, `ema2-welcome|${currentChallenge}`, welcome.proof);
-}
-
+/** popup 用 /health 判断 daemon 是否在跑；连接状态以本扩展的 WS 为准。 */
 async function probeRelay(port) {
+  const target = Number(port) || currentPort || DEFAULT_PORT;
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/pair/status`, { cache: 'no-store' });
-    if (!response.ok) return { reachable: true, error: `HTTP ${response.status}` };
-    return { reachable: true, ...(await response.json()) };
+    const response = await fetch(`http://127.0.0.1:${target}/health`, { cache: 'no-store' });
+    if (!response.ok) return { reachable: true, status: response.status, health: null };
+    return { reachable: true, status: response.status, health: await response.json() };
   } catch (error) {
-    return { reachable: false, error: String((error && error.message) || error) };
+    return { reachable: false, error: String((error && error.message) || error), health: null };
   }
-}
-
-let pendingPair = null;
-
-function settlePair(granted, error) {
-  const pending = pendingPair;
-  if (!pending) return;
-  pendingPair = null;
-  if (error) pending.reject(error);
-  else pending.resolve(granted);
-}
-
-function openPairPage() {
-  if (autoOpenedPairPage) return;
-  autoOpenedPairPage = true;
-  try {
-    const created = chrome.tabs.create({ url: chrome.runtime.getURL('pair.html') });
-    if (created && typeof created.catch === 'function') created.catch(() => {});
-  } catch (_) { /* ignore */ }
-}
-
-async function waitForPairSocket(port) {
-  if (pairingWelcome && socket && socket.readyState === WebSocket.OPEN && currentPort === port) {
-    return { ws: socket, temporary: false };
-  }
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/?pair=1`);
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      try { ws.close(); } catch (_) { /* ignore */ }
-      reject(new Error('连接中继超时'));
-    }, 8000);
-    ws.onopen = () => ws.send(JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'bridge/hello',
-      role: 'extension',
-      version: chrome.runtime.getManifest().version,
-    }));
-    ws.onmessage = (event) => {
-      let msg;
-      try { msg = JSON.parse(event.data); } catch (_) { return; }
-      if (msg.method === 'bridge/welcome') { clearTimeout(timer); resolve(); return; }
-      if (msg.method === 'bridge/pair-granted') { settlePair(msg, null); return; }
-      if (msg.method === 'bridge/pair-denied') settlePair(null, new Error(msg.reason || 'authorization denied'));
-    };
-    ws.onerror = () => { clearTimeout(timer); reject(new Error('无法连接 EMA2 中继')); };
-    ws.onclose = () => { clearTimeout(timer); reject(new Error('配对连接已关闭')); };
-  });
-  return { ws, temporary: true };
-}
-
-/** 用户点击授权按钮后调用：claim → 拿到 token → 立即用 token 重连。 */
-async function pairWithRelay(port, clients) {
-  const status = await probeRelay(port);
-  if (!status.reachable) throw new Error('EMA2 中继未运行，请先执行 ema2.exe install');
-  if (status.anonymous) throw new Error('中继以匿名模式运行，无需授权');
-  if (!status.pairing) throw new Error('EMA2 已绑定其他扩展；先运行 ema2.exe pair --reset');
-
-  const { ws, temporary } = await waitForPairSocket(port);
-  try {
-    const granted = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        pendingPair = null;
-        reject(new Error('授权超时'));
-      }, 15000);
-      pendingPair = {
-        resolve: (msg) => { clearTimeout(timer); resolve(msg); },
-        reject: (error) => { clearTimeout(timer); reject(error); },
-      };
-      try {
-        const claim = { jsonrpc: '2.0', method: 'bridge/pair-claim' };
-        if (Array.isArray(clients)) claim.clients = clients;
-        ws.send(JSON.stringify(claim));
-      } catch (error) {
-        clearTimeout(timer);
-        pendingPair = null;
-        reject(error);
-      }
-    });
-
-    const selection = Array.isArray(granted.selection)
-      ? granted.selection
-      : (Array.isArray(clients) ? clients : []);
-    await chrome.storage.local.set({
-      token: granted.token,
-      wsUrl: `ws://127.0.0.1:${port}`,
-      pairedClients: selection,
-    });
-    authToken = granted.token;
-    tokenHintShown = false;
-    lastError = '';
-    const old = socket;
-    socket = null;
-    relayReady = false;
-    pairingWelcome = false;
-    if (old) { try { old.close(); } catch (_) { /* ignore */ } }
-    if (temporary) { try { ws.close(); } catch (_) { /* ignore */ } }
-    setTimeout(() => { connect(); }, 0);
-    return { ok: true, clients: Array.isArray(granted.clients) ? granted.clients : [] };
-  } catch (error) {
-    if (temporary) { try { ws.close(); } catch (_) { /* ignore */ } }
-    throw error;
-  }
-}
-
-async function configureClients(port, clients) {
-  if (!authToken) throw new Error('尚未授权');
-  const body = JSON.stringify(Array.isArray(clients) ? { clients } : {});
-  const response = await fetch(`http://127.0.0.1:${port}/admin/clients`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${authToken}`, 'content-type': 'application/json' },
-    body,
-  });
-  if (!response.ok) throw new Error(`写入配置失败：HTTP ${response.status}`);
-  return { ok: true, ...(await response.json()) };
 }
 
 async function handlePageMessage(message) {
-  const port = Number(message.port) || currentPort || 8765;
+  const port = Number(message.port) || currentPort || DEFAULT_PORT;
   switch (message.type) {
     case 'ema2/state': {
-      const status = await probeRelay(port);
+      const relay = await probeRelay(port);
       return {
         ok: true,
-        status,
-        hasToken: !!authToken,
-        relayReady,
-        lastError,
-        port,
-        extensionVersion: chrome.runtime.getManifest().version,
+        port: currentPort,
+        requestedPort: port,
         connected: !!socket && socket.readyState === WebSocket.OPEN && relayReady,
+        socketOpen: !!socket && socket.readyState === WebSocket.OPEN,
+        relayReady,
+        relay,
+        lastError,
+        extensionVersion: chrome.runtime.getManifest().version,
       };
     }
-    case 'ema2/authorize':
-      return await pairWithRelay(port, message.clients);
-    case 'ema2/configure':
-      return await configureClients(port, message.clients);
     case 'ema2/reconnect': {
+      lastError = '';
       try { if (socket) socket.close(); } catch (_) { /* ignore */ }
       socket = null;
+      relayReady = false;
+      clearReconnectTimer();
+      retryAttempt = 0;
       connect();
       return { ok: true };
     }
@@ -396,25 +247,9 @@ async function handlePageMessage(message) {
   }
 }
 
-let staleProbeCounter = 0;
+// ---------------------------------------------------------------- relay plumbing
 
-/** 中继被 reset 后会拒绝旧 token；探测到“未配对”时丢弃本地 token 并回到授权流程。 */
-async function maybeDropStaleToken() {
-  if (!authToken) return;
-  staleProbeCounter += 1;
-  if (staleProbeCounter % 3 !== 0) return;
-  const status = await probeRelay(currentPort);
-  if (status.reachable && status.pairing) {
-    await chrome.storage.local.remove('token');
-    authToken = null;
-    console.warn('[EMA2] relay was reset; waiting for authorization again');
-    openPairPage();
-  }
-}
-
-// ---------------------------------------------------------------- mcp plumbing
-
-async function handleMCPMessage(data, ws) {
+async function handleRelayMessage(data, ws) {
   if (typeof data !== 'string' || data.length > MAX_INCOMING_CHARS) return;
   if (ws !== socket) return; // 旧连接的迟到消息不得影响当前状态
   let req;
@@ -423,37 +258,9 @@ async function handleMCPMessage(data, ws) {
 
   const hasId = Object.prototype.hasOwnProperty.call(req, 'id');
   if (req.method === 'bridge/welcome') {
-    if (req.pairing) {
-      // 未配对：这是一条授权通道，不能执行任何工具调用。
-      pairingWelcome = true;
-      relayReady = false;
-      openPairPage();
-      return;
-    }
-    if (!(await verifyWelcome(req))) {
-      relayReady = false;
-      lastError = 'relay_identity_failed';
-      console.error('[EMA2] relay identity check failed; refusing to run tools');
-      try { ws.close(); } catch (_) { /* ignore */ }
-      return;
-    }
-    pairingWelcome = false;
+    // v2 无验签：welcome 只确认对端是 ema2 daemon，然后开始执行 tools/call。
     relayReady = true;
     lastError = '';
-    return;
-  }
-  if (req.method === 'bridge/pair-granted') {
-    settlePair(req, null);
-    return;
-  }
-  if (req.method === 'bridge/pair-denied') {
-    settlePair(null, new Error(req.reason || 'authorization denied'));
-    return;
-  }
-  if (req.method === 'bridge/reload') {
-    // 开发用：中继要求扩展重新加载自身（等价于 edge://extensions 点“重新加载”）。
-    if (hasId) sendResponse(ws, req.id, { result: {} });
-    setTimeout(() => chrome.runtime.reload(), 250);
     return;
   }
   if (!relayReady) return;
@@ -732,6 +539,7 @@ async function navigationTiming(tabId) {
 }
 
 async function openTool(args) {
+  await clearLastAct();
   const wait = args.wait || 'load';
   let tab;
   let reuse = 'new';
@@ -853,6 +661,7 @@ async function waitForReady(tabId, state, timeoutMs) {
 }
 
 async function waitTool(args) {
+  if (args.await) return awaitPendingAction(args);
   const tab = await resolveTab(args);
   const timeoutSeconds = args.timeout === undefined ? WAIT_TIMEOUT_MS / 1000 : Number(args.timeout);
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > WAIT_MAX_SECONDS) {
@@ -919,7 +728,7 @@ async function runInTab(tabId, func, args, world, attempts = 2) {
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 3) return { installed: false };
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 10) return { installed: false };
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
   const shortUrl = (url) => {
     try { const u = new URL(url); return (u.pathname + u.search).slice(0, 80); } catch (_) { return String(url).slice(0, 80); }
@@ -1031,12 +840,13 @@ function installHelpers() {
   const setDocHandle = (handle) => { window.__ema2_doc_handle = String(handle || ''); };
   const parseRef = (value) => {
     const text = String(value == null ? '' : value).trim().replace(/^\[|\]$/g, '').replace(/"/g, '');
-    const match = /^e(\d+)@(d\d+)$/i.exec(text);
-    return match ? { seq: Number(match[1]), epoch: match[2] } : null;
+    // 全写 e12@d1 带文档校验；CLI 示例里的短写 e12 视作“当前文档”，方便手敲。
+    const match = /^e(\d+)(?:@(d\d+))?$/i.exec(text);
+    return match ? { seq: Number(match[1]), epoch: match[2] || '' } : null;
   };
   const refIsCurrent = (value) => {
     const parsed = parseRef(value);
-    return !!parsed && !!docEpoch() && parsed.epoch === docEpoch();
+    return !!parsed && !!docEpoch() && (!parsed.epoch || parsed.epoch === docEpoch());
   };
 
   const refOf = (el) => {
@@ -1054,8 +864,10 @@ function installHelpers() {
     if (ref) {
       const wanted = String(ref).trim().replace(/^\[|\]$/g, '').replace(/"/g, '');
       if (!refIsCurrent(wanted)) return null;
+      const parsed = parseRef(wanted);
+      const full = parsed && !parsed.epoch ? `e${parsed.seq}@${docEpoch()}` : wanted;
       for (const { root } of roots) {
-        const el = root.querySelector('[data-ema2-ref="' + wanted + '"]');
+        const el = root.querySelector('[data-ema2-ref="' + full + '"]');
         if (el) return el;
       }
       return null;
@@ -1195,27 +1007,68 @@ function installHelpers() {
     };
   };
 
-  /** 正文容器启发式：取文本最多、链接密度最低的候选。 */
+  /** 页面可见性：checkVisibility 能识别 display:none / visibility:hidden / content-visibility。 */
+  const isReadVisible = (el) => {
+    if (!el) return false;
+    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return false;
+    try {
+      if (typeof el.checkVisibility === 'function') {
+        return el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
+      }
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden';
+    } catch (_) {
+      return true;
+    }
+  };
+
+  /** 正文容器启发式：取文本最多、链接密度最低的候选；太短就回退 body。 */
   const mainRoot = () => {
     const selectors = ['main', '[role="main"]', 'article', '#content', '#main', '.content', '.main',
       '.article', '.post', '.markdown-body', '.rich_media_content', '.article-content', '.post-content'];
     let best = null;
     let bestScore = 0;
+    let bestLength = 0;
+    let candidateLength = 0;
+    let sawCandidate = false;
     for (const selector of selectors) {
       for (const el of document.querySelectorAll(selector)) {
-        const text = el.innerText || '';
+        sawCandidate = true;
+        // 用清洁后的文本评分，避免 script/style 把候选撑大。
+        const text = plainText(el);
+        candidateLength = Math.max(candidateLength, text.length);
         if (text.length < 200) continue;
         const linkLength = [...el.querySelectorAll('a')].reduce((sum, link) => sum + (link.innerText || '').length, 0);
         const score = text.length - linkLength * 1.5;
-        if (score > bestScore) { bestScore = score; best = el; }
+        if (score > bestScore) { bestScore = score; best = el; bestLength = text.length; }
       }
     }
-    if (best) return { root: best, selector: best.tagName.toLowerCase() + (best.id ? '#' + best.id : '') };
-    return { root: document.body || document.documentElement, selector: 'body' };
+    const body = document.body || document.documentElement;
+    const bodyLength = body ? plainText(body).length : 0;
+    if (!best) {
+      return {
+        root: body,
+        selector: sawCandidate ? 'body(fallback)' : 'body',
+        fallback: sawCandidate,
+        bodyLength,
+        textLength: candidateLength,
+      };
+    }
+    const tooShort = bestLength < 200 || (bodyLength > 2000 && bestLength < bodyLength * 0.05);
+    if (tooShort) {
+      return { root: body, selector: 'body(fallback)', fallback: true, bodyLength, textLength: bestLength };
+    }
+    return {
+      root: best,
+      selector: best.tagName.toLowerCase() + (best.id ? '#' + best.id : ''),
+      fallback: false,
+      bodyLength,
+      textLength: bestLength,
+    };
   };
 
   const markdown = (root) => {
-    const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
+    const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
     const BLOCK = /^(DIV|SECTION|ARTICLE|P|UL|OL|LI|TABLE|THEAD|TBODY|TR|TD|TH|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|DL|DT|DD|FIGURE|FIGCAPTION|MAIN|HEADER|FOOTER|ASIDE|FORM|NAV)$/;
     const out = [];
     const push = (text) => {
@@ -1233,6 +1086,8 @@ function installHelpers() {
         const child = node;
         const tag = child.tagName;
         if (!tag || SKIP.test(tag)) continue;
+        if (!isReadVisible(child)) continue;
+        if (!child.innerText) continue;
         if (/^H[1-4]$/.test(tag)) {
           const text = clean(child.innerText);
           if (text) out.push('#'.repeat(Number(tag[1])) + ' ' + text);
@@ -1267,7 +1122,43 @@ function installHelpers() {
     walk(root);
     return out.join('\n\n');
   };
-  const plainText = (root) => (root.innerText || '').split('\n').map(clean).filter(Boolean).join('\n');
+  /** 清洁文本：跳过 script/style/noscript/iframe/媒体/导航等，块级边界换行。 */
+  const plainText = (root) => {
+    const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
+    const BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|DIV|DL|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/;
+    const lines = [];
+    let buffer = '';
+    const flush = () => {
+      const text = clean(buffer);
+      if (text) lines.push(text);
+      buffer = '';
+    };
+    const walk = (parent) => {
+      for (const node of parent.childNodes || []) {
+        if (node.nodeType === 3) {
+          buffer += (buffer ? ' ' : '') + (node.nodeValue || '');
+          continue;
+        }
+        if (node.nodeType !== 1) continue;
+        const child = node;
+        const tag = child.tagName;
+        if (!tag || SKIP.test(tag)) continue;
+        if (tag === 'BR') { flush(); continue; }
+        if (!isReadVisible(child)) continue;
+        if (!child.innerText) continue;
+        if (BLOCK.test(tag)) {
+          flush();
+          walk(child);
+          flush();
+          continue;
+        }
+        walk(child);
+      }
+    };
+    walk(root);
+    flush();
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  };
 
   /** 当前视口内的 ref 标记（用于截图标注，set-of-marks）。 */
   const marks = () => {
@@ -1304,8 +1195,37 @@ function installHelpers() {
     const doc = el.ownerDocument || document;
     const win = doc.defaultView || window;
     if (el.isContentEditable) {
-      el.textContent = String(value == null ? '' : value);
-      return { ok: true };
+      // X/Slack/Discord 等富文本编辑器依赖原生 input 事件；直接写 textContent
+      // 不会更新它们内部状态（例如 X 的“发帖”按钮仍然 disabled）。
+      const text = String(value == null ? '' : value);
+      const insert = () => {
+        el.focus();
+        try {
+          const selection = win.getSelection();
+          if (selection) {
+            const range = doc.createRange();
+            range.selectNodeContents(el);
+            selection.removeAllRanges();
+            selection.addRange(range);
+          }
+          return doc.execCommand('insertText', false, text);
+        } catch (_) {
+          return false;
+        }
+      };
+      let inserted = insert();
+      // 极少数编辑器在首次聚焦/重载后会把同一次 insertText 应用两次；复核并修一次。
+      if (String(el.textContent || '') !== text) {
+        inserted = insert();
+      }
+      if (!inserted || String(el.textContent || '') !== text) {
+        el.textContent = text;
+        try {
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+        } catch (_) { /* ignore */ }
+      }
+      // execCommand 已经触发原生 input；外层不要再补发，避免某些编辑器重复应用。
+      return { ok: true, selfDispatched: true };
     }
     let proto = null;
     if (tag === 'INPUT' && win.HTMLInputElement) proto = win.HTMLInputElement.prototype;
@@ -1332,7 +1252,7 @@ function installHelpers() {
     snapshot, markdown, plainText, mainRoot, find, refOf, clean, candidates,
     collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent, setValue,
   };
-  window.__ema2_helpers_version = 3;
+  window.__ema2_helpers_version = 10;
   return { installed: true };
 }
 
@@ -1419,8 +1339,10 @@ function performActionInPage(spec) {
         results.push({ ok: false, target: label, code: written.code, message: written.message });
         continue;
       }
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      if (!written.selfDispatched) {
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
       results.push({ ok: true, target: label });
     }
     const failed = results.filter(item => !item.ok);
@@ -1452,26 +1374,45 @@ function performActionInPage(spec) {
   switch (action) {
     case 'click': {
       if (disabled) return { found: true, ok: false, code: 'element_disabled', message: 'target is disabled' };
+      const tag = el.tagName.toLowerCase();
+      const form = el.closest && el.closest('form');
+      const anchor = tag === 'a' && !!(el.href || el.getAttribute('href'));
+      const submitter = (tag === 'button' && (!el.type || el.type === 'submit'))
+        || (tag === 'input' && (el.type === 'submit' || el.type === 'image'));
+      const effect = anchor || (submitter && !!form) ? 'nav' : 'page';
+      const nextUrl = anchor ? (el.href || el.getAttribute('href') || '') : (submitter && form ? form.action || '' : '');
       try { el.click(); } catch (error) {
         return { found: true, ok: false, code: 'click_failed', message: String(error && error.message || error) };
       }
       const info = ref ? `ref=${ref}` : target ? `target=${target}` : `selector=${selector}`;
-      return { found: true, ok: true, info };
+      return { found: true, ok: true, info, effect, nextUrl };
     }
     case 'type': {
       const text = spec.text === undefined ? '' : String(spec.text);
-      const written = helpers.setValue(el, text);
+      // type 追加，fill 覆盖：两者语义不同，模型不用先读旧值拼字符串。
+      const current = el.isContentEditable
+        ? (el.textContent || '')
+        : (el.value === undefined ? '' : String(el.value));
+      const written = helpers.setValue(el, current + text);
       if (!written.ok) return { found: true, ...written };
       try { el.focus(); } catch (_) { /* ignore */ }
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      if (!written.selfDispatched) {
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      let effect = 'none';
+      let nextUrl = '';
       if (spec.submit) {
         el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
         const form = el.closest && el.closest('form');
-        if (form && form.requestSubmit) form.requestSubmit();
+        if (form && form.requestSubmit) {
+          form.requestSubmit();
+          effect = 'nav';
+          nextUrl = form.action || '';
+        }
       }
       // 只返回写入长度；输入内容（尤其是密码）绝不进入工具输出。
-      return { found: true, ok: true, info: `wrote=1 chars=${text.length}${spec.submit ? ' submit=1' : ''}` };
+      return { found: true, ok: true, info: `wrote=1 chars=${text.length}${spec.submit ? ' submit=1' : ''}`, effect, nextUrl };
     }
     case 'select': {
       if (el.tagName !== 'SELECT') {
@@ -1493,12 +1434,18 @@ function performActionInPage(spec) {
       const opts = { key, code: key, bubbles: true, cancelable: true };
       const notCanceled = pressTarget.dispatchEvent(new KeyboardEvent('keydown', opts));
       pressTarget.dispatchEvent(new KeyboardEvent('keyup', opts));
+      let effect = 'page';
+      let nextUrl = '';
       if (key === 'Enter' && notCanceled) {
         const form = pressTarget.closest && pressTarget.closest('form');
-        if (form && form.requestSubmit) form.requestSubmit();
+        if (form && form.requestSubmit) {
+          form.requestSubmit();
+          effect = 'nav';
+          nextUrl = form.action || '';
+        }
       }
       const where = ref ? `ref=${ref}` : selector ? `selector=${selector}` : target ? `target=${target}` : 'target=active';
-      return { found: true, ok: true, info: `key=${key} ${where}` };
+      return { found: true, ok: true, info: `key=${key} ${where}`, effect, nextUrl };
     }
     case 'hover': {
       const rect = el.getBoundingClientRect();
@@ -1513,7 +1460,7 @@ function performActionInPage(spec) {
         return { found: true, ok: false, code: 'no_form', message: 'target is not inside a form', hint: 'use click on the submit button or press Enter on the field' };
       }
       form.requestSubmit();
-      return { found: true, ok: true, info: 'submitted=1' };
+      return { found: true, ok: true, info: 'submitted=1', effect: 'nav', nextUrl: form.action || '' };
     }
     default:
       return { found: true, ok: false, code: 'invalid_action', message: `unsupported action: ${action}` };
@@ -1763,13 +1710,273 @@ async function networkMark(tabId) {
   }
 }
 
-// ---------------------------------------------------------------- act
+// ---------------------------------------------------------------- act / settle / await
+
+async function loadLastAct() {
+  try {
+    const store = chrome.storage && chrome.storage.session;
+    if (store) {
+      const stored = (await store.get(LAST_ACT_KEY)) || {};
+      const value = stored[LAST_ACT_KEY];
+      if (value && typeof value === 'object'
+          && (!value.updatedAt || Date.now() - value.updatedAt <= LAST_ACT_TTL_MS)) {
+        lastActContext = value;
+        return value;
+      }
+    }
+  } catch (_) { /* storage.session 不可用：用内存兜底 */ }
+  if (lastActContext
+      && (!lastActContext.updatedAt || Date.now() - lastActContext.updatedAt <= LAST_ACT_TTL_MS)) {
+    return lastActContext;
+  }
+  lastActContext = null;
+  return null;
+}
+
+async function saveLastAct(context) {
+  const value = { ...context, updatedAt: Date.now() };
+  lastActContext = value;
+  try {
+    const store = chrome.storage && chrome.storage.session;
+    if (store) await store.set({ [LAST_ACT_KEY]: value });
+  } catch (_) { /* 忽略：内存上下文仍然可用 */ }
+  return value;
+}
+
+async function clearLastAct() {
+  lastActContext = null;
+  try {
+    const store = chrome.storage && chrome.storage.session;
+    if (store) await store.remove(LAST_ACT_KEY);
+  } catch (_) { /* ignore */ }
+}
+
+/** 动作期间新建的标签（同窗口或 opener 指向动作所在 tab）。 */
+function newTabsSince(context, tabs) {
+  const known = new Set(context.tabIds || []);
+  return tabs.filter(tab => !known.has(tab.id)
+    && tab.id !== context.tabId
+    && (tab.openerTabId === context.tabId
+      || (context.windowId != null && tab.windowId === context.windowId)));
+}
+
+function actionChangedKeys(baseline, state) {
+  const changed = [];
+  if (baseline.url && state.url && baseline.url !== state.url) changed.push('url');
+  if (baseline.doc && state.doc && baseline.doc !== state.doc) changed.push('doc');
+  if (baseline.title !== state.title) changed.push('title');
+  if (baseline.refSeq !== state.refSeq
+      || baseline.nodes !== state.nodes
+      || baseline.textLen !== state.textLen) changed.push('dom');
+  return changed;
+}
+
+/**
+ * 等待上一个动作的效果。nav 等待导航/新标签；page 只等短暂 DOM 稳定；
+ * 提前稳定就提前返回，最多 timeoutMs。
+ */
+async function waitForActionEffect(context, timeoutMs) {
+  const startedAt = Date.now();
+  const baseline = context.baseline || {};
+  let targetTabId = context.targetTabId || context.tabId;
+  let newTabIds = context.newTabId ? [context.newTabId] : [];
+  let started = !!context.newTabId;
+  let lastSig = '';
+  let quietSince = Date.now();
+  let lastState = { url: context.url || baseline.url || '', title: context.title || baseline.title || '', doc: '' };
+  let changed = [];
+
+  while (Date.now() - startedAt < timeoutMs) {
+    let tabs = [];
+    try { tabs = await chrome.tabs.query({}); } catch (_) { /* ignore */ }
+    const created = newTabsSince(context, tabs);
+    for (const tab of created) {
+      if (!newTabIds.includes(tab.id)) {
+        newTabIds.push(tab.id);
+        await rememberSessionTab(tab.id);
+      }
+    }
+    if (newTabIds.length) {
+      if (!newTabIds.includes(targetTabId)) targetTabId = newTabIds[0];
+      started = true;
+    }
+
+    let tabInfo = null;
+    try { tabInfo = await chrome.tabs.get(targetTabId); } catch (_) {
+      return {
+        settled: false, closed: true, elapsedMs: Date.now() - startedAt,
+        targetTabId, newTabIds, url: lastState.url, title: lastState.title, changed,
+      };
+    }
+    let state;
+    try { state = await pageState(targetTabId); } catch (_) {
+      state = { url: '', title: '', refSeq: 0, doc: '', nodes: 0, textLen: 0 };
+    }
+    const url = state.url || tabInfo.url || '';
+    const title = state.title || tabInfo.title || '';
+    lastState = { ...state, url, title };
+    const sig = [
+      tabInfo.status || '',
+      state.url || '',
+      state.title || '',
+      state.doc || '',
+      state.refSeq || 0,
+      state.nodes || 0,
+      state.textLen || 0,
+    ].join('|');
+    if (sig !== lastSig) {
+      lastSig = sig;
+      quietSince = Date.now();
+    }
+
+    const keys = actionChangedKeys(baseline, { ...state, url, title });
+    for (const key of keys) if (!changed.includes(key)) changed.push(key);
+    if (newTabIds.length && !changed.includes('new_tab')) changed.push('new_tab');
+    if (tabInfo.status === 'loading') started = true;
+    if (baseline.url && url && url !== baseline.url) started = true;
+    if (baseline.doc && state.doc && state.doc !== baseline.doc) started = true;
+
+    const elapsed = Date.now() - startedAt;
+    const quietFor = Date.now() - quietSince;
+    const complete = tabInfo.status === 'complete' || tabInfo.status === undefined;
+
+    if (context.expect === 'nav') {
+      if (started && complete && quietFor >= 250 && url) {
+        return {
+          settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
+          url, title, changed,
+        };
+      }
+    } else if (context.expect === 'page') {
+      if (changed.length && quietFor >= 250) {
+        return {
+          settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
+          url, title, changed,
+        };
+      }
+      if (!changed.length && elapsed >= 400) {
+        return {
+          settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
+          url, title, changed,
+        };
+      }
+    } else {
+      return {
+        settled: true, elapsedMs: elapsed, targetTabId, newTabIds,
+        url, title, changed,
+      };
+    }
+    await sleep(120);
+  }
+
+  return {
+    settled: false, elapsedMs: Date.now() - startedAt, targetTabId, newTabIds,
+    url: lastState.url, title: lastState.title, changed,
+  };
+}
+
+async function settleAfterAction(tab, step, outcome, beforeState, beforeTabs) {
+  const expect = outcome.effect === 'nav' || outcome.effect === 'page' ? outcome.effect : 'none';
+  const context = {
+    tabId: tab.id,
+    action: step.action,
+    expect,
+    startedAt: Date.now(),
+    settled: true,
+    targetTabId: tab.id,
+    newTabId: null,
+    nextUrl: outcome.nextUrl || '',
+    url: beforeState.url || '',
+    title: beforeState.title || '',
+    baseline: {
+      url: beforeState.url || '',
+      title: beforeState.title || '',
+      doc: beforeState.doc || '',
+      refSeq: beforeState.refSeq || 0,
+      nodes: beforeState.nodes || 0,
+      textLen: beforeState.textLen || 0,
+    },
+    tabIds: beforeTabs.map(item => item.id),
+    windowId: (beforeTabs.find(item => item.id === tab.id) || {}).windowId,
+  };
+
+  if (expect === 'none') {
+    await sleep(SETTLE_NONE_MS);
+    await saveLastAct(context);
+    return {
+      context,
+      settle: {
+        settled: true, expect, elapsedMs: SETTLE_NONE_MS,
+        targetTabId: tab.id, newTabIds: [], url: context.url, title: context.title, changed: [],
+      },
+    };
+  }
+
+  const timeoutMs = expect === 'nav' ? SETTLE_NAV_MS : SETTLE_PAGE_MS;
+  const result = await waitForActionEffect(context, timeoutMs);
+  context.settled = result.settled;
+  context.targetTabId = result.targetTabId || tab.id;
+  context.newTabId = (result.newTabIds || [])[0] || null;
+  context.url = result.url || context.url;
+  context.title = result.title || context.title;
+  await saveLastAct(context);
+  return { context, settle: { ...result, expect } };
+}
+
+async function awaitPendingAction(args) {
+  const timeoutSeconds = args.timeout === undefined ? 3 : Number(args.timeout);
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > WAIT_MAX_SECONDS) {
+    fail('invalid_argument', `await timeout must be between 0 and ${WAIT_MAX_SECONDS} seconds`, 'fix await duration');
+  }
+  const context = await loadLastAct();
+  if (!context) {
+    fail('no_pending_action', 'no recent act to await',
+      'call `ema2 act ...` first, or use `ema2 wait text|selector|time|idle`');
+  }
+  if (args.tabId !== undefined
+      && args.tabId !== context.tabId
+      && args.tabId !== context.targetTabId) {
+    fail('no_pending_action', `the last act belongs to tab ${context.tabId}`,
+      `use --tab ${context.tabId}, or run act on tab ${args.tabId}`);
+  }
+  if (context.settled) {
+    return `await=done elapsed=0.0s tab=${context.targetTabId || context.tabId}${context.url ? ` url=${context.url}` : ''}`;
+  }
+
+  const start = Date.now();
+  const result = await waitForActionEffect(context, Math.round(timeoutSeconds * 1000));
+  context.settled = result.settled;
+  context.targetTabId = result.targetTabId || context.targetTabId || context.tabId;
+  context.newTabId = (result.newTabIds || [])[0] || context.newTabId || null;
+  context.url = result.url || context.url;
+  context.title = result.title || context.title;
+  await saveLastAct(context);
+
+  if (result.closed) {
+    fail('tab_not_found', `tab ${context.targetTabId} was closed while waiting`,
+      'inspect tabs with `ema2 tabs list`');
+  }
+  if (!result.settled) {
+    fail('wait_timeout',
+      `await timeout after ${timeoutSeconds}s (expect=${context.expect})`,
+      `call \`ema2 await ${Math.max(1, Math.round(timeoutSeconds))}s\` again, or inspect with \`ema2 read --tab ${context.targetTabId || context.tabId}\``);
+  }
+  const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+  const bits = [
+    `await=done elapsed=${elapsed}s`,
+    `tab=${context.targetTabId || context.tabId}`,
+  ];
+  if (context.url) bits.push(`url=${context.url}`);
+  if (context.newTabId) bits.push(`new_tab=${context.newTabId}`);
+  return bits.join(' ');
+}
 
 async function actTool(args) {
   const tab = await resolveTab(args);
   const batch = Array.isArray(args.steps) && args.steps.length > 0;
   const steps = batch ? args.steps : [args];
   if (steps.length > 20) fail('too_many_steps', 'at most 20 steps', 'split the batch');
+  await clearLastAct();
   try { await ensureHelpers(tab.id); } catch (_) { /* action will report a clearer error */ }
   const before = await pageState(tab.id);
   // 动作前装 hook，并记录网络水位 {document epoch, seq}；不同文档的 seq 不可比较。
@@ -1777,40 +1984,107 @@ async function actTool(args) {
   const netBaseline = await networkMark(tab.id);
   try { await ensureConsoleHook(tab.id); } catch (_) { /* ignore */ }
   const results = [];
+  const newTabIds = [];
+  let lastSettle = null;
+  let stoppedAt = null;
 
   for (let index = 0; index < steps.length; index++) {
     const step = steps[index];
     if (!step || !step.action) fail('invalid_step', `steps[${index}] has no action`, 'each step needs action');
+
+    if (step.action === 'await') {
+      try {
+        const text = await awaitPendingAction({ timeout: step.timeout, tabId: tab.id });
+        results.push(`step${index + 1} ${text}`);
+        if (lastSettle) lastSettle = { ...lastSettle, settled: true };
+        await sleep(80);
+      } catch (error) {
+        if (error instanceof ToolError && batch) {
+          error.message = `steps[${index + 1}] await: ${error.message}`;
+        }
+        throw error;
+      }
+      continue;
+    }
+
+    const stepBefore = await pageState(tab.id);
+    let tabsBefore = [];
+    try { tabsBefore = await chrome.tabs.query({}); } catch (_) { /* ignore */ }
+    let outcome;
     try {
       await ensureHelpers(tab.id);
-      const info = await runStepWithRetry(tab, step);
-      results.push(`step${index + 1} ok=${step.action}${info ? ` ${info}` : ''}`);
+      outcome = await runStepWithRetry(tab, step);
     } catch (error) {
+      await clearLastAct();
       if (error instanceof ToolError && batch) {
         error.message = `steps[${index + 1}] ${step.action}: ${error.message}`;
       }
       throw error;
     }
-    await sleep(step.action === 'click' || step.action === 'submit' ? 350 : 150);
+
+    const settled = await settleAfterAction(tab, step, outcome, stepBefore, tabsBefore);
+    const settle = settled.settle;
+    settle.nextUrl = outcome.nextUrl || '';
+    lastSettle = settle;
+    for (const id of settle.newTabIds || []) {
+      if (!newTabIds.includes(id)) newTabIds.push(id);
+    }
+    const pending = !settle.settled;
+    results.push(`step${index + 1} ok=${step.action}${outcome.info ? ` ${outcome.info}` : ''}${pending ? ' settle=pending' : ''}`);
+
+    if (pending && batch) {
+      const next = steps[index + 1];
+      if (!next || next.action !== 'await') {
+        stoppedAt = index + 1;
+        break;
+      }
+    }
+    if (!pending) await sleep(60);
   }
 
+  const summaryTabId = (lastSettle && lastSettle.targetTabId) || tab.id;
   let waitInfo = '';
   if (args.waitFor) {
-    waitInfo = await waitForResponse(tab.id, args.waitFor, netBaseline);
+    waitInfo = await waitForResponse(summaryTabId, args.waitFor, netBaseline);
   }
-  try { await ensureNetworkHook(tab.id); } catch (_) { /* non-http page */ }
-  const after = await pageState(tab.id);
+  try { await ensureNetworkHook(summaryTabId); } catch (_) { /* non-http page */ }
+
+  const after = await pageState(summaryTabId);
+  let afterTab = null;
+  try { afterTab = await chrome.tabs.get(summaryTabId); } catch (_) { /* tab closed */ }
+  const url = after.url || (afterTab && afterTab.url) || '';
+  const title = after.title || (afterTab && afterTab.title) || '';
+  const summaryUrl = (afterTab && afterTab.url) || after.url || '';
   const changed = [];
-  if (before.url !== after.url) changed.push('url');
-  if (before.title !== after.title) changed.push('title');
+  if (before.url !== summaryUrl) changed.push('url');
+  if (before.title !== title) changed.push('title');
+  if (before.doc && after.doc && before.doc !== after.doc) changed.push('doc');
+  if (newTabIds.length) changed.push('new_tab');
+
   const lines = [...results, `ok=${results.length}/${steps.length}`];
-  if (before.url !== after.url && after.url) lines.push(`url=${after.url}`);
-  if (after.title) lines.push(`title=${after.title}`);
+  if (stoppedAt !== null) lines.push(`stopped=${stoppedAt} reason=pending`);
+  if (lastSettle) {
+    lines.push(`settle=${lastSettle.settled ? 'done' : 'pending'} ms=${lastSettle.elapsedMs || 0} expect=${lastSettle.expect}`);
+    if (lastSettle.targetTabId && lastSettle.targetTabId !== tab.id) lines.push(`tab=${lastSettle.targetTabId}`);
+    if (newTabIds.length) lines.push(`new_tab=${newTabIds[0]}${newTabIds.length > 1 ? ` new_tabs=${newTabIds.join(',')}` : ''}`);
+    if (!lastSettle.settled) {
+      if (lastSettle.nextUrl) lines.push(`next_url=${lastSettle.nextUrl}`);
+      lines.push(stoppedAt !== null
+        ? `hint=stopped at step${stoppedAt}; add \`await 10s\` after it, or call \`ema2 await 10s\``
+        : 'hint=page still navigating; call `ema2 await 10s` to keep waiting');
+    } else if (!batch && lastSettle.expect === 'page' && changed.length === 0) {
+      lines.push('hint=no navigation; if this starts async work, use `--wait-for` or `observe network`');
+    }
+  }
+  if (url) lines.push(`url=${url}`);
+  if (title) lines.push(`title=${title}`);
   if (waitInfo) lines.push(waitInfo);
   if (changed.length) lines.push(`changed=${changed.join(',')}`);
-  const newRefs = await newRefsSince(tab.id, before.refSeq, before.doc);
-  if (newRefs.length) lines.push('new=' + newRefs.join(' | '));
-  const consoleErrors = await consoleErrorCount(tab.id);
+  if (summaryTabId === tab.id) {
+    const newRefs = await newRefsSince(tab.id, before.refSeq, before.doc);
+    if (newRefs.length) lines.push('new=' + newRefs.join(' | '));
+  }
+  const consoleErrors = await consoleErrorCount(summaryTabId);
   if (consoleErrors > 0) lines.push(`console_errors=${consoleErrors}`);
   return lines.join('\n');
 }
@@ -1907,9 +2181,11 @@ async function pageState(tabId) {
       title: (document.title || '').slice(0, 120),
       refSeq: window.__ema2_ref_seq || 0,
       doc: window.__ema2_helpers ? window.__ema2_helpers.docEpoch() : '',
+      nodes: document.getElementsByTagName('*').length,
+      textLen: document.body ? (document.body.textContent || '').length : 0,
     }), []);
   } catch (_) {
-    return { url: '', title: '', refSeq: 0, doc: '' };
+    return { url: '', title: '', refSeq: 0, doc: '', nodes: 0, textLen: 0 };
   }
 }
 
@@ -1956,7 +2232,7 @@ function mapActionResult(step, result) {
   if (!result.ok) {
     fail(result.code || 'action_failed', result.message || `${step.action} failed`, result.hint || 'inspect the page and retry with a fresh snapshot');
   }
-  return result.info || '';
+  return { info: result.info || '', effect: result.effect || 'none', nextUrl: result.nextUrl || '' };
 }
 
 async function runStep(tab, step) {
@@ -1968,7 +2244,7 @@ async function runStep(tab, step) {
       else location.reload();
       return true;
     }, [action]);
-    return '';
+    return { info: '', effect: 'nav', nextUrl: '' };
   }
   if (action === 'scroll') {
     const info = await runInTab(tab.id, (delta) => {
@@ -1977,7 +2253,7 @@ async function runStep(tab, step) {
       if (dy !== 0) window.scrollBy(0, dy);
       return 'scroll=' + before + '->' + window.scrollY;
     }, [typeof step.deltaY === 'number' ? step.deltaY : null]);
-    return info || '';
+    return { info: info || '', effect: 'none', nextUrl: '' };
   }
 
   await ensureHelpers(tab.id);
@@ -2116,18 +2392,26 @@ async function filesTool(args) {
       fail('missing_target', 'upload requires ref, selector or target', 'call snapshot and pass the file input ref');
     }
     await ensureHelpers(tab.id);
-    if (args.ref) {
-      const current = await runInTab(tab.id, (ref) => ({
-        current: !!window.__ema2_helpers && window.__ema2_helpers.refIsCurrent(ref),
-      }), [args.ref]);
-      if (!current || !current.current) {
-        fail('stale_ref', `ref ${args.ref} is stale or belongs to another document`, 'call snapshot again');
+    let targetRef = args.ref || null;
+    if (targetRef) {
+      // 短 ref（e12）先补成 e12@dX；完整 ref 必须通过当前文档校验。
+      const current = await runInTab(tab.id, (ref) => {
+        const helpers = window.__ema2_helpers;
+        if (!helpers || !helpers.refIsCurrent(ref)) return null;
+        const parsed = helpers.parseRef(ref);
+        return {
+          ref: parsed && !parsed.epoch ? `e${parsed.seq}@${helpers.docEpoch()}` : ref,
+        };
+      }, [targetRef]);
+      if (!current || !current.ref) {
+        fail('stale_ref', `ref ${targetRef} is stale or belongs to another document`, 'call snapshot again');
       }
+      targetRef = current.ref;
     }
     return withDebugger(tab.id, async () => {
       await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.enable');
       const expression = '(' + deepFindForDebugger.toString() + ')('
-        + [args.ref || null, args.selector || null, args.target || null].map(v => JSON.stringify(v)).join(',')
+        + [targetRef, args.selector || null, args.target || null].map(v => JSON.stringify(v)).join(',')
         + ')';
       const evaluated = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
         expression,
@@ -2148,23 +2432,10 @@ async function filesTool(args) {
     });
   }
   if (action === 'download-dir') {
-    const dir = String(args.dir || '').trim();
-    if (!dir) fail('missing_dir', 'download-dir requires dir', 'pass an absolute directory path');
-    return withDebugger(tab.id, async () => {
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, 'Page.setDownloadBehavior', {
-          behavior: 'allow', downloadPath: dir,
-        });
-        return `download_dir=${dir}`;
-      } catch (_) { /* deprecated, fall through */ }
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, 'Browser.setDownloadBehavior', {
-          behavior: 'allow', downloadPath: dir, eventsEnabled: false,
-        });
-        return `download_dir=${dir}`;
-      } catch (_) { /* page targets don't expose the Browser domain */ }
-      fail('download_dir_unsupported', 'this browser build does not allow an extension to change the download directory', 'files will land in the default Downloads folder; use chrome.downloads or set it manually');
-    });
+    // Edge 不允许扩展修改下载目录；在触碰浏览器之前就给出稳定错误。
+    fail('download_dir_unsupported',
+      'Edge does not allow an extension to change the download directory',
+      'set it manually in edge://settings/downloads; files land in the default Downloads folder');
   }
   fail('invalid_action', `unknown files action: ${action}`, 'use upload|download-dir');
 }
@@ -2197,11 +2468,22 @@ function withDebugger(tabId, run, options = {}) {
       throw new ToolError('debugger_busy', `debugger queue wait exceeded ${Math.round(queueWait / 1000)}s`, 'close other long-running js/files calls and retry');
     }
     const remaining = Math.min(taskTimeout, queueWait - waited);
-    try {
-      await withDeadline(chrome.debugger.attach({ tabId }, '1.3'), Math.min(10000, remaining), 'debugger_attach_timeout', `cannot attach debugger to tab ${tabId}`);
-    } catch (error) {
-      if (error instanceof ToolError && error.code === 'debugger_attach_timeout') throw error;
-      throw new ToolError('debugger_attach_failed', `cannot attach debugger to tab ${tabId}: ${error.message}`, 'close DevTools on that tab and retry');
+    let attachError = null;
+    // 扩展重载/DevTools 关闭的瞬间会偶发 attach 失败；非超时错误重试一次。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await withDeadline(chrome.debugger.attach({ tabId }, '1.3'), Math.min(10000, remaining), 'debugger_attach_timeout', `cannot attach debugger to tab ${tabId}`);
+        attachError = null;
+        break;
+      } catch (error) {
+        attachError = error;
+        if (error instanceof ToolError && error.code === 'debugger_attach_timeout') break;
+        if (attempt === 0) await sleep(200);
+      }
+    }
+    if (attachError) {
+      if (attachError instanceof ToolError && attachError.code === 'debugger_attach_timeout') throw attachError;
+      throw new ToolError('debugger_attach_failed', `cannot attach debugger to tab ${tabId}: ${attachError.message || attachError}`, 'close DevTools on that tab and retry');
     }
     let work;
     try {
@@ -2329,7 +2611,7 @@ function buildHar(items, pageUrl) {
 
 function validateBatchInner(toolName, inner) {
   if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
-    fail('invalid_argument', 'batch args must be an object', 'see tools/list');
+    fail('invalid_argument', 'batch args must be an object', 'see docs/TOOLS.md');
   }
   const has = (key) => inner[key] !== undefined && inner[key] !== null;
   const numberIn = (key, min, max) => {
@@ -2406,7 +2688,7 @@ async function batchTool(args) {
   }
   const inner = args.args === undefined ? {} : args.args;
   if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
-    fail('invalid_argument', 'batch args must be an object', 'see tools/list');
+    fail('invalid_argument', 'batch args must be an object', 'see docs/TOOLS.md');
   }
   if (urls.length) {
     // 复合模式的内层参数属于目标工具；open 自身只接受 wait/replace/reuse。
@@ -2625,13 +2907,15 @@ async function observeTool(args) {
     const knownDoc = observedDocs.get(tab.id);
     const currentDoc = await runInTab(tab.id, () => window.__ema2_console_epoch || '', [], 'MAIN');
     const forceReset = !!knownDoc && since > 0 && currentDoc !== knownDoc;
-    const data = await runInTab(tab.id, (level, sinceValue, resetDoc) => {
+    const data = await runInTab(tab.id, (level, sinceValue, resetDoc, filterText) => {
       const min = { log: 1, warn: 3, error: 4 }[level] || 4;
       const all = window.__ema2_console || [];
       const seq = window.__ema2_console_seq || 0;
       const reset = resetDoc || sinceValue > seq;
       const start = reset ? 0 : sinceValue;
-      const entries = all.filter(e => e.seq > start && (e.order || 1) >= min);
+      const needle = filterText ? String(filterText).toLowerCase() : '';
+      const entries = all.filter(e => e.seq > start && (e.order || 1) >= min
+        && (!needle || String(e.text || '').toLowerCase().includes(needle)));
       return {
         entries,
         seq,
@@ -2639,7 +2923,7 @@ async function observeTool(args) {
         reset,
         firstSeq: all.length ? all[0].seq : seq + 1,
       };
-    }, [args.level || 'error', since, forceReset], 'MAIN');
+    }, [args.level || 'error', since, forceReset, args.filter || null], 'MAIN');
     if (data.epoch) observedDocs.set(tab.id, data.epoch);
     const records = data.entries.map(e => ({
       seq: e.seq,
@@ -2749,6 +3033,9 @@ async function readTool(args) {
     const helpers = window.__ema2_helpers;
     let root = document.body || document.documentElement;
     let mainSelector = '';
+    let mainFallback = false;
+    let textLength = 0;
+    let bodyLength = 0;
     if (selectorArg) {
       const found = helpers.find(null, selectorArg, null);
       if (!found) return { missing: true };
@@ -2757,12 +3044,18 @@ async function readTool(args) {
       const picked = helpers.mainRoot();
       root = picked.root;
       mainSelector = picked.selector;
+      mainFallback = !!picked.fallback;
+      textLength = picked.textLength || 0;
+      bodyLength = picked.bodyLength || 0;
     }
     const text = modeName === 'html' ? root.innerHTML
       : modeName === 'text' ? helpers.plainText(root)
       : helpers.markdown(root);
     return {
       text,
+      mainFallback,
+      textLength,
+      bodyLength,
       header: 'url=' + location.href + '\ntitle=' + helpers.clean(document.title)
         + (mainSelector ? '\nmain=' + mainSelector : ''),
     };
@@ -2774,6 +3067,9 @@ async function readTool(args) {
   const parts = [data.header, slice.text, footer(slice.total, slice.text.length, slice.next)];
   const hint = truncationHint('read', slice.total, slice.text.length, slice.next, cursor);
   if (hint) parts.push(hint);
+  if (data.mainFallback) {
+    parts.push(`hint=main extraction too short (${data.textLength || 0} chars); fell back to body. Use --selector or --no-main to control this.`);
+  }
   return parts.join('\n');
 }
 
@@ -2806,14 +3102,14 @@ async function snapshotTool(args) {
 function requireStringArg(args, key, max, allowEmpty) {
   if (args[key] === undefined) return undefined;
   if (typeof args[key] !== 'string' || args[key].length > max || (!allowEmpty && !args[key].trim())) {
-    fail('invalid_argument', `${key} must be a string (max ${max})`, 'see tools/list');
+    fail('invalid_argument', `${key} must be a string (max ${max})`, 'see docs/TOOLS.md');
   }
   return args[key];
 }
 
 async function executeTool(name, args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
-    fail('invalid_arguments', 'tool arguments must be an object', 'see tools/list');
+    fail('invalid_arguments', 'tool arguments must be an object', 'see docs/TOOLS.md');
   }
   switch (name) {
     case 'tabs': return tabsTool(args);
@@ -2847,28 +3143,29 @@ async function executeTool(name, args) {
     case 'files': return filesTool(args);
     case 'batch': return batchTool(args);
     case 'shot': return shotTool(args);
-    default: fail('unknown_tool', `unknown tool: ${name}`, 'call tools/list');
+    default: fail('unknown_tool', `unknown tool: ${name}`, 'use tabs|open|read|snapshot|act|wait|js|observe|files|shot|batch');
   }
 }
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+/** 旧版本留下的 token / 配对字段在 v2 全部作废；8765 迁移到 7744。 */
+async function migrateSettings() {
+  try {
+    const stored = await chrome.storage.local.get(['wsUrl', 'port']);
+    const port = resolvePort(stored);
+    if (Number(stored.port) !== port) await chrome.storage.local.set({ port });
+    await chrome.storage.local.remove(['token', 'pairedClients']);
+  } catch (_) { /* storage 不可用时仍按默认端口连接 */ }
+}
+
 ensureWatchdog();
 connect();
 chrome.runtime.onStartup.addListener(() => { ensureWatchdog(); connect(); });
-chrome.runtime.onInstalled.addListener((details) => {
+chrome.runtime.onInstalled.addListener(() => {
   ensureWatchdog();
-  connect();
-  if (details && details.reason === 'install') openPairPage();
+  migrateSettings().finally(() => connect());
 });
-if (chrome.action && chrome.action.onClicked) {
-  chrome.action.onClicked.addListener(() => {
-    try {
-      const created = chrome.tabs.create({ url: chrome.runtime.getURL('pair.html') });
-      if (created && typeof created.catch === 'function') created.catch(() => {});
-    } catch (_) { /* ignore */ }
-  });
-}
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string' || !message.type.startsWith('ema2/')) return undefined;
   handlePageMessage(message).then(

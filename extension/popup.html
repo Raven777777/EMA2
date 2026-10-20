@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EMA2</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f8fc;
+      --card: #ffffff;
+      --text: #0b1b2b;
+      --muted: #5b7085;
+      --line: #dbe4ee;
+      --brand: #0078d4;
+      --ok: #12855a;
+      --warn: #b45309;
+      --err: #b42318;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1722;
+        --card: #131f2c;
+        --text: #eaf2fa;
+        --muted: #93a7bb;
+        --line: #24384c;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      width: 320px;
+      padding: 14px;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    .head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }
+    .mark { width: 30px; height: 30px; flex: none; }
+    h1 { margin: 0; font-size: 15px; letter-spacing: .2px; }
+    .sub { margin: 0; color: var(--muted); font-size: 11px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .statusline { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+    .dot.ok { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+    .dot.err { background: var(--err); }
+    .detail { margin-top: 6px; color: var(--muted); font-size: 12px; word-break: break-word; min-height: 1.4em; }
+    .field { display: grid; gap: 5px; margin-top: 12px; color: var(--muted); font-size: 11px; }
+    input[type="number"] {
+      width: 120px; padding: 7px 9px; border-radius: 7px;
+      border: 1px solid var(--line); background: transparent; color: var(--text); font: inherit;
+    }
+    .actions { display: flex; gap: 8px; margin-top: 10px; }
+    button {
+      border: 0; border-radius: 7px; padding: 7px 13px; font: inherit; font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .primary { color: #fff; background: var(--brand); }
+    .ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    .hint { margin: 9px 0 0; color: var(--muted); font-size: 11px; min-height: 1.2em; }
+    .hint.err { color: var(--err); }
+    .hint.ok { color: var(--ok); }
+    .foot { margin-top: 9px; color: var(--muted); font-size: 10px; text-align: center; }
+  </style>
+</head>
+<body>
+  <header class="head">
+    <svg class="mark" viewBox="0 0 512 512" aria-hidden="true">
+      <defs>
+        <linearGradient id="flow" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#00D8F6"/>
+          <stop offset="50%" stop-color="#0078D4"/>
+          <stop offset="100%" stop-color="#004B87"/>
+        </linearGradient>
+      </defs>
+      <path d="M256,40C370,40,456,120,456,230C456,350,360,440,240,440C140,440,72,370,72,276C72,210,115,160,175,160C185,160,190,168,185,176C150,210,135,245,135,280C135,330,175,370,240,370C315,370,380,310,380,225C380,145,320,95,240,95C180,95,125,128,90,175C82,185,70,180,72,168C105,100,170,40,256,40Z" fill="url(#flow)"/>
+    </svg>
+    <div>
+      <h1>EMA2</h1>
+      <p class="sub">AI → 真实 Edge</p>
+    </div>
+  </header>
+
+  <section class="card">
+    <div class="statusline"><span id="dot" class="dot"></span><span id="status">正在检测…</span></div>
+    <div id="detail" class="detail"></div>
+
+    <label class="field">中继端口（默认 7744）
+      <input id="port" type="number" min="1" max="65535" step="1" value="7744">
+    </label>
+    <div class="actions">
+      <button id="save" class="primary">保存并连接</button>
+      <button id="reconnect" class="ghost">重新连接</button>
+    </div>
+    <p id="hint" class="hint"></p>
+  </section>
+
+  <div class="foot">先运行 <b>ema2 server</b>，端口与这里保持一致</div>
+  <script src="popup.js"></script>
+</body>
+</html>

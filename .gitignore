@@ -1,4 +1,5 @@
 /rust/target/
+/bin/
 
 # 本地运行产物
 /output/
@@ -10,8 +11,6 @@ examples/output/
 Thumbs.db
 
 # 构建/编辑残留
-bin/*.old
-bin/*.tmp
 *~
 
 # Python
@@ -19,6 +18,3 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
-
-# Node test deps
-node_modules/

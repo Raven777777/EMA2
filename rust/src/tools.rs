@@ -1,29 +1,25 @@
-//! v1.8 工具注册表（11 个粗粒度工具，面向 AI）。
+//! v2.0 工具注册表（11 个粗粒度工具，面向 AI 的 CLI 子命令）。
 //!
 //! 约定：
 //! - 输出行式紧凑文本（`key=value` / TSV / `[ref]`），不 pretty-print JSON
 //! - 列表带 `total / shown / next`
 //! - 错误统一 `error=<code> msg=... hint=...`
-//! - schema 只在这里定义一次（工具列表 / 白名单 / 校验 / 超时同源）
+//! - 工具名白名单、参数校验、超时预算同源，都在这里定义一次
 
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-pub struct Tool {
-    pub name: &'static str,
-    /// 客户端 UI 里显示的短标题（部分客户端会展示给用户/模型）。
-    pub title: &'static str,
-    pub description: &'static str,
-    pub input_schema: Value,
-}
+/// 11 个工具命令名（CLI 子命令与 /cmd 白名单共用）。
+pub const TOOL_NAMES: &[&str] = &[
+    "tabs", "open", "read", "snapshot", "act", "wait", "js", "observe", "files", "shot", "batch",
+];
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const ACT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const LONG_TIMEOUT: Duration = Duration::from_secs(120);
 pub const PAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-/// 单次工具调用的产品总时长上限；超出时在调用前明确拒绝，而不是让中继伪装成超时。
+/// 单次工具调用的产品总时长上限；超出时在调用前明确拒绝，而不是让 daemon 伪装成超时。
 pub const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MARGIN_SECS: f64 = 15.0;
 /// 扩展侧 debugger 任务本身的执行上限（全局串行队列）。
@@ -31,248 +27,8 @@ const DEBUGGER_TASK_SECS: f64 = 60.0;
 const MAX_BUDGET: u64 = 200_000;
 const MAX_WAIT_SECS: f64 = 300.0;
 
-pub static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
-    vec![
-        Tool {
-            name: "tabs",
-            title: "List / manage real Edge tabs",
-            description: "On the user's real, visible Microsoft Edge browser (not headless): action=list|current|new|close|activate. list=TSV id/active/title/url; close takes tabId|tabIds[]|scope=session.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["list", "current", "new", "close", "activate"] },
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "tabIds": {
-                        "type": "array", "minItems": 1, "maxItems": 8,
-                        "items": { "type": "integer", "minimum": 0 }
-                    },
-                    "scope": { "type": "string", "enum": ["session"] },
-                    "url": { "type": "string" },
-                    "active": { "type": "boolean" }
-                }
-            }),
-        },
-        Tool {
-            name: "open",
-            title: "Open a page in real Edge",
-            description: "Open a URL in the user's real Edge browser: new tab by default; replace=true uses the current tab, reuse=\"session\" the last session tab, tabId that tab. Returns id/url/title/status/reuse/net_hook.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "maxLength": 8192 },
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "wait": { "type": "string", "enum": ["load", "dom", "none"] },
-                    "replace": { "type": "boolean" },
-                    "reuse": { "type": "string", "enum": ["session"] }
-                },
-                "required": ["url"]
-            }),
-        },
-        Tool {
-            name: "read",
-            title: "Read a page from real Edge",
-            description: "Read the page open in the user's real Edge as md|text|html. main=true (default) extracts main content; selector/budget/cursor supported. Truncation adds hint=truncated + cursor.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "mode": { "type": "string", "enum": ["md", "text", "html"] },
-                    "selector": { "type": "string", "maxLength": 2048 },
-                    "main": { "type": "boolean" },
-                    "budget": { "type": "integer", "minimum": 200, "maximum": 200000 },
-                    "cursor": { "type": "integer", "minimum": 0 }
-                }
-            }),
-        },
-        Tool {
-            name: "snapshot",
-            title: "Snapshot real Edge page",
-            description: "Snapshot the user's real Edge page as refs `[e12@d1] button \"X\"`. filter/ near=<ref> scope; refs are document-scoped and go stale after navigation.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "filter": { "type": "string", "enum": ["interactive", "full", "links", "buttons", "form"] },
-                    "near": { "type": "string", "maxLength": 32 },
-                    "budget": { "type": "integer", "minimum": 200, "maximum": 200000 },
-                    "cursor": { "type": "integer", "minimum": 0 }
-                }
-            }),
-        },
-        Tool {
-            name: "act",
-            title: "Act in real Edge",
-            description: "Interact with the user's real Edge page: click|type|fill|select|press|hover|scroll|submit|back|forward|reload by ref/selector/target; steps[] batch; waitFor response.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "action": { "type": "string", "enum": ["click", "type", "fill", "select", "press", "hover", "scroll", "submit", "back", "forward", "reload"] },
-                    "ref": { "type": "string", "maxLength": 32 },
-                    "selector": { "type": "string", "maxLength": 2048 },
-                    "target": { "type": "string" },
-                    "text": { "type": "string", "maxLength": 100000 },
-                    "value": { "type": "string", "maxLength": 100000 },
-                    "key": { "type": "string", "maxLength": 100 },
-                    "deltaY": { "type": "number", "minimum": -100000, "maximum": 100000 },
-                    "submit": { "type": "boolean" },
-                    "fields": {
-                        "type": "array", "minItems": 1, "maxItems": 100,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "ref": { "type": "string", "maxLength": 32 },
-                                "selector": { "type": "string", "maxLength": 2048 },
-                                "target": { "type": "string", "maxLength": 200 },
-                                "value": { "type": "string", "maxLength": 100000 }
-                            },
-                            "required": ["value"]
-                        }
-                    },
-                    "steps": {
-                        "type": "array", "minItems": 1, "maxItems": 20,
-                        "items": { "type": "object", "required": ["action"] }
-                    },
-                    "waitFor": {
-                        "type": "object",
-                        "properties": {
-                            "url": { "type": "string", "maxLength": 2048 },
-                            "status": { "type": "integer", "minimum": 100, "maximum": 599 },
-                            "timeout": { "type": "number", "minimum": 0, "maximum": 30 }
-                        }
-                    }
-                },
-                "anyOf": [{ "required": ["action"] }, { "required": ["steps"] }]
-            }),
-        },
-        Tool {
-            name: "wait",
-            title: "Wait in real Edge",
-            description: "Wait inside the user's real Edge page for one of text|textGone|selector|time|idle (max 300s).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "text": { "type": "string", "maxLength": 100000 },
-                    "textGone": { "type": "string" },
-                    "selector": { "type": "string", "maxLength": 2048 },
-                    "time": { "type": "number", "minimum": 0, "maximum": 300 },
-                    "idle": { "type": "boolean" },
-                    "timeout": { "type": "number", "minimum": 0, "maximum": 300 }
-                }
-            }),
-        },
-        Tool {
-            name: "js",
-            title: "Run JS in real Edge",
-            description: "Evaluate JS in a tab of the user's real Edge browser (await ok); compact value, budget-capped. On timeout all JS in that tab is terminated.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "code": { "type": "string", "maxLength": 100000 },
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "budget": { "type": "integer", "minimum": 200, "maximum": 200000 }
-                },
-                "required": ["code"]
-            }),
-        },
-        Tool {
-            name: "observe",
-            title: "Observe real Edge network/console",
-            description: "Observe the user's real Edge tab: console deltas or network (fetch/XHR with real status+body). since=last next; bodyFilter regex; har=true exports HAR.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "kind": { "type": "string", "enum": ["console", "network"] },
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "since": { "type": "integer", "minimum": 0 },
-                    "level": { "type": "string", "enum": ["log", "warn", "error"] },
-                    "filter": { "type": "string", "maxLength": 2048 },
-                    "bodyFilter": { "type": "string", "maxLength": 512 },
-                    "wait": { "type": "number", "minimum": 0, "maximum": 10 },
-                    "bodies": { "type": "boolean" },
-                    "har": { "type": "boolean" },
-                    "budget": { "type": "integer", "minimum": 200, "maximum": 200000 }
-                },
-                "required": ["kind"]
-            }),
-        },
-        Tool {
-            name: "files",
-            title: "Upload files in real Edge",
-            description: "Upload local files into a file input on the user's real Edge page. action=download-dir is accepted but Edge always returns download_dir_unsupported.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["upload", "download-dir"] },
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "ref": { "type": "string", "maxLength": 32 },
-                    "selector": { "type": "string", "maxLength": 2048 },
-                    "target": { "type": "string", "maxLength": 200 },
-                    "paths": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "type": "string" } },
-                    "dir": { "type": "string", "maxLength": 4096 }
-                },
-                "required": ["action"]
-            }),
-        },
-        Tool {
-            name: "shot",
-            title: "Screenshot real Edge",
-            description: "Screenshot the user's real, visible Edge tab: default saves PNG and returns path; inline=true returns image; annotate=true adds ref boxes and a coordinate list.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tabId": { "type": "integer", "minimum": 0 },
-                    "inline": { "type": "boolean" },
-                    "annotate": { "type": "boolean" },
-                    "format": { "type": "string", "enum": ["png", "jpeg"] }
-                }
-            }),
-        },
-        Tool {
-            name: "batch",
-            title: "Batch across real Edge tabs",
-            description: "Run open|read|snapshot|js|wait concurrently on the user's real Edge tabs: tabIds for existing tabs, urls to open each url then run there.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tool": { "type": "string", "enum": ["open", "read", "snapshot", "js", "wait"] },
-                    "tabIds": {
-                        "type": "array", "minItems": 1, "maxItems": 8,
-                        "items": { "type": "integer", "minimum": 0 }
-                    },
-                    "urls": {
-                        "type": "array", "minItems": 1, "maxItems": 8,
-                        "items": { "type": "string", "maxLength": 8192 }
-                    },
-                    "args": { "type": "object" },
-                    "concurrency": { "type": "integer", "minimum": 1, "maximum": 4 }
-                },
-                "required": ["tool"],
-                "anyOf": [{ "required": ["tabIds"] }, { "required": ["urls"] }]
-            }),
-        },
-    ]
-});
-
-pub fn tool_list() -> Value {
-    Value::Array(
-        TOOLS
-            .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "title": tool.title,
-                    "description": tool.description,
-                    "inputSchema": tool.input_schema,
-                })
-            })
-            .collect(),
-    )
-}
-
 pub fn contains(name: &str) -> bool {
-    TOOLS.iter().any(|tool| tool.name == name)
+    TOOL_NAMES.contains(&name)
 }
 
 /// 中继等待扩展响应的超时（必须大于扩展侧自身的等待上限）。
@@ -285,7 +41,7 @@ pub fn timeout_for(name: &str, arguments: &Value) -> Duration {
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
                 .clamp(0.0, 30.0);
-            ACT_TIMEOUT + Duration::from_secs_f64(wait)
+            ACT_TIMEOUT + Duration::from_secs_f64(wait + act_await_seconds(arguments))
         }
         "js" | "shot" | "files" => LONG_TIMEOUT,
         "batch" => batch_budget(arguments).min(MAX_CALL_TIMEOUT),
@@ -308,6 +64,21 @@ fn wait_seconds(arguments: &Value) -> f64 {
         .and_then(Value::as_f64)
         .unwrap_or(PAGE_WAIT_TIMEOUT.as_secs_f64())
         .clamp(0.0, MAX_WAIT_SECS)
+}
+
+/// act 脚本里 `await 10s` 的时长总和；这些等待会叠加到工具总预算。
+fn act_await_seconds(arguments: &Value) -> f64 {
+    arguments
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|step| step.get("action").and_then(Value::as_str) == Some("await"))
+                .filter_map(|step| step.get("timeout").and_then(Value::as_f64))
+                .sum()
+        })
+        .unwrap_or(0.0)
 }
 
 fn batch_tab_count(arguments: &Value) -> usize {
@@ -463,6 +234,22 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                     };
                     validate_action(step).map_err(|error| format!("steps[{index}]: {error}"))?;
                 }
+                let wait = object
+                    .get("waitFor")
+                    .and_then(|wait_for| wait_for.get("timeout"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 30.0);
+                let budget = ACT_TIMEOUT.as_secs_f64()
+                    + wait
+                    + act_await_seconds(&Value::Object(object.clone()));
+                if budget > MAX_CALL_TIMEOUT.as_secs_f64() {
+                    return Err(format!(
+                        "act budget {:.0}s exceeds the {}s call limit; reduce await durations or split the script",
+                        budget,
+                        MAX_CALL_TIMEOUT.as_secs()
+                    ));
+                }
             } else {
                 validate_action(object)?;
             }
@@ -493,13 +280,24 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             let idle = object
                 .get("idle")
                 .is_some_and(|v| matches!(v, Value::Bool(true)));
-            let conditions = [has_text, has_gone, has_selector, time.is_some(), idle]
-                .iter()
-                .filter(|flag| **flag)
-                .count();
+            bool_arg(object, "await")?;
+            let has_await = object
+                .get("await")
+                .is_some_and(|v| matches!(v, Value::Bool(true)));
+            let conditions = [
+                has_text,
+                has_gone,
+                has_selector,
+                time.is_some(),
+                idle,
+                has_await,
+            ]
+            .iter()
+            .filter(|flag| **flag)
+            .count();
             if conditions != 1 {
                 return Err(
-                    "exactly one of text, textGone, selector, time, idle is required".into(),
+                    "exactly one of text, textGone, selector, time, idle, await is required".into(),
                 );
             }
             if let Some(seconds) = time
@@ -577,13 +375,17 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                     return Err("upload needs one of ref, selector, target".into());
                 }
             } else {
-                string_arg(object, "dir", 4_096, true, false)?;
+                // download-dir 只为返回明确的 download_dir_unsupported 错误，
+                // dir 值本身无用（Edge 不允许扩展改下载目录）。
+                string_arg(object, "dir", 4_096, false, false)?;
             }
         }
         "shot" => {
             tab_id(object)?;
             bool_arg(object, "inline")?;
             bool_arg(object, "annotate")?;
+            // 扩展按 format 决定截图格式；CLI `--format png|jpeg` 与此对应。
+            enum_arg(object, "format", &["png", "jpeg"], false)?;
         }
         "batch" => {
             enum_arg(
@@ -663,7 +465,7 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
         "action",
         &[
             "click", "type", "fill", "select", "press", "hover", "scroll", "submit", "back",
-            "forward", "reload",
+            "forward", "reload", "await",
         ],
         true,
     )?;
@@ -677,6 +479,14 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if action == "await" {
+        if let Some(timeout) = number_arg(object, "timeout", false)?
+            && !(0.0..=300.0).contains(&timeout)
+        {
+            return Err("await timeout must be between 0 and 300 seconds".into());
+        }
+        return Ok(());
+    }
     if action == "press"
         && !object
             .get("key")
@@ -924,62 +734,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_tool_identifies_the_users_real_browser() {
-        for tool in TOOLS.iter() {
-            assert!(
-                !tool.title.trim().is_empty(),
-                "{} needs a UI title",
-                tool.name
-            );
-            let description = tool.description.to_lowercase();
-            assert!(
-                description.contains("real"),
-                "{} description must say 'real' browser: {}",
-                tool.name,
-                tool.description
-            );
-            assert!(
-                description.contains("edge"),
-                "{} description must name Edge: {}",
-                tool.name,
-                tool.description
-            );
-        }
-    }
-
-    #[test]
     fn registry_is_compact_and_complete() {
-        assert_eq!(TOOLS.len(), 11);
-        assert_eq!(tool_list().as_array().unwrap().len(), 11);
-        let schema_chars = tool_list().to_string().len();
-        // v1.10.1 起每个描述都写明“用户的真实 Edge（非无头）”，约 6.5KB。
-        assert!(
-            schema_chars < 7_000,
-            "tool schema grew to {schema_chars} chars; keep it compact"
-        );
-        for tool in TOOLS.iter() {
-            assert!(
-                !tool.description.is_empty(),
-                "{} has no description",
-                tool.name
-            );
-            assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
+        assert_eq!(TOOL_NAMES.len(), 11);
+        // CLI 子命令与 /cmd 白名单共用这一份名单。
+        for name in TOOL_NAMES {
+            assert!(contains(name), "{name} missing from contains()");
         }
+        assert!(!contains("edge_get_tabs"));
+        assert!(!contains("pair"));
+        assert!(!contains("install"));
     }
 
     #[test]
     fn every_tool_is_reachable() {
-        for tool in TOOLS.iter() {
-            if let Err(error) = validate_arguments(tool.name, &json!({})) {
-                assert!(
-                    !error.contains("unknown tool"),
-                    "{} is not handled",
-                    tool.name
-                );
+        for name in TOOL_NAMES {
+            if let Err(error) = validate_arguments(name, &json!({})) {
+                assert!(!error.contains("unknown tool"), "{} is not handled", name);
             }
-            assert!(contains(tool.name));
         }
-        assert!(!contains("edge_get_tabs"));
     }
 
     #[test]
@@ -1082,6 +854,30 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({
+                    "steps": [
+                        { "action": "click", "ref": "e1" },
+                        { "action": "await", "timeout": 10 }
+                    ]
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "steps": [{ "action": "await", "timeout": 301 }] })
+            )
+            .is_err()
+        );
+        // 脚本 await 总量超过 600s 预算：执行前拒绝。
+        let steps: Vec<Value> = (0..8)
+            .map(|_| json!({ "action": "await", "timeout": 300 }))
+            .collect();
+        assert!(validate_arguments("act", &json!({ "steps": steps })).is_err());
     }
 
     #[test]
@@ -1095,6 +891,10 @@ mod tests {
         assert!(validate_arguments("wait", &json!({ "time": 301 })).is_err());
         assert!(validate_arguments("wait", &json!({ "text": "x", "timeout": 60 })).is_ok());
         assert!(validate_arguments("wait", &json!({ "text": "x", "timeout": 999 })).is_err());
+        assert!(validate_arguments("wait", &json!({ "await": true, "timeout": 10 })).is_ok());
+        assert!(validate_arguments("wait", &json!({ "await": true })).is_ok());
+        assert!(validate_arguments("wait", &json!({ "await": true, "text": "x" })).is_err());
+        assert!(validate_arguments("wait", &json!({ "await": "yes" })).is_err());
     }
 
     #[test]
@@ -1152,6 +952,8 @@ mod tests {
             )
             .is_ok()
         );
+        // CLI `ema2 files download-dir` 不带 dir：也要能通过校验（扩展固定报错）。
+        assert!(validate_arguments("files", &json!({ "action": "download-dir" })).is_ok());
     }
 
     #[test]
@@ -1179,6 +981,8 @@ mod tests {
         assert!(validate_arguments("shot", &json!({ "inline": true, "annotate": true })).is_ok());
         assert!(validate_arguments("shot", &json!({ "inline": "yes" })).is_err());
         assert!(validate_arguments("shot", &json!({ "annotate": 1 })).is_err());
+        assert!(validate_arguments("shot", &json!({ "format": "jpeg" })).is_ok());
+        assert!(validate_arguments("shot", &json!({ "format": "webp" })).is_err());
     }
 
     #[test]
@@ -1504,5 +1308,21 @@ mod tests {
             Duration::from_secs(135)
         );
         assert_eq!(timeout_for("tabs", &json!({})), DEFAULT_TIMEOUT);
+        assert_eq!(
+            timeout_for("wait", &json!({ "await": true, "timeout": 10 })),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            timeout_for(
+                "act",
+                &json!({
+                    "steps": [
+                        { "action": "click", "ref": "e1" },
+                        { "action": "await", "timeout": 10 }
+                    ]
+                })
+            ),
+            ACT_TIMEOUT + Duration::from_secs(10)
+        );
     }
 }

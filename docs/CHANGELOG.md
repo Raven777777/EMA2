@@ -1,5 +1,87 @@
 # 变更记录
 
+## v2.1.4 — read 正文清洁、main 回退、debugger 重试
+
+- `read --mode text|md` 现在跳过 `script/style/noscript/template/textarea/input/select/option`、
+  页面壳（nav/header/footer/aside/form），以及 `display:none`/`visibility:hidden`/
+  `content-visibility` 的隐藏元素；不再把百度 `textarea#hotsearch_data` 的 JSON、
+  GitHub dashboard JSON 或隐藏弹窗文本读进正文。
+- 正文容器评分改用清洁后的文本；`<main>`/article 太短（<200 字符或不到 body 5%）时
+  回退 `main=body(fallback)`，并给 `hint=main extraction too short (...)`。
+- `debugger.attach` 非超时失败自动重试一次（200ms 后），减少扩展重载/DevTools 关闭瞬间的
+  `debugger_attach_failed`。
+- helper 版本升到 10；真机测试覆盖 Bing / Baidu / GitHub / HN / Nature 等站点。
+- 版本：exe/扩展 2.1.4。
+
+## v2.1.3 — 中间构建（未单独发布）
+
+`read` 正文清洁、main 回退和 debugger attach 重试在 2.1.3 开始开发，统一并入 2.1.4 发布。
+
+## v2.1.2 — contenteditable 去重
+
+- `contenteditable` 的 `execCommand('insertText')` 已经触发原生 input，外层不再补发
+  `input/change`，避免 X/Draft.js 把同一次输入重复应用。
+- 写入后复核 `textContent`；不一致时重试一次，仍不一致才回退到 `textContent + InputEvent`。
+- `status` 收到 `bridge/hello` 时也刷新 `last_ping`，不再出现已连接但 `last_ping=never`。
+- 版本：exe/扩展 2.1.2。
+
+## v2.1.1 — act settle、await 与连续指令
+
+让动作和页面稳定分开：动作成功不等于页面已经稳定，AI 可以自己决定要不要继续等。
+
+- **act 隐式 settle**：导航意图（链接/表单提交/back/forward/reload）最多等 3s，
+  普通按钮最多 800ms，其他动作不等待；页面提前稳定就提前返回。
+- **settle 超时不是错误**：返回 `settle=pending`、`expect=nav`、`next_url=` 和
+  `hint=call ema2 await 10s`，退出码仍为 0。
+- **`ema2 await [10s]`**：等上一个 act 动作的页面效果；不带 `--tab` 时使用动作所在标签页。
+  显式 await 超时才返回 `wait_timeout`（退出 4）。
+- **last-act 上下文**：扩展用 `chrome.storage.session` 记录 tab、expect、baseline、新标签；
+  `open`/新的 act 会清掉旧上下文，避免 await 到过期页面。
+- **新标签**：动作打开的新标签返回 `new_tab=` 并自动登记 session，`tabs close --session` 可清理。
+- **连续指令**：`.ema2`/`--steps` 支持 `await 10s`；如果上一步 pending 且下一步不是 await，
+  脚本停止并提示，不再在旧页面继续点击。
+- **内容编辑器**：`contenteditable` 的 fill/type 改用原生 `insertText`，X/Slack 类编辑器
+  能正确更新内部状态；`type` 追加、`fill` 覆盖。
+- **超时预算**：act 的工具预算会叠加脚本里的 await 时长，超过 600s 在执行前拒绝。
+- 版本：exe/扩展 2.1.1；真机验证：慢导航 pending→await、快速导航 done、
+  fetch 按钮 page、target=_blank 新标签、脚本 await/pending 停止、X 发帖/删除。
+
+## v2.0.0 — CLI + daemon：删除 MCP / token / 授权 / 配置
+
+架构重写：EMA2 不再是一个 MCP 服务，而是「单 exe 自带 daemon + 短命 CLI + MV3 扩展」。
+
+- **服务形态**：`ema2 server` daemon 化并立即返回；`ema2 server stop` 通过
+  `POST /shutdown` 关闭，卡死时用临时 PID 文件兜底；`ema2 status` 读 `/health`；
+  `ema2 init` 写/更新 `AGENTS.md`。默认端口 **7744**。
+- **单端口分流**：`127.0.0.1:7744` 同时服务 WS（扩展，`Upgrade` 头）与 HTTP
+  （`POST /cmd`、`GET /health`、`POST /shutdown`）。
+- **CLI 语法**：位置参数 + `key=value`；11 个工具命令
+  `tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch`；
+  `--steps` 支持分号/换行，`.ema2` 脚本逐行执行，`waitFor` 独立成行。
+- **删除**：MCP HTTP/JSON-RPC/SSE、token、HMAC 配对、授权页、状态页、`state.toml`、
+  `.ema2.bak`、五类终端配置合并、`install`/`uninstall`、`pair`、
+  `clients`/`jsonc`/`config`/`mcp`/`http`/`pair` 模块。
+- **错误码拆分**：`relay_not_running`（7744 不通）与 `extension_not_connected`
+  （server 在、扩展没连）；新增 `port_in_use`、`relay_start_failed`、`shutdown_failed`。
+  退出码：0 成功 / 1 参数错 / 2 中继不可用 / 3 扩展未连 / 4 工具执行错。
+- **扩展**：popup 只保留端口输入 + 保存/重连 + 连接状态；默认 7744；
+  旧 8765 自动迁移；无 token/HMAC/pair 页。11 个工具、ref 快照、网络/console hook
+  原样保留；helper 版本升到 4（完整 ref + 短 ref `e12` 兼容）。
+- **行为修正**（真机验收发现）：
+  - `act type` 现在追加到现有值，`act fill` 覆盖；两者语义分开；
+  - `act select` 的 CLI 位置参数正确映射到 option 的 `value`；
+  - `files upload --ref e12` 会把短 ref 补成当前文档句柄再走 debugger；
+  - `files download-dir` 固定返回 `download_dir_unsupported`，不再尝试改下载目录；
+  - `observe console --filter` 真正按子串过滤；
+  - `batch` 的内层 flag 放进 `args`（与扩展 batch 协议一致）。
+- **文档/示例**：README、TOOLS、ARCHITECTURE、TESTING 重写为 CLI/daemon 形态；
+  删除 MCP 示例与旧 bridge/live-check 脚本；新增 `rust/assets/AGENTS.md` 模板。
+- **测试政策**：删除 `package.json`/`package-lock.json`/`node_modules` 与 Node/jsdom
+  测试设施；**绝对禁止 Node.js 测试**，功能验收必须使用真实 Edge + 真实 CLI。
+- **验证**：隔离 profile 的真实 Edge + MV3 扩展上完成 25 项 CLI 检查
+  （status、tabs、open/read/snapshot、act 全动作、wait、js、observe/HAR、
+  files、shot、batch、steps/script、open 复用、tabs session、init、server 生命周期）。
+
 ## v1.12.1 — 游标参数接受数字字符串
 
 真机验收时踩到：`snapshot` 尾部写 `next=23`，把它抄成 `cursor: "23"` 会被中继拒掉

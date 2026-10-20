@@ -1,186 +1,124 @@
-# EMA2 测试说明（v1.12.1）
+# EMA2 测试说明 · v2.1.4
 
-本文记录当前自动化测试分层、覆盖矩阵、运行命令和真实 Edge/MV3 验收结果。
-测试目标是保护 2026-10-19 代码审查的 F01–F13 修复、2026-10-20 的 P0/P1/P2/P3 加固，以及 v1.10 的配置合并/多终端/安装卸载、v1.11 的标签复用/真实状态码/截断续读、v1.12 的快照瘦身与句柄分配；
-主流程已在隔离 profile 的真实 Edge 上跑通，
-未覆盖的边界在文末单独列出。
+> ## 硬性规定：禁止 Node.js 测试
+>
+> - **绝对禁止**新增或运行 Node.js 测试（`node:test`、`jest`、`jsdom`、Playwright、
+>   Puppeteer、VM 模拟等都不允许）。
+> - 禁止提交 `package.json`、`package-lock.json`、`node_modules/` 或任何 Node 测试依赖。
+> - 所有功能、回归、验收测试必须在**真实 Edge 浏览器** + 真实 `ema2` CLI 上执行。
+> - 原因：Node 模拟测试启动慢、维护成本高，且找不到真实浏览器行为差异。
+>   v2.0 真机验收就发现了 `type`/`select`、短 ref、`observe console --filter`、
+>   `files download-dir` 等 Node 模拟很难覆盖的问题。
+> - Rust 单测只用于纯解析/校验的快速反馈，**不能替代真实浏览器验收**。
 
-## 1. 测试分层
+v2.0 的产品面是 **CLI + 真实 Edge**，测试以真机行为和 CLI 输出为准，
+不依赖 MCP 客户端、token、授权页或终端配置。
 
-| 层 | 工具 | 数量 | 覆盖范围 |
-|---|---|---:|---|
-| Rust 单元/路由测试 | `cargo test` | 98 | 工具 schema/参数校验、超时预算、batch 递归校验、pending 代际隔离、token 必需性、SSE 投递/替换/清理、锁中毒、JSONC/TOML 合并、备份、取消勾选、MCP 元数据、截图落盘、HTTP 路由 |
-| 扩展回归 | Node VM + jsdom | 42 | F01–F03、F05–F07、F09–F13、P2-1、P2-4、配对/HMAC、终端选择、导航落点、快照瘦身、句柄并发 |
-| 脚本回归 | Node + PowerShell | 3 | F04 精确端口/进程身份、陌生监听者保护、脚本静态检查 |
-| 真实 Edge/MV3 验收 | Node + 隔离 Edge profile + 隔离 HOME | 22 场景 | tabs/open/snapshot、F01–F13 主流程、files、shot、bridge 重启重连、SSE 通知、token 网关、streaming 观测、五终端真实合并、install 识别已加载扩展 |
-| 静态检查 | `cargo fmt` / `cargo clippy` | — | Rust 格式与 `-D warnings` |
-
-Node 回归使用 `node:test`，唯一 devDependency 是 `jsdom`。测试通过 VM 加载真实
-`extension/background.js`（截掉自动连接入口），并在 jsdom 页面上下文中执行真实的
-`installHelpers` / `performActionInPage` / `installNetworkHook` 等函数。
-
-## 2. 运行命令
+## 自动化
 
 ```bash
-# 安装测试依赖
-npm install
-
-# 扩展 + 脚本回归
-npm run test:js
-
-# 真实 Edge/MV3 验收（需要本机 Edge；约 3 分钟）
-npm run test:edge
-# 可选：EMA2_EDGE_SKIP_SLOW=1 跳过 60s 挂起 JS 场景
-#       EMA2_EDGE_KEEP=1      失败时保留临时 profile / 日志
-#       EMA2_EDGE_EXE=...      指定 Edge 路径
-
-# 全部自动化测试（不含真实 Edge）
-npm run test:all
-
-# Rust 单独运行
 cd rust
-cargo test --locked --offline
-cargo clippy --locked --offline --all-targets -- -D warnings
+cargo test
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-
-# Windows 进程管理自检
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bridge.ps1 -SelfTest
 ```
 
-发布候选构建：
+Rust 单测覆盖：工具白名单/参数校验、超时预算、act 脚本/`--steps` 解析、
+batch 内层参数、pending 代际、锁中毒、截图/HAR 落盘、HTTP 路由、health/shutdown。
 
-```bash
-cd rust
-cargo build --release --locked --offline
-sha256sum target/release/ema2.exe
+扩展侧不依赖 VM/jsdom 模拟；关键 DOM 行为全部通过下面的真实 Edge 清单覆盖。
+
+## 真机验收清单
+
+建议用**隔离 profile**，不要动日常 Edge 的登录态：
+
+```powershell
+# 1) 启动中继
+bin\ema2.exe server
+bin\ema2.exe status          # relay=running, extension=disconnected
+
+# 2) 隔离 Edge（另开一个窗口；端口默认 7744）
+& 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' `
+  --user-data-dir="$env:TEMP\ema2-profile" `
+  --load-extension="$PWD\extension" `
+  --disable-extensions-except="$PWD\extension" `
+  --no-first-run --no-default-browser-check about:blank
+
+# 3) 点工具栏 EMA2 图标 → 端口 7744 → 保存并连接
+bin\ema2.exe status          # extension=connected
 ```
 
-当前 `bin/ema2.exe` 已由同一源码构建为 v1.12.1；重新构建后建议用
-`scripts\setup.cmd` 覆盖并记录 SHA-256。
+逐项检查：
 
-## 3. 审查项覆盖矩阵
-
-| 审查项 | 自动化验证 | 说明 |
+| # | 命令 | 期望 |
 |---|---|---|
-| F01 网络 hook 非阻塞 | `F01 fetch hook...`、`F01 response preview...`、`F01 bodies=false...` | 永不结束的 clone reader 不阻塞页面；8KB/1.5s 上限；关闭 body 后不 clone |
-| F02 敏感信息 | `F02 password values...` | password 名称、snapshot、candidates、marks、type 反馈均无虚构密码 |
-| F03 ref 文档作用域 | `F03 refs are document-scoped...` | 同文档稳定；reload/跨 tab 旧 ref 失败；files 也拒绝 stale ref |
-| F04 进程管理 | `F04 bridge scripts...`、self-test、foreign listener | 精确端口、进程路径校验、陌生监听者退出 2 且不被杀 |
-| F05 debugger 恢复 | `F05 debugger queue...`、`F05 queued task...` | 挂起 Promise 超时后 terminate + detach，后续任务成功 |
-| F06 截图目标 | `F06 shot rejects...` | 非活动 tab 拒绝；截图期间切 tab 失败 |
-| F07 观测分页 | `F07 console pagination...`、`F07 observe resets...`、`F07 network pagination...` | next 按已交付记录；dropped/reset；100 条网络记录无 slice(-80) 丢失 |
-| F08 超时预算 | Rust `timeout_budget` | wait 60/120/300；batch 8 tab 并发 1/2/4；超过 600s 拒绝 |
-| F09 Markdown | `F09 markdown...` | 根直接文本、p/h1/pre、混合文本/块、列表 |
-| F10 动作结果 | `F10 actions fail...` | disabled/readOnly/不支持控件失败；单次页面注入 |
-| F11 跨导航 waitFor | `F11 waitForResponse...` | 新文档从 seq=0；`status=-1` 回填不作为成功证据 |
-| F12 batch 参数 | Rust `batch_validation`、Node `F12 batch...` | 内层 validator 复用；time=3600 拒绝；扩展侧防御 |
-| F13 press 目标 | `F13 press targets...` | 有 ref 时聚焦目标；无定位才用 activeElement |
-| P0-1 默认鉴权 | Rust `token_is_required_by_default`、`explicit_anonymous_switch_is_required_for_no_token`、`anonymous_switch_parsing_is_strict`；Edge `P0-1 relay refuses...` | 无 token 且未显式允许时拒绝启动（真机进程退出码 2）；开关值严格解析；token 模式 401/200 |
-| P0-2 锁/panic | Rust `lock_survives_a_poisoned_mutex` | 持锁线程 panic 后状态仍可用；release 使用 unwind |
-| P1-1 SSE 投递 | Rust `event_stream_delivers_server_notifications`、`broadcast_reaches_every_session_stream`；Edge `P1-1 GET /mcp...` | 真机 WS 断开/重连时 GET /mcp 收到 disconnected + connected |
-| P2-3 流替换 | Rust `re_registering_closes_the_superseded_stream`、`event_stream_cleanup_is_scoped_to_its_own_stream` | 同 session 重复注册只保留一条流，旧流立即关闭 |
-| P2-1 bodyFilter | Node `P2-1 bodyFilter rejects...` | `(a+)+` / `(a|a)+` / 超长模式被拒；安全模式仍可匹配 |
-| P2-4 pending 分页 | Node `P2-4 network observe keeps...`；Edge `P2-4 slow body...` | pending 之后的已就绪记录不被丢弃；真机慢响应标 `streaming=1` 且 `next` 前进 |
-| 扩展图标 | Node `extension icons cover every manifest size...` | 16/48/128 图标存在、尺寸与 manifest 一致、RGBA 透明 |
-| v1.11 标签复用 | Node `open reports the real document status...`、`open reuse=session...`、`open rejects conflicting...`；Rust `open_reuse_modes_are_exclusive` | 新开/`replace`/`reuse` 三选一；用户标签不进会话；状态码与 4xx hint |
-| v1.11 会话收尾 | Node `tabs close scope=session...`、`tabs close tabIds[]...`；Rust `tabs_close_scopes` | 只关本会话标签；已消失的 id 跳过；非 close 动作传 tabIds/scope 报错 |
-| v1.11 batch 复合 | Node `batch urls opens each url...`、`batch open accepts urls...`；Rust `batch_urls_open_and_composite` | `urls` 打开后执行目标工具；与 `tabIds` 互斥；open 成本计入预算 |
-| v1.12 句柄唯一 | Node `two tabs installing at the same moment...`、`document handles resume from the persisted counter...` | 并发取号不重号；重载后续号而不是回到 d1 |
-| v1.12 快照瘦身 | Node `refs carry a short document handle...`、`snapshot drops nameless containers...`、`each new document gets its own handle...`、`two tabs installing at the same moment...` | ref 短句柄、空节点丢弃、URL 截断、句柄唯一 |
-| v1.11 导航落点 | Node `open waits for the new document...` | `tabs.update` 后旧文档仍 complete 时不提前返回，`url/title` 必须属于新文档 |
-| v1.11 截断提示 | Node `read says explicitly that the text was truncated...` | 截断时给 `hint=truncated` + `cursor`；全文读完不给 |
-| v1.11 js 语句体 | Node `js accepts a function body with top-level return...`、`js flags a body that produced no value...`、`js keeps a real runtime error...`、`js reports a syntax error after the body fallback...` | 表达式优先、语法错误回退 async 函数体；hint 区分语法/运行时；无返回值提示 |
+| 1 | `ema2 server` / `ema2 server` | 第二次 `relay=already_running pid=...`，退出 0 |
+| 2 | `ema2 status` | `relay=running`、`extension=connected`、`tabs=N active_tab=ID` |
+| 3 | `ema2 tabs current` | `id/window/os/title/url` |
+| 4 | `ema2 open https://example.com/` | `status=200`、`net_hook=on`、`id=` |
+| 5 | `ema2 read --mode md` | 正文；截断时 `hint=... --cursor N` |
+| 5a | 对百度 `read --mode text` | 不出现 `hotsearch_data` / `card_title` JSON / `/* eslint` |
+| 5b | 对 Bing 首页 `read --mode text` | 正文不是只有 8 字符；`main=body` 或 `body(fallback)` |
+| 5c | 对 GitHub dashboard `read --mode text` | 不出现 `{"props":` / `currentUserLogin` |
+| 5d | 本地短 `<main>` + 长 body | `main=body(fallback)` + `hint=main extraction too short` |
+| 5e | `read --mode html` | 仍是原始 HTML（允许 script/style） |
+| 5f | 本地含 `display:none` / `hidden` / `aria-hidden` 文本 | 隐藏文本不进入 read 正文 |
+| 6 | `ema2 snapshot` | `[e1@d1] ...`，无密码 value |
+| 7 | `ema2 act fill e2 "x"` / `type e2 "y"` | fill 覆盖、type 追加；`wrote=1 chars=N` |
+| 8 | `ema2 act select e4 <value>` | select 的 value 生效 |
+| 9 | `ema2 act click e1` | 页面变化；旧完整 ref 报 `stale_ref` |
+| 9a | 点击一个 5s 才响应的链接 | `settle=pending`、`next_url=`、退出 0 |
+| 9b | 紧接 `ema2 await 10s` | `await=done elapsed=...s tab=... url=...` |
+| 9c | 点击普通 fetch 按钮 | `settle=done ms<800 expect=page`，并提示用 `--wait-for` |
+| 9d | 点击 `target=_blank` 链接 | `new_tab=ID`，`tabs list` 的 `session_tabs` 包含它 |
+| 9e | `.ema2` 里 `click` 后写 `await 10s` | 每步 `ok`，最终仍在正确的新页面 |
+| 9f | 脚本里 pending 后不写 `await` | `ok=1/N`、`stopped=1 reason=pending`，不继续点 |
+| 10 | `ema2 act click e6 --wait-for "url=api/save status=200 timeout=5s"` | `response=200 GET /api/save` |
+| 11 | `ema2 wait text/selector/time/idle` | `ok=... elapsed=...s` |
+| 12 | `ema2 js '1+1'` / `ema2 js 'return 6*7'` / `--file` | `2` / `42` / 文件结果 |
+| 13 | `ema2 observe network --since 0 --filter api` | 真实 status + body 预览 |
+| 14 | `ema2 observe network --har out.har` | `path=... entries=N`，HAR 可解析 |
+| 15 | `ema2 observe console --filter log-119` | 命中 console 行 |
+| 16 | `ema2 files upload <abs> --ref e8` | `uploaded=1`；`js` 能看到文件名 |
+| 17 | `ema2 files download-dir` | `download_dir_unsupported`，退出 4 |
+| 18 | `ema2 shot --out out.png` | `path=` + `bytes=`，文件存在 |
+| 19 | `ema2 shot --annotate --format jpeg` | 标注图落盘 |
+| 20 | `ema2 shot --inline` | `data:image/png;base64,...` |
+| 21 | `ema2 batch read --urls "u1,u2"` | 两块，`---` 分隔，各自 `tab=` |
+| 22 | `ema2 batch open --urls "u1,u2"` | 并行开页，各自 `id=` |
+| 23 | `ema2 act --steps 'fill e2 "a"; type e2 "b"'` | 两步；type 追加 |
+| 24 | `ema2 act --script flow.ema2` | 逐行执行，`waitFor` 挂在整体 |
+| 25 | `ema2 open url --replace` / `--reuse session` / `--tab ID` | `reuse=replace/session/tabId` |
+| 26 | `ema2 tabs close --session` | 只关本会话 `open`/`tabs new` 的标签 |
+| 27 | `ema2 init` | `path=... action=created`；重复执行 `action=updated`，标记只有一份 |
+| 28 | `ema2 server stop` → `ema2 status` | `relay=stopped`；status 退出 2 |
 
-## 4. 真实站点冒烟（用户自己的 Edge）
+错误路径：
 
-自动化测试跑在临时 profile 里，覆盖不到「用户真实登录态 + 真实站点」的水合、懒加载、
-反爬和长 URL。`scripts/live-check.py` 补这一层：它直连正在运行的中继，对维基 / GitHub /
-HN / 京东 / Bing 各跑一轮，断言快照结构、ref 句柄、act 解析、batch 复合与截断续读。
+| 场景 | 期望 |
+|---|---|
+| 中继没起时 `ema2 tabs` | `error=relay_not_running`，退出 2 |
+| 中继在、扩展没连时 `ema2 tabs` | `error=extension_not_connected`，退出 3 |
+| 7744 被别的服务占用时 `ema2 server` | `error=port_in_use`，退出 2，不换端口 |
+| `ema2 act type e15`（缺文本） | `error=invalid_argument`，退出 1 |
+| `ema2 act click <disabled>` | `error=element_disabled`，退出 4 |
+| `ema2 act click <旧完整 ref>` | `error=stale_ref`，退出 4 |
+| `ema2 files download-dir` | `error=download_dir_unsupported`，退出 4 |
 
-```bash
-scripts\start-bridge.cmd          # 先确保中继在跑、扩展已连接
-python scripts/live-check.py      # 59 项断言，约 2~3 分钟
-```
+## 开发注意
 
-- 只做只读动作（`hover` / `read` / `snapshot`），结束时 `tabs close scope=session` 关掉自己开的标签
-- 令牌自动从中继状态文件读，无需参数；`EDGE_MCP_URL` 可指向别的端口
+- 扩展是普通 MV3 service worker。改完 `extension/` 后在 `edge://extensions/`
+  点“重新加载”；如果 Edge 仍用旧脚本，把 `extension/manifest.json` 的
+  `version` 加一，或换一个全新 `--user-data-dir`（Edge 按 manifest 版本缓存扩展脚本）。
+- 页面 helper 有版本号（`__ema2_helpers_version`）。改 helper 行为时同步加一，
+  否则已经打开的页面会继续用旧 helper。
+- 截图要求目标 tab 是活动 tab 且窗口可见；连续截图注意 Chromium 的
+  `MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND` 配额。
+- 观察网络/hook 只能看到 hook 安装之后的请求；`act waitFor` 对安装前的历史请求
+  会明确给 `observation_gap=status_unavailable`。
+- 验收结束：
 
-## 5. 真实 Edge/MV3 验收
-
-`tests/integration/edge-acceptance.cjs` 使用**独立临时 user-data-dir** 启动真实 Edge，
-加载 `extension/` 解包扩展，并连接一个临时端口、临时 `EDGE_MCP_STATE_DIR` 的 `bin/ema2.exe`。
-中继以「待授权态」启动，扩展通过真实的 `pairWithRelay()` 完成配对后再跑后续场景。它不会附着到用户日常
-Edge profile，也不会使用用户登录态。
-
-已执行环境：
-
-```text
-Microsoft Edge 155.0.4283.62
-EMA2 relay 1.11.0
-Windows, 可见隔离窗口（用于 captureVisibleTab）
-```
-
-22 个场景全部通过：
-
-1. `open` / `snapshot` / `doc=` ref
-2. F02 密码脱敏
-3. F09 Markdown 混合文本
-4. F10 disabled/readonly/unsupported/动态移除
-5. F13 press 定位目标与活动焦点
-6. F01 真实流式 fetch 不被 preview 阻塞（headers ≈ 3ms）
-7. P2-4 慢响应（3s 不发 body）被标为 `streaming=1` + `pending=<n> seqs=...`，水位继续前进
-8. F07 network 100 条分页 + HAR 落盘
-9. F07 console 120 条分页
-10. F03 导航 / 同 URL reload / 跨 tab stale ref
-11. F11 跨导航 `waitFor` 命中新文档 `/api/save`
-12. F12 batch 内层 `time=3600` 拒绝
-13. F08 8 tab × 4s、concurrency=1 分波执行（32s，旧预算会提前失败）
-14. F05 永不 resolve 的 JS 超时释放 debugger，下一次 `js` 成功
-15. F06 后台 tab 截图拒绝，活动 tab 截图 + annotate 成功
-16. files 真实 `DOM.setFileInputFiles` 上传
-17. P1-1 真实 WS 断开/重连时，`GET /mcp` 的 SSE 收到 disconnected + connected 通知，
-   重连后工具仍可用
-18. P0-1 token 模式对 `/mcp` 返回 401/200
-19. F04 真实 `bridge.ps1` status/stop/start + 扩展重连
-20. 配对：全新中继（无 token）→ 扩展真实 `pairWithRelay()` → token 落盘 →
-    `?token=` 重连并通过 HMAC 验签 → `tools/call` 成功 → 授权页列出 5 个终端；
-    隔离 HOME 里的 opencode `.jsonc`（含注释）、Claude Code、Codex TOML、Pi、Claude Desktop
-    全部按真实格式写入且保留原有键
-21. 取消勾选：只保留 opencode → Pi 的 `edge-browser` 条目被移除、`.bak` 刷新为移除前内容，
-    opencode 条目保留，`/pair/status` 里 Pi 的 `selected=false`
-22. install：从真实 Edge profile 的 `Preferences` 识别已加载的解包扩展，原地覆盖更新；
-    扩展离线时说明“下次启动生效”，随后在 75s 内自动重连
-
-> 隔离 profile 首次启动时，Edge 偶发不保留解包扩展的 service worker。runner 会在
-> 45s 内没有可配置的 worker 时换一个全新 profile 重试一次（日志打印 `relaunching Edge`），
-> 避免把浏览器环境抖动误判成产品缺陷。
-
-仍有必要继续做实机验证的边界：
-
-- 同源 iframe / open shadow root 的定位与 iframe marks 坐标偏移
-- DevTools 抢占 debugger 的交互路径
-- 多个 MCP 客户端同时调用
-- 大文件下载、超慢 body、跨域 iframe
-- 下载目录设置与不同 Edge 版本差异
-- 候选包哈希、安装目录与长期运行的版本一致性
-
-## 6. 当前已执行结果（2026-10-20）
-
-```text
-cargo test --locked --offline                         98 passed
-cargo clippy --locked --all-targets -- -D warnings    passed
-cargo fmt --check                                     passed
-node --test tests/*.test.cjs                          45 passed
-bridge.ps1 -SelfTest                                  passed
-foreign listener stop/start protection test           passed
-cargo build --release --locked --offline              passed
-真实 Edge/MV3 验收                                      22/22 scenarios passed
-```
-
-发布候选：
-
-```text
-rust/target/release/ema2.exe
-version=1.12.1
-sha256=c28acee0f91351852d4e10db85d830a0f5690437a5524a00bec1c1789b3cc311（Windows release）
+```powershell
+bin\ema2.exe tabs close --session
+bin\ema2.exe server stop
 ```

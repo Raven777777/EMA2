@@ -1,0 +1,8 @@
+# 登录 / 表单：把 ref 换成 snapshot 返回的实际值
+fill e15 "user@example.com"
+fill e16 "correct horse battery staple"
+select e20 "zh-CN"
+click e30
+waitFor url=api/login status=200 timeout=10s
+
+# 页面跳转后重新 snapshot，旧 ref 会 stale_ref

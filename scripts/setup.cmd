@@ -1,5 +1,5 @@
 @echo off
-rem Build the EMA2 Rust relay and copy the release exe to bin\.
+rem Build the EMA2 Rust daemon/CLI and copy the release exe to bin\.
 rem Requires cargo on PATH, or set EMA2_CARGO to the full cargo executable path.
 setlocal
 
