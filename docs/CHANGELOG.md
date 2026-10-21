@@ -1,6 +1,6 @@
 # 变更记录
 
-## 未发布 — guard 生命周期加固
+## 未发布 — guard 生命周期加固与 AGENTS 模板更新
 
 - **释放不再卡死**：每 tab 的 `disarm()` 有单独时限，整批 sweep 有总上限；
   卡在原生对话框/死循环里的渲染进程不会让后续命令永久排队。
@@ -32,6 +32,10 @@
 - **验收**：`cargo test` 80 passed；clippy/fmt 通过；真实前台 Edge 113 checks
   passed；额外验证 `--submit` 真实提交、HAR 默认脱敏/`--headers all` 与
   `wait idle` 位置参数。
+- **AGENTS.md 模板更新**：`rust/assets/AGENTS.md` 同步到当前 CLI 契约，补齐最小流程、
+  全局协议、命令签名、默认值/副作用、Must/Never 与错误码动作；新增 `server` 后
+  首次 `status` 的等待提示、`read` fallback 的 selector/付费墙处理，以及
+  `batch read --tab-ids` 多标签读正文。仅文档，不影响 CLI/扩展行为。
 
 ## v2.4.1.1 — guard 仅命令期启用，补齐目标与默认值
 
