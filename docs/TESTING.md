@@ -28,7 +28,7 @@
 
 ```bash
 cd rust
-cargo test                          # 74 项：参数校验、超时预算、脚本解析、路由、落盘
+cargo test                          # 80 项：参数校验、超时预算、脚本解析、路由、落盘
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

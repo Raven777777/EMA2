@@ -200,6 +200,112 @@ FIXTURE_VISIBLE = """<!doctype html>
 """
 
 
+FIXTURE_CONTENTS = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture contents</title></head>
+<body>
+<h1>Contents Fixture</h1>
+<div class="content" style="display:contents">
+<p>contents paragraph alpha is wrapped by a display:contents container and must still be readable.</p>
+<p>contents paragraph beta keeps extra filler so the block reaches real article length.</p>
+</div>
+</body></html>
+"""
+
+FIXTURE_LANDMARK = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture landmark</title></head>
+<body>
+<header role="banner"><div>banner strip text skipzone</div></header>
+<article>
+<header><h1>Landmark Article Title</h1><p>article header lead text stays inside the article shell</p></header>
+<p>article body paragraph with enough words to dominate the page text budget.</p>
+</article>
+<footer role="contentinfo">contentinfo strip text skipzone</footer>
+</body></html>
+"""
+
+FIXTURE_BR = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture br</title></head>
+<body><h1>Br Fixture</h1><p id="brp">line alpha<br>line beta</p></body></html>
+"""
+
+FIXTURE_BADLINK = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture badlink</title></head>
+<body><h1>Badlink Fixture</h1>
+<p><a id="jslink" href="/second.html"><script>var leakme = 1;</script></a>tail text stays</p>
+<p><a id="fraglink" href="#anchorname"></a><a id="imglink" href="/second.html"><img src="/big.bin" alt="Fix Logo"></a></p>
+</body></html>
+"""
+
+FIXTURE_BUTTONS = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture buttons</title></head>
+<body><h1>Buttons Fixture</h1>
+<span class="sr" style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;border:0;clip:rect(0 0 0 0);overflow:hidden">sr only label uniqbeta</span>
+<button id="save" type="button">Save Now uniqbeta</button>
+<div id="rolev" role="button">Share Prev uniqbeta</div>
+<p>ordinary body paragraph uniqbeta</p>
+</body></html>
+"""
+
+FIXTURE_EMPTY = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture empty</title></head>
+<body></body></html>
+"""
+
+FIXTURE_LOGIN = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Sign in to ExampleCorp</title></head>
+<body>
+<h1>Sign in</h1>
+<form id="login">
+<input id="user" name="user" type="text" autocomplete="username">
+<input id="pass" name="pass" type="password" autocomplete="current-password">
+<button type="submit">Sign in</button>
+</form>
+</body></html>
+"""
+
+FIXTURE_CHALLENGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Just a moment...</title></head>
+<body>
+<div id="challenge-form">Confirm you are human to continue</div>
+</body></html>
+"""
+
+FIXTURE_BLOCKS = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture blocks</title></head>
+<body><h1>Blocks Fixture</h1>
+<h5>H5 Heading Random Five</h5>
+<h6>H6 Heading Random Six</h6>
+<center>centered text Random Mode</center>
+<dl><dt>Term Alpha</dt><dd>Definition Alpha carries the meaning</dd><dt>Term Beta</dt><dd>Definition Beta adds detail</dd></dl>
+<details open><summary>Details Summary Label Opened</summary><p>collapsed details body stays</p></details>
+<details><summary>Details Summary Label Closed</summary><p>hidden details body is excluded</p></details>
+<my-block><p>custom element body stays visible</p></my-block>
+<table id="outer"><tbody><tr><td>outer cell one</td></tr><tr><td>outer cell two<table><tbody><tr><td>inner cell alone</td></tr></tbody></table></td></tr></tbody></table>
+</body></html>
+"""
+
+
+def fixture_pdf() -> bytes:
+    """最小合法 PDF（fixture 用）；offset 按 PDF 规范精确计算。"""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{index} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref_at = len(out)
+    out += b"xref\n0 4\n"
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n" + str(xref_at).encode() + b"\n%%EOF\n"
+    return bytes(out)
+
+
 class FixtureHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):  # 静默：验收输出只留 PASS/FAIL
         return
@@ -239,6 +345,26 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._send(FIXTURE_BUGS.encode())
         elif path == "/visible.html":
             self._send(FIXTURE_VISIBLE.encode())
+        elif path == "/contents.html":
+            self._send(FIXTURE_CONTENTS.encode())
+        elif path == "/landmark.html":
+            self._send(FIXTURE_LANDMARK.encode())
+        elif path == "/br.html":
+            self._send(FIXTURE_BR.encode())
+        elif path == "/badlink.html":
+            self._send(FIXTURE_BADLINK.encode())
+        elif path == "/buttons.html":
+            self._send(FIXTURE_BUTTONS.encode())
+        elif path == "/empty.html":
+            self._send(FIXTURE_EMPTY.encode())
+        elif path == "/login.html":
+            self._send(FIXTURE_LOGIN.encode())
+        elif path == "/challenge.html":
+            self._send(FIXTURE_CHALLENGE.encode())
+        elif path == "/blocks.html":
+            self._send(FIXTURE_BLOCKS.encode())
+        elif path == "/report.pdf":
+            self._send(fixture_pdf(), "application/pdf")
         elif path == "/idle.html":
             self._send(FIXTURE_IDLE.encode())
         elif path == "/slow":
@@ -430,7 +556,7 @@ def main() -> int:
 
     try:
         version = runner.run("--version")
-        runner.expect_ok("binary exposes product version", version, "2.4.1.1")
+        runner.expect_ok("binary exposes product version", version, "2.4.2.0")
 
         opened = runner.expect_ok("open fixture", runner.run("open", f"{base}/"), "status=200", "net_hook=on", "title=ema2 fixture home")
         tab_match = re.search(r"^id=(\d+)", opened, re.M)
@@ -558,6 +684,11 @@ def main() -> int:
         )
 
         md = runner.expect_ok("read md", runner.run("read", "--mode", "md", "--no-main"), "Fixture Home")
+        runner.check(
+            "read header carries http and content_type",
+            "http=200" in md and "content_type=text/html" in md,
+            md[:800],
+        )
         runner.check("md keeps links", re.search(r"\]\(http[^)]+second\.html\)", md) is not None, md[:600])
         runner.check("md keeps table", "| key | value |" in md and "| alpha | 1 |" in md, md[:600])
         runner.check("md keeps list", "- one" in md and "- two" in md, md[:400])
@@ -816,6 +947,175 @@ def main() -> int:
             "clean text still excludes nav",
             clean_text.returncode == 0 and "Visible Main" in clean_out and "nav-only-text" not in clean_out,
             clean_out[:800],
+        )
+
+        # ---- P0 read：可见性 / 地标 / 块模型 / 链接 / 噪声 / 页面状态 fixtures ----
+        runner.run("open", f"{base}/contents.html")
+        contents_read = runner.run("read", "--no-main", "--mode", "text")
+        contents_out = (contents_read.stdout or "") + (contents_read.stderr or "")
+        runner.check(
+            "read keeps display:contents subtrees (--no-main)",
+            contents_read.returncode == 0
+            and "contents paragraph alpha" in contents_out
+            and "contents paragraph beta" in contents_out,
+            contents_out[:1200],
+        )
+        contents_main = runner.run("read", "--mode", "md")
+        runner.check(
+            "read default main also keeps display:contents",
+            contents_main.returncode == 0 and "contents paragraph alpha" in (contents_main.stdout or ""),
+            (contents_main.stdout or "")[:1200],
+        )
+
+        runner.run("open", f"{base}/landmark.html")
+        landmark_md = runner.run("read", "--mode", "md")
+        landmark_out = (landmark_md.stdout or "") + (landmark_md.stderr or "")
+        runner.check(
+            "read keeps article header and skips page banner/contentinfo",
+            landmark_md.returncode == 0
+            and "Landmark Article Title" in landmark_out
+            and "article header lead text" in landmark_out
+            and "skipzone" not in landmark_out,
+            landmark_out[:1200],
+        )
+
+        runner.run("open", f"{base}/br.html")
+        br_md = runner.run("read", "--mode", "md", "--no-main")
+        runner.check(
+            "md renders <p>a<br>b</p> as two lines",
+            re.search(r"line alpha\nline beta", br_md.stdout or "") is not None,
+            ((br_md.stdout or "") + (br_md.stderr or ""))[:600],
+        )
+
+        runner.run("open", f"{base}/badlink.html")
+        badlink_md = runner.run("read", "--mode", "md", "--no-main")
+        badlink_out = (badlink_md.stdout or "") + (badlink_md.stderr or "")
+        runner.check(
+            "read never leaks inline script text from links",
+            "leakme" not in badlink_out and badlink_out.count("var ") == 0,
+            badlink_out[:1000],
+        )
+        runner.check(
+            "empty-text links are dropped without bare urls",
+            "#anchorname" not in badlink_out,
+            badlink_out[:1000],
+        )
+        runner.check(
+            "image links use the img alt as their label",
+            "[Fix Logo](http" in badlink_out and "tail text stays" in badlink_out,
+            badlink_out[:1000],
+        )
+
+        runner.run("open", f"{base}/buttons.html")
+        buttons_md = runner.run("read", "--mode", "md", "--no-main")
+        buttons_out = (buttons_md.stdout or "") + (buttons_md.stderr or "")
+        runner.check(
+            "read skips sr-only 1x1 spans and buttons",
+            "sr only label uniqbeta" not in buttons_out
+            and "Save Now uniqbeta" not in buttons_out
+            and "Share Prev uniqbeta" not in buttons_out,
+            buttons_out[:1200],
+        )
+        runner.check(
+            "read keeps the ordinary paragraph",
+            "ordinary body paragraph uniqbeta" in (buttons_md.stdout or ""),
+            buttons_out[:1200],
+        )
+        buttons_snapshot = runner.run("snapshot")
+        runner.check(
+            "snapshot still exposes buttons that read skips",
+            "Save Now uniqbeta" in (buttons_snapshot.stdout or ""),
+            (buttons_snapshot.stdout or "")[:1200],
+        )
+
+        runner.run("open", f"{base}/blocks.html")
+        blocks_md = runner.run("read", "--mode", "md", "--no-main")
+        blocks_out = (blocks_md.stdout or "") + (blocks_md.stderr or "")
+        runner.check(
+            "read keeps h5/h6 headings and center blocks",
+            "##### H5 Heading Random Five" in blocks_out
+            and "###### H6 Heading Random Six" in blocks_out
+            and "centered text Random Mode" in blocks_out,
+            blocks_out[:1600],
+        )
+        runner.check(
+            "read splits dt/dd and details blocks",
+            "Term Alpha" in blocks_out
+            and "Definition Alpha carries the meaning" in blocks_out
+            and "Details Summary Label Opened" in blocks_out
+            and "collapsed details body stays" in blocks_out
+            and "custom element body stays visible" in blocks_out
+            and "hidden details body is excluded" not in blocks_out,
+            blocks_out[:1600],
+        )
+        runner.check(
+            "read outer table ignores nested table rows",
+            "outer cell one" in blocks_out
+            and "outer cell two" in blocks_out
+            and blocks_out.count("inner cell") == 1,
+            blocks_out[:1600],
+        )
+
+        runner.run("open", f"{base}/empty.html")
+        runner.expect_error(
+            "read empty page reports empty_page",
+            runner.run("read", "--mode", "md"), "empty_page", 4,
+        )
+        visible_empty = runner.run("read", "--mode", "visible")
+        runner.check(
+            "read visible empty keeps its hint",
+            visible_empty.returncode == 0 and "visible text is empty" in (visible_empty.stdout or ""),
+            ((visible_empty.stdout or "") + (visible_empty.stderr or ""))[:800],
+        )
+
+        runner.run("open", f"{base}/login.html")
+        login_read = runner.run("read", "--mode", "md")
+        login_out = (login_read.stdout or "") + (login_read.stderr or "")
+        runner.check(
+            "read reports login walls as state, not error",
+            login_read.returncode == 0
+            and "state=login_required" in login_out
+            and "http=200" in login_out
+            and "snapshot" in login_out,
+            login_out[:1000],
+        )
+
+        runner.run("open", f"{base}/challenge.html")
+        challenge_read = runner.run("read", "--mode", "md")
+        challenge_out = (challenge_read.stdout or "") + (challenge_read.stderr or "")
+        runner.check(
+            "read reports challenge pages as state, not error",
+            challenge_read.returncode == 0
+            and "state=challenge" in challenge_out
+            and "re-run read" in challenge_out,
+            challenge_out[:1000],
+        )
+
+        notfound_open = runner.run("open", f"{base}/missing-page-404.html")
+        notfound_out = (notfound_open.stdout or "") + (notfound_open.stderr or "")
+        runner.check(
+            "open 404 still succeeds and reports status=404",
+            notfound_open.returncode == 0 and "status=404" in notfound_out,
+            notfound_out[:800],
+        )
+        runner.expect_error(
+            "read 404 page reports page_error",
+            runner.run("read", "--mode", "md"), "page_error", 4,
+        )
+
+        pdf_open = runner.run("open", f"{base}/report.pdf")
+        pdf_match = re.search(r"^id=(\d+)", (pdf_open.stdout or "") + (pdf_open.stderr or ""), re.M)
+        runner.check(
+            "open pdf reaches the viewer",
+            pdf_open.returncode == 0 and pdf_match is not None,
+            ((pdf_open.stdout or "") + (pdf_open.stderr or ""))[:800],
+        )
+        pdf_read = runner.run("read", "--mode", "md", *( ["--tab", pdf_match.group(1)] if pdf_match else [] ))
+        pdf_out = (pdf_read.stdout or "") + (pdf_read.stderr or "")
+        runner.check(
+            "read on pdf reports pdf_page",
+            pdf_read.returncode == 4 and "error=pdf_page" in pdf_out,
+            pdf_out[:1200],
         )
 
         # ---- bin/BUGREPORT.md regressions ----

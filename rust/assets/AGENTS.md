@@ -44,7 +44,7 @@ ema2 server stop            # 收尾：关 daemon
 | `ema2 init` | 在当前目录写/更新本文件 |
 | `ema2 tabs [list\|current\|new\|close\|activate]` | 标签页；`tabs new` **默认激活并聚焦窗口**，`--background` 才后台 |
 | `ema2 open <url> [--tab ID\|--replace\|--reuse session] [--wait load\|dom\|none] [--timeout 15]` | 打开/导航；输出 `id/url/title/status/reuse/net_hook/focused` |
-| `ema2 read [--tab ID] [--mode md\|text\|html\|visible] [--selector X] [--no-main] [--budget N] [--cursor N]` | 读正文；默认 `--main` 开 |
+| `ema2 read [--tab ID] [--mode md\|text\|html\|visible] [--selector X] [--no-main] [--budget N] [--cursor N]` | 读正文；默认 `--main` 开。登录/验证页输出 `state=login_required\|challenge`（exit 0），空页/PDF/HTTP 404 报错（exit 4） |
 | `ema2 snapshot [--tab ID] [--filter interactive\|full\|links\|buttons\|form] [--near REF] [--budget N] [--cursor N] [--values]` | ref 快照；`[e12@d1] button "X"`，href 是完整 URL |
 | `ema2 act <action> [ref] [text] [flags] [--tab ID]` / `--steps` / `--script x.ema2` | 单步或脚本；不强制切换活动标签 |
 | `ema2 await [10s] [--tab ID]` | 等**上一个 act 所在标签**的导航/页面稳定；缺省 3s，范围 0–300s |
@@ -156,6 +156,9 @@ Never：
 | `debugger_attach_failed` | 先重载该 tab；`ema2 js` 自动降级（看 `via=scripting`） |
 | `debugger_timeout` / `debugger_busy` | 终止长任务后重试 |
 | `internal_page` | `edge://` 等内置页不可脚本化；换 http(s) |
+| `empty_page` | `read` 整页 md/text 0 字符；`wait idle`/`wait selector` 后重试，或 `shot --annotate` |
+| `page_error` | HTTP ≥400（404/403/5xx）；核对 url 或换页面 |
+| `pdf_page` | PDF 不做文本提取；开 html 版本，或让用户保存后用文件工具读 |
 | `download_dir_unsupported` | Edge 不允许扩展改下载目录；文件进默认下载目录 |
 
 ## 端口错配诊断

@@ -1,6 +1,47 @@
 # 变更记录
 
-## 未发布 — guard 生命周期加固与 AGENTS 模板更新
+## v2.4.2 — read 正文质量与页面状态
+
+这版只改 `read` 的提取质量与状态语义；paywall 检测、PDF 抽文本、OCR、站点适配器仍明确不做。
+
+- **可见性（P0-A）**：`display:contents` 没有自己的盒，Edge 的 checkVisibility 判 false 但子树照常渲染；
+  read 视为可见并继续遍历（Substack/MDN 的被包裹正文不再整段丢失）。1×1 / clip(0) 的 sr-only 元素按隐藏过滤。只影响 read 的 md/text 遍历；snapshot/click 的可见性判断不变。
+- **地标壳（P0-B）**：`nav`/`form` 永久跳过；`header`/`footer`/`aside` 在
+  `role=banner/contentinfo/complementary` 时跳过，其余只有在「不在 article/main/[role=main] 内
+  且无 h1–h6 后代」时才跳过。`article > header > h1` 保留；Guardian 首页这类页面级 header 不再只剩标题。
+  `section` 不算正文容器语境。
+- **块模型（P0-C）**：`<br>` 按块边界换行（`<p>a<br>b</p>` 输出两行）；H1–H6 全部按标题渲染；
+  `center`、`dt`/`dd`、`details`/`summary`、自定义元素（tag 含 `-`）都按块展开；
+  `table.rows` 只取本表行，嵌套表不再被拍平进 host 单元格（HN 首页的 3000+ 字符长线消失）：
+  含嵌套表的 td 只保留自己的文字，嵌套表作为独立表格块跟在当前表后面输出（WeakSet 防深嵌套重复）。
+  收起的 `<details>` 内容仍是隐藏状态、不进入 md（fixture 同时覆盖 open 与 collapsed 两种）。
+- **链接（P0-D）**：标签只用 `innerText`（`<a><script>…</script></a>` 不再泄漏 JS）；
+  空文本链接默认不输出、不产生裸 URL；fragment-only 且空文本才降级；带图链接用图片 alt。
+  非空 fragment 链接不降级；不新增 `--links` 参数。
+- **噪声（P0-E）**：`BUTTON`、`[role=button]` 不进入正文；sr-only 只在 read 跳过。
+  snapshot/click 的可见性判断不受影响；糟糕的 Save/Share 按钮块不再挤进正文预算。
+- **页面状态（P0-F）**：read 头部新增 `http=`/`content_type=`（主文档真实值）；
+  `empty_page`/`pdf_page`/`page_error` 报错（exit 4，不再"0 字却 exit 0"）；
+  `login_required`/`challenge` 输出 `state=` + hint 且 **exit 0**（不是错误，也不伪装成正文）。
+  **本期不检测 paywall**：不读 JSON-LD、不加订阅标记、不输出 `paywall=`。
+  state/empty 只约束 md/text 整页读取；`--selector` 子树允许为空；`--mode html` 只有 pdf 报错。
+- **真机 fixtures**：verify.py 新增 display:contents、article>header、`<br>` 换行、
+  链接脚本泄漏/空文本链接/图片链接、sr-only+按钮噪声、h5/h6+dl+details+center+自定义元素+
+  嵌套表、空页、PDF、404、login、challenge 共 11 个 fixture 页与断言。
+- **验收**：`cargo test` 全过 80 用例、`scripts/verify.py` 真机检查 135 项全过（含新增 fixtures）；
+  38 页复测：0 个「0 字却 exit 0」（唯一 total=0 的页面是 Stack Overflow 人机验证页，按设计输出
+  `state=challenge` + hint 且 exit 0）；js/sr-only 泄漏 0；空链接裸 URL 0；md 超长单行 0（HN 修复后）；
+  Substack/MDN `--no-main` 正常恢复整页；Guardian 首页 59,207 字符正文完整保留。
+  性能：8k 元素 fixture 页 `read --mode md` 用时 32.8ms（同页 v2.4.1 基线 25.7ms，1.28×），
+  `plainText` 1.34×、`mainRoot` 1.30×，均在 ≤1.5× 约束内；新增可见性判定带来的
+  per-element `getBoundingClientRect`/`checkVisibility` 成本如预期。
+- version/extension 陷阱已写入 HANDOFF：`executeScript({func})` 注入的是被序列化
+  的单函数，引用后台顶层函数会 ReferenceError；Edge 对注入函数内的抛错不 reject
+  而是 `result=undefined`（曾误报 helpers_missing）；现在 readPageContent 内部
+  try/catch 把异常带回，readTool 映射为已有错误码 `js_exception`。
+- 版本：对外产品/扩展 `2.4.2.0`；Cargo crate metadata `2.4.2`；helper 升至 **20**。
+
+## v2.4.2-pr1 — guard 生命周期加固与 AGENTS 模板更新
 
 - **释放不再卡死**：每 tab 的 `disarm()` 有单独时限，整批 sweep 有总上限；
   卡在原生对话框/死循环里的渲染进程不会让后续命令永久排队。

@@ -5,9 +5,9 @@
 ## 当前版本
 
 ```text
-exe        2.4.1.1（Cargo crate metadata 仍为 SemVer 2.4.1）
-extension  2.4.1.1
-helper     19
+exe        2.4.2.0（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.2.0
+helper     20
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
@@ -98,7 +98,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前 Rust 测试：**74 passed**。
+当前 Rust 测试：**80 passed**。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -140,10 +140,17 @@ cargo test
 ### read
 
 - `text` / `md` 跳过 script/style/noscript/template/textarea/input/select/option、
-  nav/header/footer/aside/form，以及 `display:none` / `visibility:hidden` / `content-visibility` 元素；
-  两者共用一次 block/inline 遍历，只是 renderer 不同
+  nav/form，以及 `display:none` / `visibility:hidden` / `content-visibility` 元素；
+  header/footer/aside 只有在 `role=banner/contentinfo/complementary`，或不在
+  `article/main/[role=main]` 且无标题后代时跳过；两者共用一次 block/inline 遍历，只是 renderer 不同
+- `display:contents` 对 read 视为可见（子树照常渲染就继续遍历）；BUTTON / [role=button] /
+  1×1 sr-only 不进入正文；这些都只影响 read，不影响 snapshot/click
+- 空文本链接不输出裸 URL；链接标签只用 innerText（带图用 alt）
 - `html` 保持 `root.innerHTML`；`visible` 直接取 `root.innerText`，不跑清洁遍历，
   但同样复用 main/selector/no-main 选区
+- 整页 md/text 为空 → `empty_page`；HTTP ≥400 → `page_error`；PDF → `pdf_page`（均 exit 4）；
+  登录墙 → `state=login_required`，人机验证 → `state=challenge`（`state=` + hint，exit 0）；
+  头部始终带 `http=` / `content_type=`；**不检测 paywall**
 - main 太短（<200 字符，或 body>2000 且候选 <body 5%）回退 `main=body(fallback)` 并给 hint
 - 被截断必须给 `next` 和 cursor hint
 
@@ -218,7 +225,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 ## 开发陷阱
 
 1. **修改页面 helper 必须提升 `__ema2_helpers_version`**
-   当前是 18；否则已打开页面继续用旧 helper。
+   当前是 20；否则已打开页面继续用旧 helper。
 
 2. **Edge 会按 manifest 版本缓存扩展脚本**
    行为没更新时提升 `extension/manifest.json` 版本，或在 `edge://extensions` 重新加载；
@@ -240,7 +247,8 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
    连续截图注意 `MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND`。
 
 8. **真实站点有反自动化**
-   携程结果页、去哪儿首页可能不渲染；换站点或外部脚本，不要为单站加适配器。
+   携程结果页、去哪儿首页可能不渲染；apnews.com 首页的后台脚本会让主线程长时间
+   忙碌（连 `return 1+1` 都注入超时）；换站点或外部脚本，不要为单站加适配器。
 
 9. **page guard 只能存在于命令租约内**
    不要在 manifest 恢复静态 `content_scripts`；否则普通浏览的弹窗会再次被拦截。
@@ -248,13 +256,20 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
    修改 wrappers/restore 逻辑时提升 `page_guard.js` 的 `GUARD_VERSION`；修改清理协议时
    同时提升 background.js 的 `ema2_guard_protocol`。
 
+10. **`executeScript({func})` 的两个坑（v2.4.2 read 踩过）**
+    a. 注入的 func 是**被序列化的单函数**，后台顶层函数不存在于注入环境：
+       `readPageContent` 引用 `readPageContentInner` 直接 ReferenceError。注入入口必须自包含。
+    b. Edge 对 func 注入内的抛错**不 reject**，结果是 `result=undefined`：
+       `readTool` 曾把它误报成 `helpers_missing`。页面内大函数要自己 try/catch
+       把异常带回（现在 readPageContent 从 `page_exception` 映射成 `js_exception`）。
+
 ## 下一位维护者的第一步
 
 1. 读 [PHILOSOPHY.md](PHILOSOPHY.md)
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
 4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
-5. `python scripts/verify.py` —— 113 项真机检查，跑不过就别改行为
+5. `python scripts/verify.py` —— 135 项真机检查，跑不过就别改行为
 6. 打开一个真实网站，跑 `open → snapshot → act → read`
 7. 修改行为前先问：这是通用原语，还是网站特例？
 8. 任何动作相关改动，必须真机验证“成功就是真的成功”

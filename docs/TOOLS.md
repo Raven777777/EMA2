@@ -128,6 +128,9 @@ total=2 shown=2 next=none
 | `debugger_attach_failed` | 无法挂 debugger（DevTools 或其他扩展占用该 tab） | `js` 会自动降级（看 `via=scripting`）；否则重载该 tab |
 | `debugger_timeout` / `debugger_busy` | JS 执行或队列等待超期 | 终止长任务后重试 |
 | `internal_page` | 内置页（edge:// 等）不可脚本化 | 换 http(s) 页面 |
+| `empty_page` | `read` 的整页 md/text 一个字都没提取到 | 页面可能还在加载；`ema2 wait idle` 或 `wait selector` 后重试；canvas/PDF 类页面用 `shot --annotate` |
+| `page_error` | 目标页面 HTTP 状态 ≥400（404/403/5xx 等） | 核对 url；拿不到正文就换页面 |
+| `pdf_page` | 目标是 PDF 文档，read 无法抽文本 | 打开 html 版本；或让用户保存后用文件工具读 |
 | `download_dir_unsupported` | Edge 不允许扩展改下载目录 | 文件会进默认下载目录 |
 
 ## 服务管理
@@ -252,16 +255,58 @@ ema2 read [--tab ID] [--mode md|text|html|visible] [--selector X] [--no-main] [-
 - 正文容器太短（<200 字符，或不到 body 的 5%）时回退 `main=body(fallback)`，并给
   `hint=main extraction too short (...); fell back to body`。
 - `--selector` 优先于 `--main`，支持 shadow DOM / 同源 iframe 内的元素。
-- `text`/`md` 会跳过 `script/style/noscript/template/textarea/input/select/option`、
-  nav/header/footer/aside/form 等页面壳，以及 `display:none`/`visibility:hidden`/
-  `content-visibility` 的隐藏元素；`html` 仍是原始 HTML。
+- `text`/`md` 会跳过 `script/style/noscript/template/textarea/input/select/option`，以及
+  `display:none`/`visibility:hidden`/`content-visibility` 的隐藏元素；地标壳的跳过规则见下。
+  `html` 仍是原始 HTML。
 - `visible` 直接返回所选 root 的 `innerText`：不跳过导航/页脚/表单等页面壳，也不做
   Markdown/正文清洗；默认仍走 `main`，`--no-main` 读整页，`--selector` 读子树。
   它读的是**渲染文本**（包含滚动到视口外的已渲染内容），不是严格视口内文本；
   Edge 原生 PDF 查看器、canvas 和跨域 iframe 仍读不到。`text`/`md` 的内部遍历已合并，
   `visible` 和 `html` 是独立的提取路径。
 - 正文遍历会进入 open shadow root（Web Component）；closed shadow root 仍不可见。
-- Markdown 按 `childNodes` 遍历，根节点直接文本、p/h1/pre、文本+块混排都不会漏字或重复。
+
+### 页面状态（login / challenge / pdf / 404 / 空页）
+
+read 头部现在总是带 `http=`（主文档响应状态）与 `content_type=`（主文档 MIME）。
+
+| 情形 | 输出 | 退出码 |
+|---|---|---|
+| 一切正常读出正文 | 正文 + `total/shown/next`，头部按需要带 `main=` | 0 |
+| 登录墙（可见密码框 + 登录语义的 title/h1，且不是弹层） | `state=login_required` + `hint=`，不给伪装的正文 | **0** |
+| 人机验证（"Just a moment…" / `#challenge-form` / 验证文案） | `state=challenge` + `hint=` | **0** |
+| HTTP ≥ 400（404/403/5xx；md/text/visible） | `error=page_error`，错误信息带 `http=` 与 `content_type=` | 4 |
+| PDF 文档（MIME `application/pdf` 或 `.pdf` 文档） | `error=pdf_page`（不做 PDF 文本提取） | 4 |
+| 整页 md/text 一个字都没有（`--no-main` 也一样） | `error=empty_page` | 4 |
+
+- `state=login_required` / `state=challenge` 是**页面状态，不是错误**：按 exit 0 处理，
+  这样 AI 可以继续 `snapshot`/`act` 处理登录或验证；不要把这当成一次成功的正文读取。
+- **本期完全不检测 paywall**：不读 JSON-LD、不加订阅标记、不输出 `paywall=`。
+  NYT/WSJ/FT 这类页面仍会按普通页面返回公开可见的薄内容，AI 需要自己判断。
+- `--selector` 是显式子树请求：不做 state/empty 判定（子树允许为空），但 PDF 报错保留。
+- `--mode html` 是原始视图：只有 pdf 报错，其余状态/空页判定不适用。
+
+### 清洁遍历规则（md / text）
+
+- **可见性（read 专用）**：`display:contents` 没有自己的盒，但子树照常渲染——
+  只要它有自有文本或可见盒后代，就继续遍历（被它包裹的正文不再整段丢失）；
+  actionability（snapshot/click 的可见性判断）不变，`display:contents` 在 click 侧仍无 box。
+- **地标壳**：`nav`/`form` 永久跳过；`header`/`footer`/`aside` 在
+  `role=banner/contentinfo/complementary` 时跳过，其余只有在「不在 `article`/`main`/
+  `[role=main]` 内**且**没有 h1–h6 后代」时才跳过——`article > header > h1` 保留，
+  Guardian 首页这类把内容放进页面级 header 的站点也不会只剩一个标题。
+  `section` 不算正文容器语境。
+- **块模型**：`<br>` 按块边界换行（md/text 都是两行）；H1–H6 全部按标题渲染；
+  `center`、`dt`/`dd`（各成一段）、`details`/`summary`（summary 先单独一行）、
+  自定义元素（tag 含 `-`）都当作块展开；`table.rows` 只取本表行（嵌套表的行不进入外层表）。
+- **链接**：标签只用 `innerText`（textContent 会把 `<a><script>…</script></a>` 的
+  脚本泄漏进正文）；空文本链接默认不输出、**不产生裸 URL**（需要链接结构用 snapshot）；
+  只有 fragment-only 且空文本的链接才降级为空；带图链接用图片 `alt` 当标签。
+  非空文本的 fragment 链接保持 `[text](绝对URL)` 不降级。
+- **噪声**：`BUTTON`、`[role=button]` 与 1×1 / clip(0) 的 sr-only 元素不进入正文；
+  这些过滤只影响 read，snapshot/click 的可见性判断不受影响。
+
+- 正文容器太短时回退 body；Markdown 按 `childNodes` 遍历，根节点直接文本、p/h1/pre、
+  文本+块混排都不会漏字或重复。
 - `md` 是**有损**渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对URL)`，
   有序列表保留 `<ol start>` / `<li value>` / `reversed` 的编号；
   行内代码与 `strong/em` 保留；样式、合并单元格、脚本生成内容会丢，不要拿它当可回写的源文件。
@@ -270,7 +315,8 @@ ema2 read [--tab ID] [--mode md|text|html|visible] [--selector X] [--no-main] [-
 - `read --selector "#input"` 会返回控件当前值（input/textarea/select），不再总是 0 字符。
 - 尾部 `truncated=1` 明确表示还有内容；`--cursor` 是**字符偏移**，换 `--mode` 续读会错位，
   续读时保持同一个 mode（头部会回 `mode=`）。
-- 头部 `url/title[/main]` 和 `mode=md|text|html|visible`，正文，尾部 `total/shown/next`。
+- 头部 `url/title[/main][state?] http/? content_type?` 和 `mode=md|text|html|visible`，
+  正文，尾部 `total/shown/next`。
 - 四种 mode 共用 `--selector` / `--no-main` / 默认 `main` 的选区，以及 budget/cursor；
   换 mode 续读会错位，保持同一个 mode。
 - **被截断时尾部多一行** `hint=truncated: returned 4000 of 12345 chars; call read with --cursor 4000 to continue`：

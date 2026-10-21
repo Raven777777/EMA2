@@ -1604,7 +1604,7 @@ async function requireValidSelector(tabId, selector) {
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 19) {
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 20) {
     return { installed: false, handle: String(window.__ema2_doc_handle || '') };
   }
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
@@ -2039,17 +2039,58 @@ function installHelpers() {
     };
   };
 
-  /** 页面可见性：checkVisibility 能识别 display:none / visibility:hidden / content-visibility。 */
+  /**
+   * read 专用可见性（只影响 md/text 的清洁遍历；snapshot/click 的 visible() 不变，见 P0-A/P0-E）：
+   * - 隐藏元素（display:none / visibility:hidden / content-visibility）整棵跳过；
+   * - `display:contents` 没有自己的盒，Edge 的 checkVisibility 会判 false，但子树照常渲染：
+   *   它有自有文本或可见盒后代时就继续遍历，`--no-main` 才不会丢掉整段正文；
+   * - 1×1 / clip(0) 的 sr-only 元素对正文无贡献，按隐藏过滤；
+   * - BUTTON / [role=button] 是交互噪声，不进入正文（看按钮找 snapshot）。
+   */
+  const readStyleOf = (el) => {
+    const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    return view.getComputedStyle(el);
+  };
+  /** display:contents 的可见性看子树：自有文本节点落在匿名盒里；后代有可见盒就算可见。 */
+  const contentsRendered = (el) => {
+    try {
+      for (const node of el.childNodes) {
+        if (node.nodeType === 3 && /\S/.test(String(node.nodeValue || ''))) return true;
+      }
+      for (const child of el.children) {
+        if (child.checkVisibility
+          && child.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true })) return true;
+        if (readStyleOf(child).display === 'contents' && contentsRendered(child)) return true;
+      }
+    } catch (_) {
+      return true; // 子树算不了就按可见处理，宁可多读不可漏读
+    }
+    return false;
+  };
+  /** 1×1 / clip(0) 的视觉隐藏（Bootstrap `.visually-hidden`、`.sr-only` 的常见模式）。 */
+  const srOnlyForRead = (el, rect) => {
+    if (rect.width <= 1 && rect.height <= 1) return true;
+    // 无 1px 尺寸约束时只看内联 clip，不给每个元素额外做一次 getComputedStyle；
+    // class 形式的 clip sr-only 绝大多数同时带 1px 尺寸，上面已过滤。
+    return /^rect\(\s*0/.test(String((el.style && el.style.clip) || ''));
+  };
   const isReadVisible = (el) => {
-    if (!el) return false;
-    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return false;
+    if (!el || el.hidden) return false;
+    if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return false;
+    if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') return false;
     try {
       if (typeof el.checkVisibility === 'function') {
-        return el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
+        if (el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true })) {
+          return !srOnlyForRead(el, el.getBoundingClientRect());
+        }
+        // 唯一的例外:display:contents 被 checkVisibility 判 false 但子树照常渲染。
+        if (readStyleOf(el).display === 'contents') return contentsRendered(el);
+        return false;
       }
-      const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-      const style = view.getComputedStyle(el);
-      return style.display !== 'none' && style.visibility !== 'hidden';
+      const style = readStyleOf(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      if (style.display === 'contents') return contentsRendered(el);
+      return !srOnlyForRead(el, el.getBoundingClientRect());
     } catch (_) {
       return true;
     }
@@ -2109,8 +2150,30 @@ function installHelpers() {
   // ---------------------------------------------------------------- read 渲染
   // md / text 共用一次 DOM 遍历，产出轻量 block/inline 结构；html 走 innerHTML，
   // visible 直接使用浏览器渲染后的 innerText。三种来源共用 read 的选区、预算和游标。
-  const READ_SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
-  const READ_BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|DIV|DL|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/;
+  const READ_BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|CENTER|DIV|DL|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/;
+
+  const READ_SKIP_TAGS = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION)$/;
+
+  /**
+   * read 直接跳过的元素（P0-B）：
+   * - script/style/svg/canvas… 这些本就不该进正文；
+   * - nav/form 永久跳过；
+   * - header/footer/aside 在 role=banner/contentinfo/complementary 时跳过；
+   * - 其余只在「不在 article/main/[role=main] 内且没有标题后代」时跳过：
+   *   article > header > h1 必须保留；像 Guardian 首页那样把内容放进页面级
+   *   header 的情况也不能只剩一个标题。`section` 不算正文容器语境。
+   */
+  const LANDMARK_HIDE_ROLES = /^(banner|contentinfo|complementary)$/;
+  const readSkip = (el) => {
+    const tag = el.tagName;
+    if (!tag || READ_SKIP_TAGS.test(tag)) return true;
+    if (tag === 'NAV' || tag === 'FORM') return true;
+    if (tag !== 'HEADER' && tag !== 'FOOTER' && tag !== 'ASIDE') return false;
+    if (LANDMARK_HIDE_ROLES.test(String(el.getAttribute('role') || '').trim())) return true;
+    const inContent = el.closest && el.closest('article,main,[role="main"]');
+    const hasHeading = el.querySelector && el.querySelector('h1,h2,h3,h4,h5,h6');
+    return !(inContent || hasHeading);
+  };
 
   const hrefOf = (el) => {
     const raw = el.getAttribute('href') || '';
@@ -2143,12 +2206,43 @@ function installHelpers() {
     return null;
   };
   const cellText = (cell) => clean(cell.innerText || cell.textContent || '');
-  const tableRows = (table) => [...table.querySelectorAll('tr')]
+  /** 含嵌套表的 td：host 单元格只留自己的文字，嵌套表交给后面的独立表格块。 */
+  const cellTextStripped = (cell) => {
+    const clone = cell.cloneNode(true);
+    for (const inner of clone.querySelectorAll('table')) inner.remove();
+    return clean(clone.textContent || '');
+  };
+  /**
+   * `table.rows` 只含本表 thead/tbody/tfoot 里的行；嵌套表不是本表的行——
+   * host 单元格剥离嵌套表文本，嵌套表作为独立表格块在当前表之后输出
+   * （WeakSet 去重：同一嵌套表不会被相邻层级重复展开）。
+   */
+  const tableRows = (table, nestedSink) => [...table.rows]
     .map(row => [...row.children]
       .filter(cell => /^(TD|TH)$/.test(cell.tagName))
-      .map(cellText))
+      .map(cell => {
+        if (nestedSink && cell.querySelector('table')) {
+          for (const inner of cell.querySelectorAll('table')) {
+            if (!nestedSink.seen.has(inner)) { nestedSink.seen.add(inner); nestedSink.queue.push(inner); }
+          }
+          return cellTextStripped(cell);
+        }
+        return cellText(cell);
+      }))
     .filter(cells => cells.length);
   const mdCell = (value) => String(value).replace(/\|/g, '\\|');
+
+  /**
+   * 链接标签只信 innerText（P0-D）：textContent 会把 `<a><script>…</script></a>`
+   * 的脚本泄漏进正文。没有文字但有图时用图片 alt；两者都没有就没有链接标签，
+   * 上层按空文本链接丢弃，不编造裸 URL。
+   */
+  const linkLabel = (el) => {
+    const text = clean(el.innerText || '');
+    if (text) return text;
+    const img = el.querySelector ? el.querySelector('img') : null;
+    return img ? clean(img.getAttribute('alt') || img.getAttribute('aria-label') || '') : '';
+  };
 
   /** 单个不可再拆的行内节点；A/CODE/STRONG/EM 保持和旧 inline() 一样的原子语义。 */
   const inlineNode = (el) => {
@@ -2156,7 +2250,7 @@ function installHelpers() {
     if (tag === 'A') {
       return {
         t: 'link',
-        text: clean(el.innerText || el.textContent || ''),
+        text: linkLabel(el),
         href: hrefOf(el),
       };
     }
@@ -2184,7 +2278,7 @@ function installHelpers() {
       if (node.nodeType !== 1) continue;
       const el = node;
       const tag = el.tagName;
-      if (!tag || READ_SKIP.test(tag)) continue;
+      if (readSkip(el)) continue;
       if (!isReadVisible(el)) continue;
       if (el.shadowRoot) { out.push(...inlineIn(el.shadowRoot)); continue; }
       if (tag === 'BR') { out.push({ t: 'br' }); continue; }
@@ -2223,9 +2317,10 @@ function installHelpers() {
   const readBlocks = (root) => {
     const blocks = [];
     let pending = [];
-    const flush = () => {
+    /** hard=1 表示这个块被 <br> 截开、下面还有紧跟的一行（md 里按单换行连接）。 */
+    const flush = (viaBr) => {
       if (pending.length) {
-        blocks.push({ b: 'p', inlines: pending });
+        blocks.push({ b: 'p', inlines: pending, hard: !!viaBr });
         pending = [];
       }
     };
@@ -2238,16 +2333,21 @@ function installHelpers() {
         if (node.nodeType !== 1) continue;
         const el = node;
         const tag = el.tagName;
-        if (!tag || READ_SKIP.test(tag)) continue;
+        if (readSkip(el)) continue;
         if (!isReadVisible(el)) continue;
         if (el.shadowRoot) { flush(); walk(el.shadowRoot); flush(); continue; }
-        if (tag === 'BR') { pending.push({ t: 'br' }); continue; }
+        if (tag === 'BR') {
+          // BR 结束当前物理行：md/text 都按块边界渲染换行，
+          // 否则 clean() 会把 md 段落里的 \n 又折叠回空格。
+          flush(true);
+          continue;
+        }
         if (['A', 'IMG', 'CODE', 'STRONG', 'B', 'EM', 'I'].includes(tag)) {
           pending.push(inlineNode(el));
           continue;
         }
         if (!el.innerText && !el.querySelector('img,picture,video')) continue;
-        if (/^H[1-4]$/.test(tag)) {
+        if (/^H[1-6]$/.test(tag)) {
           flush();
           const text = clean(el.innerText);
           if (text) blocks.push({ b: 'h', level: Number(tag[1]), text });
@@ -2260,14 +2360,51 @@ function installHelpers() {
           continue;
         }
         if (tag === 'TABLE') {
-          const rows = tableRows(el);
-          if (rows.length) { flush(); blocks.push({ b: 'table', rows }); }
+          const nested = { seen: new Set(), queue: [] };
+          const rows = tableRows(el, nested);
+          if (rows.length) {
+            flush();
+            blocks.push({ b: 'table', rows });
+            // 嵌套表按文档顺序跟在后面对齐语义：外层表先写完，嵌套表再展开。
+            while (nested.queue.length) {
+              const inner = nested.queue.shift();
+              const innerRows = tableRows(inner, nested);
+              if (innerRows.length) blocks.push({ b: 'table', rows: innerRows });
+            }
+          }
           continue;
         }
         if (tag === 'UL' || tag === 'OL') {
           flush();
           const list = listBlock(el);
           if (list.items.length) blocks.push(list);
+          continue;
+        }
+        // DL 的 dt/dd 每项独立成段，不再被拼进一个长段落。
+        if (tag === 'DT' || tag === 'DD') {
+          flush();
+          pending.push(...inlineIn(el));
+          flush();
+          continue;
+        }
+        if (tag === 'SUMMARY') {
+          // <details> 的第一行是标题语义，先单独成段再展开内容。
+          flush();
+          pending.push(...inlineIn(el));
+          flush();
+          continue;
+        }
+        if (tag === 'DETAILS') {
+          flush();
+          walk(el);
+          flush();
+          continue;
+        }
+        // 自定义元素（如 <query-result>、<x-wrap>）通常整段包裹正文，按块展开。
+        if (tag.includes && tag.includes('-')) {
+          flush();
+          walk(el);
+          flush();
           continue;
         }
         if (READ_BLOCK.test(tag)) {
@@ -2293,7 +2430,8 @@ function installHelpers() {
       case 'text': return node.v;
       case 'br': return '\n';
       case 'link':
-        if (!node.text) return node.href ? escapeMdUrl(node.href) + ' ' : '';
+        // 空文本链接默认丢弃：不为它编造裸 URL（需要链接结构用 snapshot）。
+        if (!node.text) return '';
         return node.href
           ? '[' + escapeMdText(node.text) + '](' + escapeMdUrl(node.href) + ') '
           : escapeMdText(node.text);
@@ -2315,39 +2453,56 @@ function installHelpers() {
     for (const block of readBlocks(root)) {
       if (block.b === 'p') {
         const text = clean(markdownInline(block.inlines));
-        if (text) out.push(text);
+        if (text) out.push({ p: true, hard: !!block.hard, text });
       } else if (block.b === 'h') {
-        out.push('#'.repeat(block.level) + ' ' + block.text);
+        out.push({ text: '#'.repeat(block.level) + ' ' + block.text });
       } else if (block.b === 'pre') {
-        out.push('```\n' + block.text + '\n```');
+        out.push({ text: '```\n' + block.text + '\n```' });
       } else if (block.b === 'table') {
-        const width = Math.max(...block.rows.map(row => row.length));
-        const pad = (cells) => [...cells, ...Array(Math.max(0, width - cells.length)).fill('')];
-        const head = pad(block.rows[0]).map(mdCell);
-        const lines = [
-          '| ' + head.join(' | ') + ' |',
-          '| ' + head.map(() => '---').join(' | ') + ' |',
-        ];
-        for (const row of block.rows.slice(1)) {
-          lines.push('| ' + pad(row).map(mdCell).join(' | ') + ' |');
-        }
-        out.push(lines.join('\n'));
+        out.push({ text: markdownTable(block.rows) });
       } else if (block.b === 'list') {
-        let number = block.start != null
-          ? block.start
-          : (block.reversed ? block.items.length : 1);
-        const lines = [];
-        for (const item of block.items) {
-          if (block.ordered && item.value != null) number = item.value;
-          // 列表项沿用旧行为：每个直接行内节点之间补一个空格。
-          const text = clean(markdownInline(item.inlines, ' '));
-          if (text) lines.push((block.ordered ? number + '. ' : '- ') + text);
-          if (block.ordered) number += block.reversed ? -1 : 1;
-        }
-        if (lines.length) out.push(lines.join('\n'));
+        out.push({ text: markdownList(block) });
       }
     }
-    return out.join('\n\n');
+    // 被 <br> 截开的段落段之间只换一行，其他块都是空行分段；
+    // 跨块型（p→h/table/…）不继承 hard。
+    let md = '';
+    for (let index = 0; index < out.length; index++) {
+      const segment = out[index];
+      if (!index) { md = segment.text; continue; }
+      const previous = out[index - 1];
+      md += (previous.p && segment.p && previous.hard ? '\n' : '\n\n') + segment.text;
+    }
+    return md;
+  };
+
+  const markdownTable = (rows) => {
+    const width = Math.max(...rows.map(row => row.length));
+    const pad = (cells) => [...cells, ...Array(Math.max(0, width - cells.length)).fill('')];
+    const head = pad(rows[0]).map(mdCell);
+    const lines = [
+      '| ' + head.join(' | ') + ' |',
+      '| ' + head.map(() => '---').join(' | ') + ' |',
+    ];
+    for (const row of rows.slice(1)) {
+      lines.push('| ' + pad(row).map(mdCell).join(' | ') + ' |');
+    }
+    return lines.join('\n');
+  };
+
+  const markdownList = (block) => {
+    let number = block.start != null
+      ? block.start
+      : (block.reversed ? block.items.length : 1);
+    const lines = [];
+    for (const item of block.items) {
+      if (block.ordered && item.value != null) number = item.value;
+      // 列表项沿用旧行为：每个直接行内节点之间补一个空格。
+      const text = clean(markdownInline(item.inlines, ' '));
+      if (text) lines.push((block.ordered ? number + '. ' : '- ') + text);
+      if (block.ordered) number += block.reversed ? -1 : 1;
+    }
+    return lines.join('\n');
   };
 
   const textInline = (nodes) => {
@@ -2655,7 +2810,7 @@ function installHelpers() {
     collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent,
     setValue, isActionableRole, absoluteHref,
   };
-  window.__ema2_helpers_version = 19;
+  window.__ema2_helpers_version = 20;
   return { installed: true };
 }
 
@@ -5756,25 +5911,89 @@ async function failInjection(tab, error, action) {
     'retry after the page settles; if the tab is still loading, run `ema2 wait idle` first');
 }
 
-async function readTool(args) {
-  const tab = await resolveTab(args);
-  if (isInternalUrl(tab.url)) fail('internal_page', 'browser internal pages cannot be read', 'open an http(s) page');
-  await ensureHelpers(tab.id);
-  const mode = args.mode || 'md';
-  const selector = args.selector;
-  if (selector) await requireValidSelector(tab.id, selector);
-  const budget = normalizeBudget(args.budget);
-  const cursor = normalizeCursor(args.cursor);
-  const useMain = args.main !== false && !selector;
-  let data;
+/** 该 tab 最近一次主文档导航的 webRequest 记录（status/mime 是首屏真实值）。 */
+function mainFrameInfo(tabId) {
+  const bucket = webRequestBucket(tabId, false);
+  if (!bucket) return null;
+  let main = null;
+  for (const record of bucket.values()) {
+    if (record.type === 'main_frame') main = record;  // 后续导航覆盖前面的
+  }
+  if (!main) return null;
+  return {
+    status: main.status || 0,
+    mimeType: String(main.mimeType || ''),
+    error: String(main.error || ''),
+  };
+}
+
+/**
+ * read 的页面内提取（md/text/html/visible 共用选区/预算/游标），
+ * 并在同一遍里识别页面状态（P0-F）：
+ * - pdf → PDF viewer 里没有可遍历的正文 DOM，read 直接报错；
+ * - challenge / login_required → 输出 state= + hint，退出 0（不伪装成正文成功，也不报错）；
+ * - http>=400 → page_error；
+ * - 公开正文仍按普通页面处理；**本期不检测 paywall**，也没有 JSON-LD / 订阅标记。
+ * state 优先级：pdf → challenge → login → http_error → 正文提取 → empty。
+ * state/empty 只约束 md/text 的整页读取（clean 内容模式）；html 是原始视图，
+ * visible 自有兜底提示；--selector 是显式子树请求，允许为空。
+ * 注意：本函数经 executeScript 注入 isolated world，必须自包含，
+ * 不能引用 background 里的其他顶层函数（注入后它们不存在）。
+ * 陷阱：Edge 对 func 注入内的抛错不 reject 而是 result=undefined（曾误报 helpers_missing），
+ * 所以这里捕获整包异常带回页面异常，由 readTool 映射成 js_exception。
+ */
+function readPageContent(modeName, selectorArg, mainWanted) {
   try {
-    data = await runInTab(tab.id, (modeName, selectorArg, mainWanted) => {
     const helpers = window.__ema2_helpers;
+  if (!helpers) return { kind: 'helpers_missing', trace: String(Object.keys(window)).filter(k => k.includes('ema2')).join(',') };
+  const clean = helpers.clean;
+  const navEntry = (typeof performance.getEntriesByType === 'function'
+    ? (performance.getEntriesByType('navigation') || [])[0] || null
+    : null);
+  const http = navEntry ? (Number(navEntry.responseStatus) || 0) : 0;
+  const contentType = String(document.contentType || '').trim().toLowerCase();
+  const title = clean(document.title);
+  const scoped = !!selectorArg;
+  const contentMode = modeName === 'md' || modeName === 'text';
+
+  const isPdf = /^application\/pdf/i.test(contentType)
+    || (/(?:^|\.)pdf$/i.test(String(location.pathname || ''))
+      && !/^text\/html|^application\/xhtml/i.test(contentType));
+
+  /** 人机验证页（Cloudflare / 滑块 / Turnstile 中间页）。小页面才扫 body 文本，避免拖慢大页 read。 */
+  const challengeState = () => {
+    if (/just a moment|attention required|checking your browser|verify you (?:are |)human|are you (?:a )?robot|press &?\s*hold|请稍候|正在验证|人机验证|安全验证/i.test(title)) return true;
+    if (document.querySelector('#challenge-form,.challenge-form,#cf-chl-widget,.cf-turnstile-wrapper,#cf-chl-runner,.cf-browser-verification')) return true;
+    const body = document.body;
+    if (!body || body.childElementCount > 60) return false;
+    const preview = String(body.innerText || '').slice(0, 400);
+    return preview.length > 0
+      && /verify you (?:are )?human|checking your browser|progress&|press (?:and|&) hold|确认您是真人/i.test(preview);
+  };
+
+  /** 登录墙：页面是「有密码框 + 登录语义的标题/一级标题」的表单页，不是弹层。 */
+  const loginState = () => {
+    if (!document.querySelector('input[type="password"]')) return false;
+    const heading = document.querySelector('h1,h2');
+    const context = title + ' ' + (heading ? String(heading.textContent || '') : '');
+    return /log ?in|sign ?in|sign ?up|登录|登入|密码|pass ?word|passcode|two-?step|two-?factor|verification code|authenticat|authorize/i.test(context);
+  };
+
+  let kind = 'ok';
+  if (isPdf) kind = 'pdf';
+  else if (!scoped && modeName !== 'html') {
+    if (contentMode && challengeState()) kind = 'challenge';
+    else if (contentMode && loginState()) kind = 'login_required';
+    else if (http >= 400) kind = 'http_error';
+  }
+
+  let text = '';
+  let mainSelector = '';
+  let mainFallback = false;
+  let textLength = 0;
+  let bodyLength = 0;
+  if (kind === 'ok') {
     let root = document.body || document.documentElement;
-    let mainSelector = '';
-    let mainFallback = false;
-    let textLength = 0;
-    let bodyLength = 0;
     if (selectorArg) {
       const found = helpers.find(null, selectorArg, null);
       if (!found) return { missing: true };
@@ -5787,25 +6006,92 @@ async function readTool(args) {
       textLength = picked.textLength || 0;
       bodyLength = picked.bodyLength || 0;
     }
-    const text = modeName === 'visible' ? helpers.visibleText(root)
+    text = modeName === 'visible' ? helpers.visibleText(root)
       : modeName === 'html' ? root.innerHTML
       : modeName === 'text' ? helpers.plainText(root)
       : helpers.markdown(root);
-    return {
-      text,
-      mainFallback,
-      textLength,
-      bodyLength,
-      header: 'url=' + location.href + '\ntitle=' + helpers.clean(document.title)
-        + '\nmode=' + modeName
-        + (mainSelector ? '\nmain=' + mainSelector : ''),
-    };
-    }, [mode, selector || null, useMain]);
+    // md/text 的整页读取不允许 "0 字却成功"；--selector 子树是显式请求，允许为空。
+    if (contentMode && !scoped && !String(text || '').trim()) kind = 'empty';
+  }
+
+  const headerLines = [
+    'url=' + location.href,
+    'title=' + title,
+    'mode=' + modeName,
+  ];
+  if (mainSelector) headerLines.push('main=' + mainSelector);
+  if (kind === 'challenge' || kind === 'login_required') headerLines.push('state=' + kind);
+  if (http > 0) headerLines.push('http=' + http);
+  if (contentType) headerLines.push('content_type=' + contentType);
+  return {
+    kind,
+    header: headerLines.join('\n'),
+    text,
+    mainFallback,
+    textLength,
+    bodyLength,
+    http,
+    contentType,
+  };
+  } catch (error) {
+    return { kind: 'page_exception', message: String((error && error.stack) || error).slice(0, 500) };
+  }
+}
+
+/** challenge / login 是页面状态而不是错误：state= + hint，退出 0。 */
+function readStateOutput(data, kind) {
+  const hint = kind === 'challenge'
+    ? 'complete the human-verification challenge in the browser, then re-run read; snapshot works after it passes'
+    : 'page looks like a sign-in wall (visible password field + login-style title); use snapshot to find the form and act to log in, or open a page that is publicly readable';
+  return [data.header, footer(0, 0, null), 'hint=' + hint].join('\n');
+}
+
+async function readTool(args) {
+  const tab = await resolveTab(args);
+  if (isInternalUrl(tab.url)) fail('internal_page', 'browser internal pages cannot be read', 'open an http(s) page');
+  const mode = args.mode || 'md';
+  const selector = args.selector;
+  // PDF 没有正文 DOM：webRequest 已记录主文档 MIME 的话，注入前直接判定。
+  const mainFrame = mainFrameInfo(tab.id);
+  if (mainFrame && /^application\/pdf/i.test(mainFrame.mimeType)) {
+    fail('pdf_page', `the document is a PDF (content_type=${mainFrame.mimeType})`,
+      'read cannot extract PDF text; open the html version, or let the user save the pdf and read it with a file tool');
+  }
+  await ensureHelpers(tab.id);
+  if (selector) await requireValidSelector(tab.id, selector);
+  const budget = normalizeBudget(args.budget);
+  const cursor = normalizeCursor(args.cursor);
+  const useMain = args.main !== false && !selector;
+  let data;
+  try {
+    data = await runInTab(tab.id, readPageContent, [mode, selector || null, useMain]);
   } catch (error) {
     await failInjection(tab, error, 'reading content');
   }
+  if (!data || data.kind === 'helpers_missing') {
+    fail('helpers_missing', 'page helpers are not installed', 'reload the tab and retry');
+  }
+  if (data.kind === 'page_exception') {
+    fail('js_exception', `read's page helper threw: ${oneLine(data.message)}`,
+      "the page may be hostile or mid-navigation; check the exception, retry after `ema2 await 2s`, then file a bug if it repeats");
+  }
   if (data.missing) {
     fail('selector_not_found', `selector not found: ${selector}`, 'call snapshot to see available refs/roles');
+  }
+  if (data.kind === 'pdf') {
+    fail('pdf_page', `the document is a PDF (content_type=${data.contentType || 'application/pdf'})`,
+      'read cannot extract PDF text; open the html version, or let the user save the pdf and read it with a file tool');
+  }
+  if (data.kind === 'http_error') {
+    fail('page_error', `the page responded http=${data.http} (content_type=${data.contentType || 'unknown'})`,
+      'the url is dead or blocked; verify it, or check `ema2 status` / the tab title for what actually loaded');
+  }
+  if (data.kind === 'empty') {
+    fail('empty_page', `read produced no text for mode=${mode}`,
+      'the tab may still be loading; wait (`ema2 wait idle`) or wait selector, then retry; canvas/PDF-like pages need shot --annotate');
+  }
+  if (data.kind === 'challenge' || data.kind === 'login_required') {
+    return readStateOutput(data, data.kind);
   }
   const slice = sliceText(data.text || '', budget, cursor);
   const parts = [data.header, slice.text, footer(slice.total, slice.text.length, slice.next)];
