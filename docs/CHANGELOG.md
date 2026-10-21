@@ -1,5 +1,20 @@
 # 变更记录
 
+## v2.4.1 — 文档收口与发布准备
+
+仅文档与发布信息，不改浏览器行为。
+
+- **README 精简**：只保留“是什么、怎么装、怎么开始、安全边界、已知限制”，
+  命令契约、架构细节、完整限制统一指向 `docs/`，避免同一份信息多处维护。
+- **安全边界写清楚**：README 明确 EMA2 只面向可信的本机个人环境；
+  无 token 是设计取舍，任何能访问 `127.0.0.1:7744` 的本地进程都可能驱动浏览器，
+  不要暴露端口或反向代理。
+- **文档数字对齐**：`TESTING.md` 的 `cargo test` 项数改为 71；`HANDOFF.md` 的
+  helper 版本改为当前值 17。
+- **发布核验**：用 release 构建产物 + 全新 Edge profile 加载扩展，启动 daemon，
+  `python scripts/verify.py` 102 项通过；`cargo test` 71、clippy、fmt 均通过。
+- 版本：exe/扩展 2.4.1；helper 17；`cargo test` 71 passed；真机 verify 102 项。
+
 ## v2.4.0 — read --mode visible，md/text 共用遍历
 
 - **新增 `read --mode visible`**：直接返回所选 root 的 `innerText`，绕过 main 启发式和正文清洗；

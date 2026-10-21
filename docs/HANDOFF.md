@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.4.0
-extension  2.4.0
+exe        2.4.1
+extension  2.4.1
 helper     17
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
@@ -210,7 +210,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 ## 开发陷阱
 
 1. **修改页面 helper 必须提升 `__ema2_helpers_version`**
-   当前是 15；否则已打开页面继续用旧 helper。
+   当前是 17；否则已打开页面继续用旧 helper。
 
 2. **Edge 会按 manifest 版本缓存扩展脚本**
    行为没更新时提升 `extension/manifest.json` 版本，或在 `edge://extensions` 重新加载；

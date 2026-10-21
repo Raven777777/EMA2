@@ -1,6 +1,6 @@
 [package]
 name = "ema2"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2024"
 # edition 2024 需要 Rust 1.85+；写在 manifest 里让旧工具链给出明确报错而不是晦涩的语法错误。
 rust-version = "1.85"
