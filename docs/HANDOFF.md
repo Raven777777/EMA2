@@ -5,13 +5,16 @@
 ## 当前版本
 
 ```text
-exe        2.3.0
-extension  2.3.0
-helper     13
+exe        2.3.1
+extension  2.3.1
+helper     14
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
 `await` 是 CLI 命令，映射到 `wait` 工具，不增加第 12 个工具。
+
+分发包只带 exe + `ema2 init` 生成的 AGENTS.md；**脚本语法以 `ema2 act --help` 为准**，
+不要在用户可见 hint 里引用仓库文档。
 
 ## 最短心智模型
 
@@ -93,7 +96,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前 Rust 测试：**68 passed**。
+当前 Rust 测试：**70 passed**。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -205,7 +208,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 ## 开发陷阱
 
 1. **修改页面 helper 必须提升 `__ema2_helpers_version`**
-   当前是 13；否则已打开页面继续用旧 helper。
+   当前是 14；否则已打开页面继续用旧 helper。
 
 2. **Edge 会按 manifest 版本缓存扩展脚本**
    行为没更新时提升 `extension/manifest.json` 版本，或在 `edge://extensions` 重新加载；
@@ -235,7 +238,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
 4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
-5. `python scripts/verify.py` —— 83 项真机检查，跑不过就别改行为
+5. `python scripts/verify.py` —— 93 项真机检查，跑不过就别改行为
 6. 打开一个真实网站，跑 `open → snapshot → act → read`
 7. 修改行为前先问：这是通用原语，还是网站特例？
 8. 任何动作相关改动，必须真机验证“成功就是真的成功”

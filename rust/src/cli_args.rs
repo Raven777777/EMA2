@@ -39,7 +39,19 @@ impl ToolCall {
     name = "ema2",
     version,
     about = "AI-driven control of the user's real Edge browser (daemon + CLI, no MCP)",
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    after_help = "\
+AI 会话顺序:
+  ema2 server
+  ema2 status
+  ema2 open <url>
+  ema2 snapshot
+  ema2 act click e12
+  ema2 await 10s
+
+完整参数与示例: ema2 <command> --help
+.ema2 脚本语法: ema2 act --help
+脚本只允许 act 动作 + await + waitFor；不能写 open/read/snapshot/wait。"
 )]
 pub struct Cli {
     /// 覆盖默认端口 7744；server 与所有客户端命令须用同一端口
@@ -78,7 +90,7 @@ pub enum Command {
         #[arg(long)]
         wait: Option<String>,
         /// 等文档接位的秒数（默认 15，1..60）
-        #[arg(long)]
+        #[arg(long, value_name = "SECONDS")]
         timeout: Option<f64>,
     },
     /// 读页面为 md|text|html
@@ -118,6 +130,49 @@ pub enum Command {
         values: bool,
     },
     /// 单步或多步操作：act click e12 / act --steps '...' / act --script run.ema2
+    #[command(after_help = r##"单步:
+  ema2 act click e12
+  ema2 act fill e15 "hello world"
+  ema2 act press e15 Enter
+  ema2 act click e12 --wait-for "url=api/save status=200 timeout=5s"
+
+多步:
+  ema2 act --steps 'click e12; fill e15 "hi"; press e15 Enter'
+  ema2 act --script flow.ema2
+
+.ema2 脚本（每行一条；空行和 # 注释忽略；含空格的值加双引号）:
+  click e12
+  click selector="#submit"
+  click target="button:提交"
+  type e15 "hello world"
+  fill e15 "hello"
+  select e20 "opt1"
+  press Enter
+  press e15 Tab
+  hover e12
+  scroll down 3
+  submit
+  back
+  forward
+  reload
+  await 10s
+  waitFor url=api/save status=200 timeout=5s
+
+脚本规则:
+- 只允许 11 个 act 动作 + await + waitFor；最多 20 步。
+- 不能写 open/read/snapshot/wait/js/tabs 等 CLI 命令；这些在 shell 里单独调用。
+- ref 裸写；selector= / target= 是命名参数，不能和裸 ref 同时用。
+- waitFor 只接受 url= / status= / timeout=，等响应或导航，不是页面条件等待。
+  单纯等待用 await 1s；等文本/选择器请在脚本外运行 ema2 wait。
+- --selector/--target/--key/--delta-y/--submit 只用于单步；
+  脚本里用 selector= / target= / press / submit。
+
+常见错误:
+  open https://...      → 先 ema2 open，再 ema2 act --script
+  wait text "Done"      → 脚本用 await / waitFor；页面条件用 ema2 wait
+  waitFor time 1s       → 用 await 1s
+
+完整语法/示例: ema2 act --help（本页）"##)]
     Act {
         /// action [ref] [text] 与 --selector/--target/--key/--delta-y/--submit/--tab/
         /// --wait-for/--steps/--script/--port 混合
@@ -125,12 +180,19 @@ pub enum Command {
         tokens: Vec<String>,
     },
     /// 等 text / textGone / selector / time / idle
+    #[command(after_help = "\
+这是 shell 命令，不能写进 .ema2 脚本。
+脚本里用:
+  await 10s                             等上一个 act 的导航/页面稳定
+  waitFor url=... status=... timeout=5s 等响应或导航
+等文本/选择器条件请在脚本前后单独运行 ema2 wait。")]
     Wait {
         /// text|textGone|selector|time|idle
         kind: String,
         /// 条件值（文本 / CSS / 时长，如 "5s"）
         value: Option<String>,
-        #[arg(long)]
+        /// 兜底超时，如 30s（0..300s）
+        #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
         #[arg(long = "tab")]
         tab: Option<u64>,
@@ -157,7 +219,7 @@ pub enum Command {
         #[arg(long)]
         cursor: Option<u64>,
         /// 执行上限秒数（默认 10，1..300）；超时会 terminateExecution
-        #[arg(long)]
+        #[arg(long, value_name = "SECONDS")]
         timeout: Option<f64>,
     },
     /// console 增量 / network（真实状态码+响应体，HAR）
@@ -176,7 +238,7 @@ pub enum Command {
         #[arg(long)]
         filter: Option<String>,
         /// 等异步请求（≤10s，如 "5s"）
-        #[arg(long)]
+        #[arg(long, value_name = "DURATION")]
         wait: Option<String>,
         /// 响应体正则（≤512 字符）
         #[arg(long = "body-filter")]
@@ -284,6 +346,10 @@ pub struct FilesArgs {
 #[derive(Subcommand)]
 pub enum FilesCommand {
     /// 上传本地文件（Windows 须 C:/... 绝对路径，≤20 个）
+    #[command(after_help = "\
+例:
+  ema2 files upload C:/tmp/a.pdf C:/tmp/b.pdf --ref e8
+路径是位置参数，所以 ref 必须用 --ref；act 的 ref 是位置参数。")]
     Upload {
         paths: Vec<String>,
         #[arg(long = "ref")]
@@ -964,6 +1030,32 @@ const ACT_ACTIONS: &[&str] = &[
     "reload",
 ];
 
+/// 写进错误信息的脚本白名单，避免用户再猜哪些动作能出现在 `.ema2` 里。
+const SCRIPT_ACTIONS_HINT: &str =
+    "click/type/fill/select/press/hover/scroll/submit/back/forward/reload";
+
+/// 脚本里误写 CLI 命令时，直接给出替代写法，而不是只说 unknown action。
+fn script_action_hint(action: &str) -> &'static str {
+    match action {
+        "open" => "run `ema2 open <url>` in the shell, then start the script again",
+        "read" => "run `ema2 read` outside the script",
+        "snapshot" => {
+            "run `ema2 snapshot` outside the script; refs from it can be used in the script"
+        }
+        "wait" => {
+            "use `await <duration>` or `waitFor ...` in scripts; use `ema2 wait ...` in the shell"
+        }
+        "js" => "run `ema2 js` outside the script",
+        "tabs" => "run `ema2 tabs` outside the script",
+        "observe" => "run `ema2 observe` outside the script",
+        "files" => "run `ema2 files upload` outside the script",
+        "shot" => "run `ema2 shot` outside the script",
+        "batch" => "run `ema2 batch` outside the script",
+        "server" | "status" | "init" => "run it in the shell; scripts only contain act steps",
+        _ => "run `ema2 act --help` for the script syntax and examples",
+    }
+}
+
 /// 位置参数里的 ref 只能是 `e12` / `e12@d1` / `[e12@d1]`；
 /// 否则 `act click foo` 会把拼错的参数当成 ref，报成看不懂的 stale_ref。
 fn check_ref_token(token: &str) -> Result<(), String> {
@@ -1075,8 +1167,11 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
         if steps_inline.is_some() {
             return Err("act: use either --steps or --script, not both".into());
         }
-        let source = std::fs::read_to_string(path)
-            .map_err(|error| format!("act: cannot read script {path}: {error}"))?;
+        let source = std::fs::read_to_string(path).map_err(|error| {
+            format!(
+                "act: cannot read script {path}: {error}; check the path or run `ema2 act --help`"
+            )
+        })?;
         steps_inline = Some(source);
     }
 
@@ -1123,15 +1218,17 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             steps.push(step);
         }
         if steps.is_empty() || steps.len() > 20 {
-            return Err("act: script must contain 1..20 steps".into());
+            return Err("act: script must contain 1..20 steps; run `ema2 act --help`".into());
         }
         arguments["steps"] = json!(steps);
     } else {
-        let action = positional
-            .first()
-            .ok_or_else(|| "act: missing action (click|type|fill|select|press|hover|scroll|submit|back|forward|reload)".to_owned())?;
+        let action = positional.first().ok_or_else(|| {
+            format!("act: missing action ({SCRIPT_ACTIONS_HINT}); run `ema2 act --help`")
+        })?;
         if !ACT_ACTIONS.contains(&action.as_str()) {
-            return Err(format!("act: unknown action {action:?}"));
+            return Err(format!(
+                "act: unknown action {action:?}; use one of {SCRIPT_ACTIONS_HINT}, or run `ema2 act --help`"
+            ));
         }
         if submit_flag && action != "type" {
             return Err(
@@ -1307,7 +1404,14 @@ fn parse_wait_for(input: &str) -> Result<Value, String> {
     let mut out = json!({});
     for token in tokens {
         let Some((key, value)) = token.split_once('=') else {
-            return Err(format!("act waitFor: expected key=value, got {token:?}"));
+            let hint = if token == "time" || token.starts_with("time") {
+                "use `await 1s` for a plain delay; use `ema2 wait` outside the script for page text/selector waits"
+            } else {
+                "waitFor only accepts url= / status= / timeout=; use `await 1s` for a plain delay"
+            };
+            return Err(format!(
+                "act waitFor: expected key=value, got {token:?}; {hint}"
+            ));
         };
         match key {
             "url" => out["url"] = json!(value),
@@ -1324,13 +1428,16 @@ fn parse_wait_for(input: &str) -> Result<Value, String> {
             }
             _ => {
                 return Err(format!(
-                    "act waitFor: unknown key {key:?} (url|status|timeout)"
+                    "act waitFor: unknown key {key:?}; only url= / status= / timeout= are supported (for text/selector use `ema2 wait` outside the script)"
                 ));
             }
         }
     }
     if out.get("url").is_none() && out.get("status").is_none() {
-        return Err("act waitFor: needs at least url= or status=".into());
+        return Err(
+            "act waitFor: needs at least url= or status=; timeout alone is not a wait (use `await 1s`)"
+                .into(),
+        );
     }
     Ok(out)
 }
@@ -1385,8 +1492,9 @@ pub fn parse_act_script(source: &str) -> Result<Value, String> {
             }
             if !ACT_ACTIONS.contains(&action.as_str()) {
                 return Err(format!(
-                    "script line {}: unknown action {action:?}",
-                    number + 1
+                    "script line {}: unknown action {action:?}; scripts only support {SCRIPT_ACTIONS_HINT} + await/waitFor. {}",
+                    number + 1,
+                    script_action_hint(action)
                 ));
             }
             let mut step = json!({ "action": action });
@@ -1521,7 +1629,9 @@ pub fn parse_act_script(source: &str) -> Result<Value, String> {
         }
     }
     if steps.is_empty() {
-        return Err("script: no steps found (only comments/blank lines?)".into());
+        return Err(
+            "script: no steps found (only comments/blank lines?); run `ema2 act --help`".into(),
+        );
     }
     Ok(json!({ "steps": steps }))
 }
@@ -1622,9 +1732,44 @@ fn parse_id_list(input: &str) -> Result<Vec<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
 
     fn args_of(call: &ToolCall) -> &Value {
         &call.args
+    }
+
+    #[test]
+    fn help_is_the_self_contained_script_manual() {
+        let mut root = Cli::command();
+        let top = root.render_long_help().to_string();
+        assert!(
+            top.contains("ema2 act --help"),
+            "top-level help must point to act help"
+        );
+        assert!(
+            top.contains("脚本只允许 act 动作"),
+            "top-level help must state the script boundary"
+        );
+
+        let act = root.find_subcommand_mut("act").expect("act subcommand");
+        let help = act.render_long_help().to_string();
+        for needle in [
+            "fill e15 \"hello\"",
+            "await 10s",
+            "waitFor url=api/save status=200 timeout=5s",
+            "不能写 open/read/snapshot/wait/js/tabs",
+            "waitFor time 1s",
+        ] {
+            assert!(help.contains(needle), "act help missing {needle:?}");
+        }
+
+        let mut root = Cli::command();
+        let wait = root.find_subcommand_mut("wait").expect("wait subcommand");
+        let help = wait.render_long_help().to_string();
+        assert!(
+            help.contains("不能写进 .ema2 脚本"),
+            "wait help must explain it is shell-only"
+        );
     }
 
     #[test]
@@ -1801,6 +1946,23 @@ click target=\"button:提交\"
         assert!(parse_act_script("type e15 hello world").is_err());
         assert!(parse_act_script("back extra").is_err());
         assert!(parse_act_script("click not-a-ref").is_err());
+    }
+
+    #[test]
+    fn script_errors_point_to_the_cli_alternative() {
+        let open = parse_act_script("open https://example.com").unwrap_err();
+        assert!(open.contains("unknown action"), "{open}");
+        assert!(open.contains("ema2 open"), "{open}");
+        assert!(open.contains(SCRIPT_ACTIONS_HINT), "{open}");
+
+        let wait = parse_act_script("wait text Done").unwrap_err();
+        assert!(wait.contains("ema2 wait"), "{wait}");
+
+        let wait_for = parse_act_script("waitFor time 1s").unwrap_err();
+        assert!(wait_for.contains("await 1s"), "{wait_for}");
+
+        let empty = parse_act_script("# only a comment").unwrap_err();
+        assert!(empty.contains("ema2 act --help"), "{empty}");
     }
 
     #[test]

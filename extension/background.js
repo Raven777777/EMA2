@@ -1110,7 +1110,7 @@ async function requireValidSelector(tabId, selector) {
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 13) {
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 14) {
     return { installed: false, handle: String(window.__ema2_doc_handle || '') };
   }
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
@@ -1448,7 +1448,13 @@ function installHelpers() {
 
   /** snapshot 过滤器：links / buttons / form。 */
   const filterFor = (name) => {
-    if (name === 'links') return (el) => el.tagName === 'A' && !!el.getAttribute('href');
+    if (name === 'links') return (el) => {
+      if (el.tagName !== 'A') return false;
+      const href = String(el.getAttribute('href') || '').trim();
+      // `#`/`javascript:` 是浏览器操作入口，不是可读链接；Bing 的 skip/feedback
+      // 按钮就是这种 <a role=button href="#">，别让它们混进 links 结果。
+      return !!href && href !== '#' && !/^javascript:/i.test(href);
+    };
     if (name === 'buttons') return (el) => roleOf(el) === 'button';
     if (name === 'form') {
       return (el) => ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'LABEL', 'FIELDSET'].includes(el.tagName)
@@ -1485,7 +1491,9 @@ function installHelpers() {
           continue;
         }
         if (predicate && !predicate(el)) continue;
-        const role = roleOf(el);
+        // filter=links 时按链接展示：Bing 等站点会给 <a href> 加 role=button，
+        // 直接信 role 会让“只看链接”的结果里出现 button 行。
+        const role = filter === 'links' ? 'link' : roleOf(el);
         const name = nameOf(el);
         // 地标容器（例如 Wikipedia 的 div[role=search]）不是控件；只有 filter=full
         // 才保留。实际输入框/链接会作为各自的后代单独出现。
@@ -1724,11 +1732,19 @@ function installHelpers() {
         }
         if (tag === 'UL' || tag === 'OL') {
           flush();
+          const items = [...child.children].filter(item => item.tagName === 'LI');
+          const reversed = tag === 'OL' && child.hasAttribute('reversed');
+          const parsedStart = Number.parseInt(child.getAttribute('start') || '', 10);
+          let number = Number.isFinite(parsedStart)
+            ? parsedStart
+            : (reversed ? items.length : 1);
           const lines = [];
-          for (const li of child.children) {
-            if (li.tagName !== 'LI') continue;
+          for (const li of items) {
+            const ownValue = Number.parseInt(li.getAttribute('value') || '', 10);
+            if (tag === 'OL' && Number.isFinite(ownValue)) number = ownValue;
             const text = clean([...li.childNodes].map(inline).join(' '));
-            if (text) lines.push((tag === 'OL' ? '1. ' : '- ') + text);
+            if (text) lines.push((tag === 'OL' ? number + '. ' : '- ') + text);
+            if (tag === 'OL') number += reversed ? -1 : 1;
           }
           if (lines.length) blocks.push(lines.join('\n'));
           continue;
@@ -1821,27 +1837,34 @@ function installHelpers() {
 
   /** 当前视口内的 ref 标记（用于截图标注，set-of-marks）。 */
   const marks = () => {
-    const out = [];
+    // 同一元素在旧 document epoch 下可能还留着一个 ref；只保留当前文档的标记，
+    // 并按元素去重（后分配的 ref 胜出），否则截图会出现同一元素两个编号。
+    const byElement = new Map();
     for (const { ref, el } of refEntries(0)) {
+      if (!refIsCurrent(ref)) continue;
       const rect = el.getBoundingClientRect();
       if (rect.width < 2 || rect.height < 2) continue;
       const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
       const offset = frameOffset(win.frameElement || null);
-      const x = Math.round(rect.left + offset.x);
-      const y = Math.round(rect.top + offset.y);
-      if (x + rect.width < 0 || y + rect.height < 0
-          || x > window.innerWidth || y > window.innerHeight) continue;
-      out.push({
+      // 标注坐标必须落在截图范围内；负坐标/视口外元素会画到图外或误导 AI。
+      const x = Math.max(0, Math.round(rect.left + offset.x));
+      const y = Math.max(0, Math.round(rect.top + offset.y));
+      const right = Math.min(window.innerWidth, Math.round(rect.right + offset.x));
+      const bottom = Math.min(window.innerHeight, Math.round(rect.bottom + offset.y));
+      const w = right - x;
+      const h = bottom - y;
+      if (w < 2 || h < 2) continue;
+      byElement.set(el, {
         ref,
         role: roleOf(el),
         name: nameOf(el).slice(0, 30),
         x,
         y,
-        w: Math.round(rect.width),
-        h: Math.round(rect.height),
+        w,
+        h,
       });
     }
-    return out;
+    return [...byElement.values()];
   };
 
   /**
@@ -2032,7 +2055,7 @@ function installHelpers() {
     return { ok: true };
   };
 
-  // 升级到 helper 13 时把旧版本遗留的 DOM 属性清掉（新 ref 只在内存表里）。
+  // 升级 helper 时把旧版本遗留的 DOM 属性清掉（新 ref 只在内存表里）。
   try {
     for (const { root } of collectRoots()) {
       for (const el of root.querySelectorAll('[data-ema2-ref]')) el.removeAttribute('data-ema2-ref');
@@ -2044,7 +2067,7 @@ function installHelpers() {
     collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent,
     setValue, isActionableRole, absoluteHref,
   };
-  window.__ema2_helpers_version = 13;
+  window.__ema2_helpers_version = 14;
   return { installed: true };
 }
 
@@ -3884,7 +3907,7 @@ async function runStep(tab, step) {
 
 /** 在 MAIN world 里按 ref / selector / "role:name" 深度查找（含 shadow root / 同源 iframe）。 */
 function deepFindForDebugger(ref, selector, target) {
-  // helper 13 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
+  // helper 14 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
   const helpers = window.__ema2_helpers;
   if (helpers && typeof helpers.find === 'function') {
     const found = helpers.find(ref || null, selector || null, target || null);
@@ -4536,7 +4559,7 @@ function buildHar(items, pageUrl) {
 
 function validateBatchInner(toolName, inner) {
   if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
-    fail('invalid_argument', 'batch args must be an object', 'see `ema2 <command> --help` (docs/TOOLS.md in the repo)');
+    fail('invalid_argument', 'batch args must be an object', 'run `ema2 batch --help`; for scripts run `ema2 act --help`');
   }
   const has = (key) => inner[key] !== undefined && inner[key] !== null;
   const numberIn = (key, min, max) => {
@@ -4613,7 +4636,7 @@ async function batchTool(args) {
   }
   const inner = args.args === undefined ? {} : args.args;
   if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
-    fail('invalid_argument', 'batch args must be an object', 'see `ema2 <command> --help` (docs/TOOLS.md in the repo)');
+    fail('invalid_argument', 'batch args must be an object', 'run `ema2 batch --help`; for scripts run `ema2 act --help`');
   }
   if (urls.length) {
     // 复合模式的内层参数属于目标工具；open 自身只接受 wait/replace/reuse。
@@ -5126,14 +5149,14 @@ async function snapshotTool(args) {
 function requireStringArg(args, key, max, allowEmpty) {
   if (args[key] === undefined) return undefined;
   if (typeof args[key] !== 'string' || args[key].length > max || (!allowEmpty && !args[key].trim())) {
-    fail('invalid_argument', `${key} must be a string (max ${max})`, 'see `ema2 <command> --help` (docs/TOOLS.md in the repo)');
+    fail('invalid_argument', `${key} must be a string (max ${max})`, 'run `ema2 <command> --help`; for scripts run `ema2 act --help`');
   }
   return args[key];
 }
 
 async function executeTool(name, args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
-    fail('invalid_arguments', 'tool arguments must be an object', 'see `ema2 <command> --help` (docs/TOOLS.md in the repo)');
+    fail('invalid_arguments', 'tool arguments must be an object', 'run `ema2 <command> --help`; for scripts run `ema2 act --help`');
   }
   switch (name) {
     case 'tabs': return tabsTool(args);

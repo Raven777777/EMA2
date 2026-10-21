@@ -1,5 +1,24 @@
 # 变更记录
 
+## v2.3.1 — exe 自描述：脚本语法进 --help，AGENTS 保持简洁
+
+分发包只有 `ema2.exe` + `ema2 init` 生成的 `AGENTS.md`；本版把用户侧文档从仓库搬进 exe。
+
+- **脚本语法进 help**：`ema2 act --help` 现在包含单步/多步/`.ema2` 完整示例、
+  动作白名单、`await`/`waitFor` 规则、`--selector/--target` 的单步限制，以及
+  `open/wait/waitFor time` 三个高频错误写法；`ema2 --help` 给 AI 会话顺序和脚本入口。
+- **错误自纠正**：脚本里写 `open/read/snapshot/wait/js` 时给出对应 shell 命令；
+  `waitFor` 非 `key=value` / 未知 key 时说明只支持 `url/status/timeout`，并提示
+  `await 1s` 或 shell 的 `ema2 wait`；空脚本/读不到脚本也指向 `ema2 act --help`。
+- **不再提仓库文档**：exe/扩展的用户可见 hint 去掉 `docs/TOOLS.md`；
+  `ema2 status` 扩展断连时补一行 popup/端口/重连 hint。
+- **AGENTS.md**：只增加“先看 `--help`”、脚本白名单和 timeout 单位，不塞长手册；
+  错误码表同步去掉仓库文档引用。
+- **read md**：有序列表保留 `<ol start>` / `<li value>` / `reversed` 的编号。
+- **snapshot --filter links**：`<a role=button>` 统一按 `link` 输出，排除 `#` / `javascript:` 伪链接。
+- **shot --annotate**：只标当前 document epoch、按元素去重，坐标裁剪到视口内。
+- 版本：exe/扩展 2.3.1；helper 14；`cargo test` 70 passed；真机 verify 93 项。
+
 ## v2.3.0 — 真实环境 bug 报告修复：不再卡死、不再假成功
 
 针对 `bin/BUGREPORT.md` 的 20 项复现逐条修复；核心是“对话框/慢页面不能把会话卡死，动作结果必须可信”。
@@ -32,6 +51,7 @@
   `--timeout`/`--values` 并显示内层 flags；`read` Markdown 转义/图片 alt；截断标记；
   EPIPE 不再 panic；错误码/提示同步。
 - 版本：exe/扩展 2.3.0；helper 13；`cargo test` 68 passed；真机 verify 83 项。
+  （v2.3.1 起 helper 14。）
 
 ## v2.2.2 — 状态隔离、输出完整性与参数真实性
 

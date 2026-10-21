@@ -3,6 +3,9 @@
 单文件 `ema2` CLI。AI 通过 shell 调用子命令操作真实 Edge。
 无 MCP、无 token、无授权、无配置文件。默认端口 **7744**。
 
+> 分发包只带 `ema2.exe` 和 `ema2 init` 生成的 `AGENTS.md`；**exe 内的
+> `ema2 <cmd> --help` 才是用户侧权威文档**，本文是仓库内参考。
+
 ## 命令总览
 
 | 命令 | 一句话 |
@@ -163,7 +166,8 @@ extension=connected  version=<ext-version>  last_ping=2s
 tabs=3  active_tab=42
 ```
 
-扩展没连时输出 `extension=disconnected last_ping=never` 与 `tabs=unknown active_tab=unknown`。
+扩展没连时输出 `extension=disconnected last_ping=never`、`tabs=unknown active_tab=unknown`，
+并给一行 `hint=`：检查扩展 popup 端口（默认 7744）、点重连，仍失败就到 `edge://extensions` 重新加载。
 `relay=not_running` 时退出码 2。
 
 ### init
@@ -217,7 +221,7 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 - `--replace`：在当前活动标签里导航（不新建），适合「同一个页面连续翻几页」。
 - `--reuse session`：复用本会话**最近**打开的标签；标签已被关掉则退回新建。
 - `--tab ID`：导航指定标签（显式意图，不计入会话）。
-- `--timeout N`：**整个 open 流程**的硬上限（1..60，默认 15）：打开标签 + 等文档接位 +
+- `--timeout N`（单位：秒）：**整个 open 流程**的硬上限（1..60，默认 15）：打开标签 + 等文档接位 +
   装 hook + 读 timing/focus 都在这段预算内；慢站点/SPA 首屏可以调大。
 - 三者互斥，同时给报 `invalid_argument`。
 - `status=` 来自 `PerformanceNavigationTiming.responseStatus` 的真实主文档状态：
@@ -249,6 +253,7 @@ ema2 read [--tab ID] [--mode md|text|html] [--selector X] [--no-main] [--budget 
 - 正文遍历会进入 open shadow root（Web Component）；closed shadow root 仍不可见。
 - Markdown 按 `childNodes` 遍历，根节点直接文本、p/h1/pre、文本+块混排都不会漏字或重复。
 - `md` 是**有损**渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对URL)`，
+  有序列表保留 `<ol start>` / `<li value>` / `reversed` 的编号；
   行内代码与 `strong/em` 保留；样式、合并单元格、脚本生成内容会丢，不要拿它当可回写的源文件。
   链接文字里的 `[`/`]` 会转义，URL 里的括号/空格会 percent-encode；`<img>` 输出 `![alt](src)`，
   `text` 模式输出 alt 文本。
@@ -281,6 +286,8 @@ ema2 snapshot [--tab ID] [--filter interactive|full|links|buttons|form] \
 - `role=search/banner/main/...` 这类**地标容器**不会被当成控件；搜索框以真正的
   `<input type=search>` / textbox ref 出现。
 - `--filter full` 额外带 `#1/#2` 标题；`--near REF` 限定在该元素最近的 `form/section/article/dialog/table/ul/main/nav` 内。
+- `--filter links` 只列真正可跳转的 `<a href>`，输出 role 统一为 `link`（Bing 的
+  `<a role=button href="#">` 不会混成 button 行）；`#` / `javascript:` 伪链接被排除。
 - 头部带 `refs= roots= doc= visual=`；纯视觉页面会给 `hint` 建议用 `shot --annotate`。
 - ref 只存在页面内存的 WeakRef 表里，不再写 `data-ema2-ref` 属性；页面 MutationObserver/CSS
   不会被 EMA2 的 snapshot 污染。
@@ -395,11 +402,15 @@ click e30
 ```
 
 规则：
-1. 首个 token 是 11 个动作之一，或脚本专用的 `await`。
+1. 首个 token 是 11 个动作之一，或脚本专用的 `await` / `waitFor`。
+   **脚本里不能写 `open/read/snapshot/wait/js/tabs` 等 CLI 命令**；这些在 shell 里单独调用。
 2. `ref` 裸写；`selector=` / `target=` 是命名参数（与裸写互斥）。
 3. 含空格的值用双引号包裹，引号内支持 `\"` 转义。
-4. `waitFor` 是独立步骤，在所在行执行（通常放在触发请求的动作之后）；`timeout=` 接受 `500ms` / `5s`。
+4. `waitFor` 是独立步骤，在所在行执行（通常放在触发请求的动作之后）；只接受
+   `url=` / `status=` / `timeout=`，`timeout=` 接受 `500ms` / `5s`。它不是页面条件等待；
+   单纯等待用 `await 1s`，等文本/选择器用 shell 的 `ema2 wait`。
 5. `await 10s` 等上一个动作的导航/页面稳定；如果上一步 `settle=pending` 且下一步不是 `await`，脚本会停止而不是在旧页面继续执行。
+6. 脚本语法/示例/常见错误以 `ema2 act --help` 为准。
 
 最多 20 步，可跨导航；返回每步结果 + `settle/expect/next_url/new_tab/changed/url/title/new/console_errors`。
 
@@ -443,12 +454,14 @@ ema2 wait time 5s
 ema2 wait idle [--timeout 30s]
 ```
 
+这是 shell 命令，**不能写进 `.ema2` 脚本**；脚本里用 `await` / `waitFor`。
+
 返回 `ok=<条件> elapsed=...s`；`time`/`timeout` 都在 0–300s。
 
 ## js
 
 ```bash
-ema2 js '<code>' [--tab ID] [--budget N] [--cursor N] [--timeout 10]
+ema2 js '<code>' [--tab ID] [--budget N] [--cursor N] [--timeout 10]  # 秒
 ema2 js --file script.js [...]
 ```
 
@@ -508,6 +521,7 @@ ema2 files download-dir
 
 - `upload` 走**页面侧 DataTransfer**：CLI 读文件字节随请求下发，扩展在页面里构造 `File`
   再赋给 `input.files`，因此不依赖 debugger（别的扩展占住 tab 时也能用）。
+  路径是位置参数，所以 ref 必须用 `--ref`；`act` 的 ref 是位置参数。
   单次 ≤20 个文件、原始载荷 ≤5 MiB；Windows 路径必须是 `C:/...` 绝对路径。
 - `download-dir`：只为返回明确错误——Edge 不允许扩展改下载目录，
   固定返回 `download_dir_unsupported`；请在 `edge://settings/downloads` 手动设置。
@@ -524,6 +538,7 @@ ema2 shot [--tab ID] [--inline] [--annotate] [--format png|jpeg] [--out PATH]
 - `--inline`：不落盘，CLI 输出 `data:image/png;base64,...`（或 jpeg）。
 - `--annotate`：先快照，再在图上画 ref 编号，回坐标列表 + 标注图
   （`[e3@d3] button "提交" @439,275 43x26`）；截图前后复核 tab/document。
+  只标注当前 document epoch、视口内的元素；同一元素只保留一个 ref，坐标裁剪为非负。
   同源 iframe 内的 ref 坐标会加上 iframe 偏移，不再画到页面左上角。
 
 ## batch

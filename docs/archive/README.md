@@ -1,4 +1,4 @@
-# 历史规划归档
+# 历史文档归档
 
 > **这些文件不代表当前行为。** 保留仅为追溯设计过程；
 > 具体实现以 [`../ARCHITECTURE.md`](../ARCHITECTURE.md)、[`../TOOLS.md`](../TOOLS.md)、
@@ -8,6 +8,7 @@
 |---|---|---|---|
 | [`v2-architecture-plan.md`](v2-architecture-plan.md) | v2.0 改造前的形态共识（单 exe、单端口、无 MCP） | 已落地（v2.0） | [`../ARCHITECTURE.md`](../ARCHITECTURE.md) |
 | [`v2-tools-plan.md`](v2-tools-plan.md) | v2.0 的命令参考草案（11 工具表、输出协议初稿） | 已过时（v2.1 起有多处行为变更） | [`../TOOLS.md`](../TOOLS.md) |
+| [`v2.3.0-evaluation-report.md`](v2.3.0-evaluation-report.md) | v2.3.0 外部评测报告（8.5/10） | 反馈项已在 v2.3.1 处理 | [`../TOOLS.md`](../TOOLS.md) / [`../HANDOFF.md`](../HANDOFF.md) |
 
 ## 归档规则
 

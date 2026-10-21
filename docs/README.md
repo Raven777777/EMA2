@@ -22,7 +22,7 @@ docs/
 ├── TESTING.md         ← 真机验收规定与清单
 ├── HANDOFF.md         ← 交接：版本、契约、已知弱点、下一步
 ├── CHANGELOG.md       ← 版本历史（唯一版本号来源）
-├── archive/           ← 已归档的历史规划，仅追溯
+├── archive/           ← 已归档的历史规划/评测，仅追溯
 └── img/               ← README 用图
 ```
 
@@ -39,12 +39,17 @@ docs/
 ## 归档
 
 [`archive/`](archive/) 里的文件**不代表当前行为**，只用于追溯设计过程。
-每个文件头部都标注了归档状态与对应的现行文档。
+每个文件头部都标注了归档状态与对应的现行文档；包括 v2.3.0 外部评测报告。
+
+## 维护脚本
+
+- `scripts/reloadextension.ahk`：AutoHotkey v2 脚本，激活 Edge、打开 `edge://extensions`
+  并点击 EMA2 的“重新加载”。用法见仓库根目录 [`../AGENTS.md`](../AGENTS.md)。
 
 ## 验证文档是否过期
 
 ```bash
 cargo test                                   # 含“错误码必须写进 TOOLS.md”的漂移测试
 python scripts/verify.py --skip-real-edge     # 同一件事的快速版
-python scripts/verify.py                      # 真实前台 Edge 冒烟（83 项）
+python scripts/verify.py                      # 真实前台 Edge 冒烟（93 项）
 ```

@@ -50,6 +50,7 @@ FIXTURE_HOME = """<!doctype html>
   <tbody><tr><td>alpha</td><td>1</td></tr><tr><td>beta</td><td>2</td></tr></tbody>
 </table>
 <ul id="list"><li>one</li><li>two</li></ul>
+<ol id="ordered" start="3"><li>three</li><li value="7">seven</li><li>eight</li></ol>
 <pre id="code">const answer = 42;</pre>
 <button id="btn" type="button">change</button>
 <input id="text" name="q" type="text" placeholder="query">
@@ -123,7 +124,10 @@ FIXTURE_BUGS = """<!doctype html>
 <select id="sel"><option value="v1">one</option><option value="v2" selected>two</option></select>
 <textarea id="area">secret</textarea>
 <a id="abs" href="https://example.org/x?a=1#f">abs</a>
+<a id="btnlink" role="button" href="/second.html">button-link</a>
+<a id="hashlink" href="#">hash link</a>
 <a id="under" href="/second.html">under overlay</a>
+<button id="neg" type="button" style="position:absolute;left:-30px;top:20px;width:20px;height:20px">neg</button>
 <button id="alert" type="button" onclick="alert('boom')">alert</button>
 <button id="print" type="button" onclick="window.print()">print</button>
 <button id="pop" type="button" onclick="window.open('/second.html')">popup</button>
@@ -245,7 +249,13 @@ def static_contract_check() -> bool:
     print(f"PASS  static: {len(codes)} error codes documented" if not missing else "FAIL  static: error codes")
     if missing:
         print("      缺少文档:", ", ".join(missing))
-    return not missing
+
+    agents = (ROOT / "rust" / "assets" / "AGENTS.md").read_text(encoding="utf-8")
+    agents_ok = "docs/TOOLS.md" not in agents and "ema2 act --help" in agents
+    print("PASS  static: AGENTS.md is self-contained" if agents_ok else "FAIL  static: AGENTS.md points outside the package")
+    if not agents_ok:
+        print("      AGENTS.md must point to `ema2 act --help` and must not mention docs/TOOLS.md")
+    return not missing and agents_ok
 
 
 def markdown_link_check() -> bool:
@@ -325,6 +335,7 @@ def main() -> int:
     upload = tmp / "upload.txt"
     upload.write_text("verify upload payload", encoding="utf-8")
     shot_path = tmp / "shot.png"
+    annotate_path = tmp / "annotate.png"
 
     try:
         opened = runner.expect_ok("open fixture", runner.run("open", f"{base}/"), "status=200", "net_hook=on", "title=ema2 fixture home")
@@ -439,6 +450,11 @@ def main() -> int:
         runner.check("md keeps table", "| key | value |" in md and "| alpha | 1 |" in md, md[:600])
         runner.check("md keeps list", "- one" in md and "- two" in md, md[:400])
         runner.check(
+            "md keeps ordered-list numbering",
+            "3. three" in md and "7. seven" in md and "8. eight" in md,
+            md[:800],
+        )
+        runner.check(
             "md keeps paragraph breaks",
             re.search("intro text[^\n]*\n\n[^\n]*second paragraph", md) is not None,
             md[:600],
@@ -463,6 +479,14 @@ def main() -> int:
         )
         runner.check("shadow read keeps light DOM", "light paragraph" in shadow_read, shadow_read[:600])
         runner.check("shadow snapshot has refs", "refs=" in shadow_snapshot, shadow_snapshot[:600])
+
+        help_act = runner.expect_ok("act --help is the script manual", runner.run("act", "--help"), "脚本规则", "ema2 act --help")
+        runner.check(
+            "act --help names unsupported CLI actions",
+            "不能写 open/read/snapshot/wait/js/tabs" in help_act and "waitFor time 1s" in help_act,
+            help_act[:1600],
+        )
+        runner.expect_ok("top-level help points to act help", runner.run("--help"), "ema2 act --help")
 
         # SPA 链接只改 DOM 不导航：应 settle=done + nav=none，而不是 pending。
         runner.run("open", f"{base}/spa.html")
@@ -557,6 +581,19 @@ def main() -> int:
             (shot.stdout or "") + (shot.stderr or ""),
         )
 
+        annotate = runner.run("shot", "--annotate", "--out", str(annotate_path))
+        annotate_out = (annotate.stdout or "") + (annotate.stderr or "")
+        mark_refs = re.findall(r"^\[(e\d+@d\d+)\]", annotate_out, re.M)
+        mark_coords = re.findall(r"@(-?\d+),(-?\d+)", annotate_out)
+        runner.check(
+            "shot --annotate keeps refs unique and coords non-negative",
+            annotate.returncode == 0
+            and annotate_path.exists()
+            and len(mark_refs) == len(set(mark_refs))
+            and all(int(x) >= 0 and int(y) >= 0 for x, y in mark_coords),
+            annotate_out[:1600],
+        )
+
         runner.run("open", f"{base}/")
         uploaded = runner.run("files", "upload", str(upload).replace("\\", "/"), "--selector", "#file")
         runner.expect_ok("files upload (DataTransfer)", uploaded, "uploaded=1")
@@ -603,6 +640,13 @@ def main() -> int:
             "snapshot href keeps scheme/query/fragment",
             links.returncode == 0 and "href=https://example.org/x?a=1#f" in links_out
             and "href=http://127.0.0.1:" in links_out,
+            links_out[:900],
+        )
+        runner.check(
+            "snapshot --filter links never labels anchors as buttons",
+            "link \"button-link\"" in links_out
+            and "button \"button-link\"" not in links_out
+            and "hash link" not in links_out,
             links_out[:900],
         )
 
@@ -717,6 +761,25 @@ def main() -> int:
                 shot_tab.returncode == 0 and "activated=1" in shot_tab_out and inactive_shot.exists(),
                 shot_tab_out[:900],
             )
+
+        bad_open = tmp / "bad-open.ema2"
+        bad_open.write_text("open https://example.com\n", encoding="utf-8")
+        bad_wait = tmp / "bad-wait.ema2"
+        bad_wait.write_text("waitFor time 1s\n", encoding="utf-8")
+        open_error = runner.expect_error(
+            "script rejects open with a CLI alternative",
+            runner.run("act", "--script", str(bad_open)),
+            "invalid_argument",
+            1,
+        )
+        runner.check("script error names ema2 open", "ema2 open" in open_error, open_error[:800])
+        wait_error = runner.expect_error(
+            "script rejects waitFor time with await hint",
+            runner.run("act", "--script", str(bad_wait)),
+            "invalid_argument",
+            1,
+        )
+        runner.check("script error names await 1s", "await 1s" in wait_error, wait_error[:800])
 
         runner.expect_error("unknown act flag", runner.run("act", "click", "--at", "10,20"), "invalid_argument", 1)
         runner.expect_error("non-ref positional", runner.run("act", "click", "not-a-ref"), "invalid_argument", 1)

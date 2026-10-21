@@ -274,7 +274,7 @@ async fn cmd(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
             &message,
-            "fix the arguments; see `ema2 <command> --help` (docs/TOOLS.md in the repo)",
+            "fix the arguments; run `ema2 <command> --help` (scripts: `ema2 act --help`)",
         );
     }
     if !state.extension_connected() {

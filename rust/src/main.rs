@@ -374,6 +374,9 @@ fn status(port: u16) -> i32 {
         ));
     } else {
         out_line(format!("extension=disconnected last_ping={last_ping}"));
+        out_line(format!(
+            "hint=click the EMA2 extension icon, keep port={port} and click reconnect; if it still fails, reload the extension in edge://extensions"
+        ));
     }
 
     if connected {
@@ -484,7 +487,7 @@ fn run_built(call: Result<cli_args::ToolCall, String>, port: u16) -> i32 {
         Ok(call) => run_tool(call, port),
         Err(message) => {
             eprintln!(
-                "error=invalid_argument msg={} hint=see `ema2 <command> --help` (or docs/TOOLS.md in the repo)",
+                "error=invalid_argument msg={} hint=run `ema2 <command> --help`; for .ema2 scripts run `ema2 act --help`",
                 one_line(&message)
             );
             1

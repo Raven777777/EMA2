@@ -23,11 +23,11 @@ bin/ema2.exe snapshot
 bin/ema2.exe act --script examples/form.ema2
 ```
 
-脚本语法：
+脚本语法（完整版以 `ema2 act --help` 为准）：
 
 - 每行一条动作；空行和 `#` 注释忽略；
-- 含空格的值用双引号；
-- `waitFor` 独立成行，挂在上一动作后；
+- 只允许 act 动作 + `await` + `waitFor`，不能写 `open/read/wait`；
+- `waitFor` 独立成行，只接受 `url=` / `status=` / `timeout=`；
 - `await 10s` 等上一个动作的导航/页面稳定；
 - `type` 在 caret/selection 处插入，`fill` 覆盖。
 
