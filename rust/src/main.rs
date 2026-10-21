@@ -123,6 +123,7 @@ fn main() {
             body_filter,
             bodies,
             har,
+            headers,
             budget,
         } => run_built(
             cli_args::build_observe(
@@ -135,6 +136,7 @@ fn main() {
                 &body_filter,
                 bodies,
                 har,
+                &headers,
                 budget,
             ),
             port,
@@ -838,14 +840,28 @@ fn detach(command: &mut Process) {
 }
 
 #[cfg(windows)]
+fn tasklist_image_is_ema2(listed: &str) -> bool {
+    // /FO CSV /NH 的一行：`"ema2.exe","1234","Console",...`。
+    // 只认第一列镜像名，避免命令行/路径里恰好含 ema2 的进程被误杀。
+    listed.lines().any(|line| {
+        line.split(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .eq_ignore_ascii_case("ema2.exe")
+    })
+}
+
+#[cfg(windows)]
 fn kill_process(pid: u32) -> bool {
     let pid_text = pid.to_string();
     let listed = Process::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).to_ascii_lowercase())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default();
-    if !listed.contains("ema2") {
+    if !tasklist_image_is_ema2(&listed) {
         return false;
     }
     Process::new("taskkill")
@@ -882,6 +898,23 @@ fn kill_process(pid: u32) -> bool {
 mod tests {
     use super::lexical_normalize;
     use std::path::{Path, PathBuf};
+
+    #[cfg(windows)]
+    #[test]
+    fn tasklist_guard_matches_only_the_ema2_image() {
+        assert!(super::tasklist_image_is_ema2(
+            "\"ema2.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\""
+        ));
+        assert!(super::tasklist_image_is_ema2(
+            "\"EMA2.EXE\",\"1234\",\"Console\",\"1\",\"10,000 K\""
+        ));
+        assert!(!super::tasklist_image_is_ema2(
+            "\"notema2.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\""
+        ));
+        assert!(!super::tasklist_image_is_ema2(
+            "\"python.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\""
+        ));
+    }
 
     #[test]
     fn output_paths_are_normalized_without_touching_disk() {

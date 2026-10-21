@@ -4,20 +4,34 @@
 
 - **释放不再卡死**：每 tab 的 `disarm()` 有单独时限，整批 sweep 有总上限；
   卡在原生对话框/死循环里的渲染进程不会让后续命令永久排队。
+- **租约不再泄漏**：每个 RPC 使用独立 `guardContext`，租约带 token 按次释放；
+  watchdog 超时后延迟强制回收该 RPC 的租约，迟到的内层工具不再新增租约。
+  keepalive 也受 `watchdog + 5s` 限制，不会把 service worker 永久保活。
+- **重启后仍能清理**：已 arm 的 tab 持久化到 `chrome.storage.session`；
+  disarm 分 top frame 与 all-frames 两次验证，只有所有可脚本化 frame 都确认恢复
+  才移出跟踪集合，失败/超时的 tab 留待下次 release 或启动重试。
 - **消除释放竞态**：最后租约先注销动态脚本再 disarm；document_start 新文档通过
   ISOLATED world bridge 查询租约，租约已释放就立即自行恢复原生 API。
 - **升级路径修复**：v1 的 own `onbeforeunload` 假 accessor 不再被当成原生引用；
   descriptor 在原型上时不再留下自己的 `window.onbeforeunload`。
 - **清理范围收窄**：普通命令只 disarm 真正 arm 过的 tab，不再每条命令扫全浏览器。
 - **生命周期 fail-open**：guard 队列任一步失败只记日志，不会污染后续命令。
+- **HAR 默认脱敏**：`authorization`/`proxy-authorization`/`cookie`/`set-cookie`
+  默认写成 `<redacted>`；需要原值时显式 `observe network --har ... --headers all`。
+- **CLI 修正**：`act type --submit <ref> <text>` 不再吞掉 ref；`wait idle 10s`
+  的位置参数真正作为兜底超时；`batch` 内层 read 支持 `visible`；
+  重复 `tabIds` 在 daemon 与扩展两侧都拒绝。
+- **错误码**：新增 `init_failed`、`doc_handle_failed`。文档句柄读取/持久化失败时
+  拒绝发号，避免 SW 重启后 `@dN` 回绕。
 - **目标可见性**：`role:name` 的精确名/HTML name/部分匹配每一层都优先可见控件；
   helper 升至 19。
 - **版本门槛**：manifest 声明 `minimum_chrome_version: 111`；静态验收检查扩展版本
   与 `PRODUCT_VERSION` 一致。
 - **reuse 语义**：`open --reuse session` 同一文档不再重载；`batch --reuse session`
   精确 URL 命中时也续用文档而不重载；文档明确两者的匹配规则差异。
-- **验收**：`cargo test` 74 passed；clippy/fmt 通过；真实前台 Edge 113 checks
-  passed；额外验证 v1→v2 升级后原生 `onbeforeunload` 可重新赋值。
+- **验收**：`cargo test` 80 passed；clippy/fmt 通过；真实前台 Edge 113 checks
+  passed；额外验证 `--submit` 真实提交、HAR 默认脱敏/`--headers all` 与
+  `wait idle` 位置参数。
 
 ## v2.4.1.1 — guard 仅命令期启用，补齐目标与默认值
 

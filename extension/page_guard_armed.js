@@ -14,10 +14,14 @@
       if (typeof guard.disarm === 'function') guard.disarm();
     } catch (_) { /* ignore */ }
   };
-  try {
-    document.addEventListener('ema2-guard-force-disarm', forceDisarm, true);
-    // bridge 可能比本脚本晚执行：它 ready 后重发一次 armed。
-    document.addEventListener('ema2-guard-bridge-ready', signalArmed, true);
-  } catch (_) { /* ignore */ }
+  // 同一文档可能被多次注入（每个命令一次）；监听器只装一次，避免长驻 SPA 叠加。
+  if (!guard.__ema2ArmedListeners) {
+    guard.__ema2ArmedListeners = true;
+    try {
+      document.addEventListener('ema2-guard-force-disarm', forceDisarm, true);
+      // bridge 可能比本脚本晚执行：它 ready 后重发一次 armed。
+      document.addEventListener('ema2-guard-bridge-ready', signalArmed, true);
+    } catch (_) { /* ignore */ }
+  }
   signalArmed();
 })();

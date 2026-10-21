@@ -256,6 +256,9 @@ pub enum Command {
         /// 导出 HAR 到指定路径
         #[arg(long, value_name = "PATH")]
         har: Option<PathBuf>,
+        /// HAR 凭证头策略：redact（默认，脱敏）| all（保留原值）
+        #[arg(long, value_name = "redact|all", default_value = "redact", value_parser = ["redact", "all"])]
+        headers: String,
         /// 返回字符预算（默认 3000，范围 200..200000）
         #[arg(long, value_name = "N")]
         budget: Option<u64>,
@@ -326,7 +329,7 @@ pub enum TabsCommand {
     },
     /// 当前活动标签页
     Current,
-    /// 新建标签页并激活：tabs new <URL> [--background]
+    /// 新建标签页并激活：tabs new <URL> [--background]（URL 必须是 http(s)）
     New {
         url: String,
         /// 兼容旧写法：显式激活（默认就是激活）
@@ -555,6 +558,20 @@ pub fn build_wait(
         }
         "idle" => {
             arguments["idle"] = json!(true);
+            if let Some(value) = value {
+                // `wait idle 10s` 里的位置参数就是兜底超时，不能静默丢弃。
+                if timeout.is_some() {
+                    return Err(
+                        "wait idle: use either a positional duration or --timeout, not both".into(),
+                    );
+                }
+                let seconds =
+                    parse_duration_secs(value).map_err(|error| format!("wait idle: {error}"))?;
+                if !(0.0..=300.0).contains(&seconds) {
+                    return Err("wait idle: duration must be between 0 and 300 seconds".into());
+                }
+                arguments["timeout"] = json!(seconds);
+            }
         }
         _ => {
             return Err(format!(
@@ -632,12 +649,21 @@ pub fn build_observe(
     body_filter: &Option<String>,
     bodies: Option<bool>,
     har: Option<PathBuf>,
+    headers: &str,
     budget: Option<u64>,
 ) -> Result<ToolCall, String> {
     if !matches!(kind, "console" | "network") {
         return Err(format!(
             "observe: kind must be console|network, got {kind:?}"
         ));
+    }
+    if !matches!(headers, "redact" | "all") {
+        return Err(format!(
+            "observe --headers must be redact|all, got {headers:?}"
+        ));
+    }
+    if headers == "all" && kind != "network" {
+        return Err("observe --headers only applies to network".into());
     }
     let mut arguments = json!({ "kind": kind });
     set_opt(&mut arguments, "tabId", tab);
@@ -647,6 +673,9 @@ pub fn build_observe(
     set_opt(&mut arguments, "bodyFilter", body_filter.clone());
     set_opt(&mut arguments, "bodies", bodies);
     set_opt(&mut arguments, "budget", budget);
+    if headers == "all" {
+        arguments["harHeaders"] = json!("all");
+    }
     if let Some(wait) = wait {
         let seconds =
             parse_duration_secs(wait).map_err(|error| format!("observe --wait: {error}"))?;
@@ -1169,12 +1198,17 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             "--wait-for" => wait_for = Some(next_value("--wait-for")?),
             "--steps" => steps_inline = Some(next_value("--steps")?),
             "--script" => script_path = Some(next_value("--script")?),
-            "--submit" => submit_flag = true,
+            "--submit" => {
+                // 布尔 flag：不消耗下一个 token，否则 `--submit e1 hi` 会吞掉 ref。
+                submit_flag = true;
+                index += 1;
+                continue;
+            }
             other if other.starts_with('-') => {
                 // trailing_var_arg + allow_hyphen_values 会把拼错的 flag 变成位置参数；
                 // 这里直接拒绝，别让它悄悄变成一个 ref。
                 return Err(format!(
-                    "act: unknown flag {other:?} (known: --selector --target --key --delta-y --submit                      --tab --wait-for --steps --script --port)"
+                    "act: unknown flag {other:?} (known: --selector --target --key --delta-y --submit --tab --wait-for --steps --script --port)"
                 ));
             }
             other => {
@@ -2032,6 +2066,12 @@ click target=\"button:提交\"
         let call = build_wait("idle", &None, &None, None).unwrap();
         assert_eq!(args_of(&call)["idle"], true);
 
+        let call = build_wait("idle", &Some("10s".into()), &None, None).unwrap();
+        assert_eq!(args_of(&call)["idle"], true);
+        assert_eq!(args_of(&call)["timeout"], 10.0);
+        // 位置参数与 --timeout 不能同时静默覆盖。
+        assert!(build_wait("idle", &Some("10s".into()), &Some("20s".into()), None).is_err());
+
         let call = build_wait("textGone", &Some("Loading".into()), &None, None).unwrap();
         assert_eq!(args_of(&call)["textGone"], "Loading");
 
@@ -2267,6 +2307,7 @@ click target=\"button:提交\"
             &Some("error".into()),
             Some(false),
             Some(PathBuf::from("net.har")),
+            "redact",
             None,
         )
         .unwrap();
@@ -2277,11 +2318,34 @@ click target=\"button:提交\"
         assert_eq!(args_of(&call)["bodyFilter"], "error");
         assert_eq!(args_of(&call)["bodies"], false);
         assert_eq!(args_of(&call)["har"], true);
+        assert_eq!(args_of(&call)["harHeaders"], Value::Null);
         assert_eq!(call.out, Some(PathBuf::from("net.har")));
+
+        let call = build_observe(
+            "network",
+            None,
+            None,
+            &None,
+            &None,
+            &None,
+            &None,
+            None,
+            Some(PathBuf::from("net.har")),
+            "all",
+            None,
+        )
+        .unwrap();
+        assert_eq!(args_of(&call)["harHeaders"], "all");
+        assert!(
+            build_observe(
+                "console", None, None, &None, &None, &None, &None, None, None, "all", None
+            )
+            .is_err()
+        );
 
         assert!(
             build_observe(
-                "dom", None, None, &None, &None, &None, &None, None, None, None
+                "dom", None, None, &None, &None, &None, &None, None, None, "redact", None
             )
             .is_err()
         );
@@ -2381,6 +2445,32 @@ click target=\"button:提交\"
 
         // 还是不能把拼错的 flag 当 ref。
         assert!(build_act(&["click".into(), "--at".into(), "1,2".into()]).is_err());
+    }
+
+    #[test]
+    fn act_submit_is_a_flag_even_before_positionals() {
+        // `--submit` 是布尔 flag，不能在 `type` 前吞掉 ref/text。
+        let call = build_act(&[
+            "type".into(),
+            "--submit".into(),
+            "e1".into(),
+            "hello".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["ref"], "e1");
+        assert_eq!(args_of(&call)["text"], "hello");
+        assert_eq!(args_of(&call)["submit"], true);
+
+        let call = build_act(&[
+            "--submit".into(),
+            "type".into(),
+            "e1".into(),
+            "hello".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["ref"], "e1");
+        assert_eq!(args_of(&call)["text"], "hello");
+        assert_eq!(args_of(&call)["submit"], true);
     }
 
     #[test]

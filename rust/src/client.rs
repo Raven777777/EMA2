@@ -113,8 +113,8 @@ fn decode_chunked(mut data: &[u8]) -> Vec<u8> {
         if size == 0 {
             break;
         }
+        // 数据不足说明响应体被截断：丢掉不完整的块，不要把半截内容当成完整值。
         if data.len() < size {
-            out.extend_from_slice(data);
             break;
         }
         out.extend_from_slice(&data[..size]);
@@ -150,5 +150,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.body, "hello world");
+    }
+
+    #[test]
+    fn drops_truncated_chunk() {
+        let response = parse_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n wo",
+        )
+        .unwrap();
+        assert_eq!(response.body, "hello");
     }
 }

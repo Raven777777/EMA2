@@ -156,14 +156,22 @@ CLI 参数
 - 页面命令开始时登记 guard lease；第一个 lease 通过
   `chrome.scripting.registerContentScripts` 动态注册 MAIN world、document_start、
   all-frames 的 `page_guard.js` + `page_guard_armed.js`，覆盖导航后的新文档。
+- 每个 RPC 有独立的 `guardContext`：租约带 token，释放时按 token 扣减，
+  重复释放/超时兜底不会误扣别的命令。watchdog 触发后延迟
+  `COMMAND_GUARD_ABANDON_GRACE_MS` 强制释放该上下文持有的租约，租约存活上限
+  因此被约束为 `watchdog + 5000ms`；上下文关闭后迟到的新租约立即释放。
 - 对已经打开的 tab，扩展立即注入并 arm；读取、快照、动作、等待、JS、观测、
   上传和截图都在租约内执行。`open` 先导航，再 arm 最终文档。
 - 扩展只记录真正被 arm 过的 tab（`ensurePageGuard` + document_start 新文档上报），
-  不再每条命令扫全部标签。
+  不再每条命令扫全部标签。该集合写入 `chrome.storage.session`
+  （`ema2_command_guard_tabs`），service worker 重启后仍能继续清理。
 - 最后一个 lease 结束时**先**注销动态脚本，**再**对记录过的 tab 广播 `disarm()`。
-  每个 tab 的清理有单独时限，整批还有总上限；卡在原生对话框里的渲染进程不能
-  拖死后续命令。释放窗口内仍在加载的新文档由 ISOLATED world bridge 询问租约，
-  已归零就立即自行 `disarm()`。
+  disarm 分 top frame 和 all-frames 两次执行并分别验证：只有 top frame 与所有
+  可脚本化 frame 都确认恢复，tab 才移出跟踪集合并持久化；受限/刚导航的 frame
+  不能让 top frame 一起失败，也不能被成功结果掩盖。未验证的 tab 留待下次
+  release/启动重试。每个 tab 的清理有单独时限，整批还有总上限；卡在原生对话框里
+  的渲染进程不能拖死后续命令。释放窗口内仍在加载的新文档由 ISOLATED world
+  bridge 询问租约，已归零就立即自行 `disarm()`。
 - alert/confirm/prompt/print/window.open 以及赋值型 `onbeforeunload` 恢复原生行为。
 - `page_guard.js` 默认 disarmed；从旧 v1/v2 升级时使用原生 descriptor 恢复页面，
   v1 的 own `onbeforeunload` accessor 不会被当成原生引用。
@@ -205,6 +213,8 @@ CLI 参数
 - `observe network --bodies=false` 真正关闭 body clone；
 - `bodyFilter` 限 512 字符，拒绝嵌套量词/量词组内分支等指数回溯形态；
 - `--har` 导出 HAR 1.2 采样，不是完整抓包；JSON 不经过普通文本预算截断；
+  `authorization`/`proxy-authorization`/`cookie`/`set-cookie` 默认脱敏为 `<redacted>`，
+  `--headers all` 才导出原值；
 - console hook 记录 log/info/warn/error/debug，支持增量 `--since` 和 `--filter`。
 
 ## js 的两条通道

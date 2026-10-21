@@ -160,7 +160,9 @@ cargo test
 - `js` 全局 debugger 串行；attach 非超时失败自动重试一次；运行时 SyntaxError 不重跑
 - `observe console --wait` 先装 hook 再等待；console/network 的 document epoch 分开记录
 - `observe console --level` 默认 `error`，输出显式带 `level=<阈值>`
-- HAR 导出是完整 JSON，不经过 20 万字符文本上限
+- HAR 导出是完整 JSON，不经过 20 万字符文本上限；凭证头默认 `<redacted>`，`--headers all` 才导出原值
+- command guard 的 tab 集合持久化到 `chrome.storage.session`；disarm 分 top/all-frames 验证，失败的 tab 留待下次重试
+- 每个 RPC 的 guard 租约带 token；watchdog 超时延迟强制释放，迟到租约立即回收
 - 扩展返回 JSON-RPC error 时 daemon 返回 `extension_error`，不能变成空成功
 - `server` 重复启动输出 `relay=already_running`，退出 0
 - `server stop` 已停止时输出 `relay=not_running`，退出 0

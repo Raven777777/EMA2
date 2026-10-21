@@ -22,8 +22,12 @@ pub const PAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 单次工具调用的产品总时长上限；超出时在调用前明确拒绝，而不是让 daemon 伪装成超时。
 pub const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MARGIN_SECS: f64 = 15.0;
+// 扩展侧 act watchdog 是 70s + 3s/step + waits；daemon 必须在它之后超时。
+const ACT_EXTENSION_GRACE_SECS: f64 = 10.0;
 const MAX_BUDGET: u64 = 200_000;
 const MAX_WAIT_SECS: f64 = 300.0;
+/// read 的模式列表；extension/background.js 的 READ_MODES 必须与它一致。
+const READ_MODES: &[&str] = &["md", "text", "html", "visible"];
 
 pub fn contains(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
@@ -102,8 +106,9 @@ fn act_wait_seconds(arguments: &Value) -> f64 {
     top_level + steps
 }
 
-/// act 的完整预算：固定执行上限 + 每步最多 3s 的隐式 settle + 显式等待。
-/// 20 步脚本光 settle 就可能 60s，不能只靠 ACT_TIMEOUT。
+/// act 的完整预算：固定执行上限、扩展侧额外 10s、每步最多 3s 的隐式 settle，
+/// 再加显式等待和中继余量。必须在扩展 watchdog 之后超时，否则会以
+/// extension_error 而不是干净的 tool_timeout 结束。
 fn act_budget_seconds(arguments: &Value) -> f64 {
     let steps = arguments
         .get("steps")
@@ -111,6 +116,8 @@ fn act_budget_seconds(arguments: &Value) -> f64 {
         .map(Vec::len)
         .unwrap_or(1);
     ACT_TIMEOUT.as_secs_f64()
+        + ACT_EXTENSION_GRACE_SECS
+        + RELAY_MARGIN_SECS
         + steps as f64 * 3.0
         + act_wait_seconds(arguments)
         + act_await_seconds(arguments)
@@ -199,9 +206,10 @@ fn batch_budget_seconds(arguments: &Value) -> f64 {
         "js" => (js_timeout_seconds(inner) + 8.0, opens > 0.0),
         _ => (DEFAULT_TIMEOUT.as_secs_f64(), opens > 0.0),
     };
-    // 复合模式（urls + read/snapshot/js/wait）每个目标多一次 open；open 模式已计入 per_call。
+    // 复合模式（urls + read/snapshot/js/wait）每个目标多一次 open；open 模式已计入
+    // per_call。内层 waitTimeout 同样作用于复合模式的 open，不能固定按 30s 估。
     let open_cost = if open_cost {
-        (opens / effective).ceil() * (PAGE_WAIT_TIMEOUT.as_secs_f64() + 2.0)
+        (opens / effective).ceil() * (open_wait_seconds(inner) + 2.0)
     } else {
         0.0
     };
@@ -278,7 +286,7 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
         }
         "read" => {
             tab_id(object)?;
-            enum_arg(object, "mode", &["md", "text", "html", "visible"], false)?;
+            enum_arg(object, "mode", READ_MODES, false)?;
             string_arg(object, "selector", 2_048, false, true)?;
             bool_arg(object, "main")?;
             budget_arg(object)?;
@@ -409,6 +417,7 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             }
             bool_arg(object, "bodies")?;
             bool_arg(object, "har")?;
+            enum_arg(object, "harHeaders", &["redact", "all"], false)?;
             budget_arg(object)?;
         }
         "files" => {
@@ -529,6 +538,9 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                         Some(value) if value >= 0.0 && value.fract() == 0.0 => {}
                         _ => return Err(format!("tabIds[{index}] must be a non-negative integer")),
                     }
+                    if tab_ids[..index].iter().any(|seen| seen == id) {
+                        return Err("tabIds must not contain duplicates".into());
+                    }
                 }
                 if tool == "open" {
                     return Err("batch open needs urls[], not tabIds[]".into());
@@ -601,6 +613,52 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // 跨字段检查必须先于 await/waitFor 的 early return：raw /cmd 同样不能带
+    // 这两个动作不支持的 key/deltaY/submit。
+    if action == "press"
+        && !object
+            .get("key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.trim().is_empty())
+    {
+        return Err("key is required for press".into());
+    }
+    if action != "press" && object.get("key").is_some_and(|value| !value.is_null()) {
+        return Err("key is only supported by press".into());
+    }
+    if action != "scroll" && object.get("deltaY").is_some_and(|value| !value.is_null()) {
+        return Err("deltaY is only supported by scroll".into());
+    }
+    if matches!(action, "scroll" | "back" | "forward" | "reload")
+        && ["selector", "target"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return Err(format!(
+            "{action} does not support selector/target locators"
+        ));
+    }
+    if let Some(delta) = number_arg(object, "deltaY", false)?
+        && delta.abs() > 100_000.0
+    {
+        return Err("deltaY must be within +/-100000".into());
+    }
+    if object
+        .get("submit")
+        .is_some_and(|v| !matches!(v, Value::Null | Value::Bool(_)))
+    {
+        return Err("submit must be a boolean".into());
+    }
+    if object
+        .get("submit")
+        .is_some_and(|v| matches!(v, Value::Bool(true)))
+        && action != "type"
+    {
+        return Err(
+            "submit=true is only supported by type; use action=submit or click the submit button"
+                .into(),
+        );
+    }
     if action == "await" {
         if let Some(timeout) = number_arg(object, "timeout", false)?
             && !(0.0..=300.0).contains(&timeout)
@@ -627,56 +685,12 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
         }
         return Ok(());
     }
-    if action == "press"
-        && !object
-            .get("key")
-            .and_then(Value::as_str)
-            .is_some_and(|key| !key.trim().is_empty())
-    {
-        return Err("key is required for press".into());
-    }
-    if action != "press" && object.get("key").is_some_and(|value| !value.is_null()) {
-        return Err("key is only supported by press".into());
-    }
-    if action != "scroll" && object.get("deltaY").is_some_and(|value| !value.is_null()) {
-        return Err("deltaY is only supported by scroll".into());
-    }
-    if matches!(action, "scroll" | "back" | "forward" | "reload")
-        && ["selector", "target"]
-            .iter()
-            .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
-    {
-        return Err(format!(
-            "{action} does not support selector/target locators"
-        ));
-    }
     if action == "fill"
         && object
             .get("fields")
             .is_none_or(|fields| matches!(fields, Value::Null))
     {
         return Err("fill requires fields[]".into());
-    }
-    if let Some(delta) = number_arg(object, "deltaY", false)?
-        && delta.abs() > 100_000.0
-    {
-        return Err("deltaY must be within +/-100000".into());
-    }
-    if object
-        .get("submit")
-        .is_some_and(|v| !matches!(v, Value::Null | Value::Bool(_)))
-    {
-        return Err("submit must be a boolean".into());
-    }
-    if object
-        .get("submit")
-        .is_some_and(|v| matches!(v, Value::Bool(true)))
-        && action != "type"
-    {
-        return Err(
-            "submit=true is only supported by type; use action=submit or click the submit button"
-                .into(),
-        );
     }
     if let Some(fields) = object.get("fields").filter(|v| !matches!(v, Value::Null)) {
         let Some(fields) = fields.as_array() else {
@@ -805,6 +819,9 @@ fn tab_ids_arg(object: &Map<String, Value>) -> Result<bool, String> {
         match id.as_f64() {
             Some(value) if value >= 0.0 && value.fract() == 0.0 => {}
             _ => return Err(format!("tabIds[{index}] must be a non-negative integer")),
+        }
+        if ids[..index].iter().any(|seen| seen == id) {
+            return Err("tabIds must not contain duplicates".into());
         }
     }
     Ok(true)
@@ -1501,13 +1518,15 @@ mod tests {
             timeout_for("wait", &json!({ "time": 0 })),
             Duration::from_secs(15)
         );
+        // act 的 daemon 预算必须在扩展 watchdog（70s + 3s/step）之后，
+        // 再留 15s 中继余量，避免完整脚本先撞上 extension_error。
         assert_eq!(
             timeout_for("act", &json!({})),
-            ACT_TIMEOUT + Duration::from_secs(3)
+            ACT_TIMEOUT + Duration::from_secs(28)
         );
         assert_eq!(
             timeout_for("act", &json!({ "waitFor": { "timeout": 10 } })),
-            ACT_TIMEOUT + Duration::from_secs(13)
+            ACT_TIMEOUT + Duration::from_secs(38)
         );
         assert_eq!(timeout_for("open", &json!({})), Duration::from_secs(30));
         assert_eq!(
@@ -1602,7 +1621,17 @@ mod tests {
                     ]
                 })
             ),
-            ACT_TIMEOUT + Duration::from_secs(24)
+            ACT_TIMEOUT + Duration::from_secs(49)
+        );
+        // 复合 batch 的 open 成本跟随内层 waitTimeout，而不是固定 30s。
+        assert_eq!(
+            timeout_for(
+                "batch",
+                &json!({
+                    "tool": "read", "urls": ["https://a/"], "args": { "waitTimeout": 60 }
+                })
+            ),
+            Duration::from_secs(107)
         );
     }
     /// 错误码表是 AI 自我纠正的依据；新增 `fail('code'` 时文档必须同步。
@@ -1633,5 +1662,84 @@ mod tests {
             .filter(|code| !docs.contains(&format!("`{code}`")))
             .collect();
         assert!(missing.is_empty(), "docs/TOOLS.md 缺少错误码: {missing:?}");
+    }
+
+    /// Rust 侧直接打印的 `error=<code>` 也必须进同一张表（例如 init_failed）。
+    #[test]
+    fn documented_error_codes_cover_rust_literals() {
+        let docs = include_str!("../../docs/TOOLS.md");
+        let sources = [
+            ("main.rs", include_str!("main.rs")),
+            ("save.rs", include_str!("save.rs")),
+        ];
+        let mut codes: Vec<String> = Vec::new();
+        for (_, source) in sources {
+            let mut rest = source;
+            while let Some(index) = rest.find("error=") {
+                rest = &rest[index + "error=".len()..];
+                let end = rest
+                    .find(|ch: char| !(ch.is_ascii_lowercase() || ch == '_'))
+                    .unwrap_or(rest.len());
+                let code = &rest[..end];
+                if !code.is_empty() && !codes.iter().any(|known| known == code) {
+                    codes.push(code.to_owned());
+                }
+            }
+        }
+        assert!(
+            codes.len() > 5,
+            "expected to find Rust error= literals, found {codes:?}"
+        );
+        let missing: Vec<&String> = codes
+            .iter()
+            .filter(|code| !docs.contains(&format!("`{code}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/TOOLS.md 缺少 Rust 错误码: {missing:?}"
+        );
+    }
+
+    /// read 枚举只定义一次不现实（Rust + JS 各一份），但必须机械地保持同步。
+    #[test]
+    fn read_modes_match_extension() {
+        let js = include_str!("../../extension/background.js");
+        let line = js
+            .lines()
+            .find(|line| line.contains("const READ_MODES = ["))
+            .expect("extension READ_MODES missing");
+        let start = line.find('[').unwrap() + 1;
+        let end = line.find(']').unwrap();
+        let modes: Vec<&str> = line[start..end]
+            .split(',')
+            .map(|item| item.trim().trim_matches('\''))
+            .filter(|item| !item.is_empty())
+            .collect();
+        assert_eq!(modes, READ_MODES);
+        assert!(
+            js.contains("READ_MODES.includes(inner.mode)"),
+            "batch inner read must use the shared READ_MODES list"
+        );
+    }
+
+    /// GUARD_VERSION 与协议清理版本必须一起提升，否则 SW 重启后可能漏清理。
+    #[test]
+    fn guard_versions_move_together() {
+        let page = include_str!("../../extension/page_guard.js");
+        let background = include_str!("../../extension/background.js");
+        let number_after = |source: &str, marker: &str| -> u32 {
+            let start = source
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} missing"));
+            let rest = &source[start + marker.len()..];
+            rest[..rest.find(';').expect("missing ;")]
+                .trim()
+                .parse()
+                .expect("version is not a number")
+        };
+        assert_eq!(
+            number_after(page, "const GUARD_VERSION ="),
+            number_after(background, "const GUARD_PROTOCOL_VERSION =")
+        );
     }
 }

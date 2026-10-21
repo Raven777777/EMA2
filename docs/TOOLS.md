@@ -72,6 +72,8 @@ total=2 shown=2 next=none
 | `payload_too_large` | 请求体超过中继上限（含上传） | 减小上传文件或拆分调用 |
 | `shutdown_failed` | server 卡死且 PID 兜底失败 | 手动结束进程后重启 |
 | `extension_error` | 中继连不上扩展（兜底） | `ema2 status` |
+| `init_failed` | `ema2 init` 读写 AGENTS.md 失败 | 换可写目录，或检查文件权限 |
+| `doc_handle_failed` | 文档句柄计数器无法读写 `chrome.storage.local` | 重载扩展；仍失败则检查浏览器存储/配置 |
 | `invalid_argument` | 参数不合法（含脚本内层参数） | 看本节参数说明 |
 | `invalid_arguments` | arguments 不是对象 | 用 `key=value` 形式传参 |
 | `invalid_action` | 未支持的 act 动作 | 用 click/type/fill/select/press/hover/scroll/submit/back/forward/reload |
@@ -187,7 +189,7 @@ ema2 init
 ema2 tabs                          # list
 ema2 tabs list [--budget N] [--cursor N]
 ema2 tabs current
-ema2 tabs new <url> [--background]
+ema2 tabs new <url> [--background]   # url 必须是 http(s)，与 open 一致
 ema2 tabs close [<id>...]          # 或用 --session
 ema2 tabs close --session
 ema2 tabs activate <id>
@@ -503,7 +505,7 @@ ema2 js --file script.js [...]
 
 ```bash
 ema2 observe console [--tab ID] [--since SEQ] [--level log|warn|error] [--filter SUBSTR] [--wait 10s]
-ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter RE] [--bodies=false] [--har PATH]
+ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter RE] [--bodies=false] [--har PATH] [--headers redact|all]
 ```
 
 - console：增量日志；首次安装 hook（`open`/`act` 也会自动装）。`--wait` 会先安装 hook 再等待，等待期间的新日志也会被记录；
@@ -527,6 +529,8 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
   - `--har PATH`：导出 HAR 1.2（采样/预览，不是完整抓包），`request.url` 是绝对 URL，
     `request/response.headers`、`queryString`、真实 `startedDateTime`、`content.mimeType/size` 来自
     webRequest + 页面 hook；JSON 不经过文本预算截断，落盘并回 `path=` + `entries=N`。
+  - HAR 里的 `authorization`、`proxy-authorization`、`cookie`、`set-cookie` 默认替换为
+    `<redacted>`。需要原始值时显式加 `--headers all`（只影响 HAR 导出）。
 
 ## files
 

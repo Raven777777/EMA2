@@ -1,5 +1,5 @@
 /**
- * EMA2 Edge 扩展 · v2.2（AI 专用浏览器接口）
+ * EMA2 Edge 扩展 · v2.4.1.1（AI 专用浏览器接口）
  * -------------------------------------------
  * 设计前提：这是给 AI 用的浏览器，不是给人用的自动化工具。
  *   - 输出一律行式紧凑文本（key=value / TSV / [ref]），不 pretty-print JSON
@@ -35,6 +35,8 @@ const NET_PREVIEW_CHARS = 800;
 const NET_PREVIEW_TIMEOUT_MS = 1500;
 const NET_MAX_ENTRIES = 300;
 const MAX_BATCH_TABS = 8;
+// 与 rust/src/tools.rs 的 READ_MODES 保持一致；cargo test 会对比两处列表。
+const READ_MODES = ['md', 'text', 'html', 'visible'];
 const LAST_ACT_KEY = 'ema2_last_act';
 const LAST_ACT_TTL_MS = 5 * 60 * 1000;
 const SETTLE_NAV_MS = 3000;
@@ -48,8 +50,16 @@ const COMMAND_GUARD_BRIDGE_FILES = ['page_guard_bridge.js'];
 const COMMAND_GUARD_DISARM_MS = 800;
 const COMMAND_GUARD_SWEEP_MS = 1500;
 const LEGACY_GUARD_SWEEP_MS = 2500;
+const COMMAND_GUARD_LIFECYCLE_MS = 3000;
+// watchdog 报错后给工具一次收尾机会；仍不 settle 就强制释放租约，避免 guard 永久残留。
+const COMMAND_GUARD_ABANDON_GRACE_MS = 2000;
+const COMMAND_GUARD_KEEPALIVE_GRACE_MS = 5000;
+const COMMAND_GUARD_TABS_KEY = 'ema2_command_guard_tabs';
 const GUARD_PROTOCOL_KEY = 'ema2_guard_protocol';
 const GUARD_PROTOCOL_VERSION = 3;
+const SENSITIVE_HAR_HEADERS = new Set([
+  'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
+]);
 
 let socket = null;
 let connecting = false;
@@ -74,8 +84,14 @@ let sessionWriteChain = Promise.resolve();
 let lastActContext = null;
 let commandGuardLeases = 0;
 let commandGuardLifecycle = Promise.resolve();
+const commandGuardLeaseTokens = new Set();
+let commandGuardLeaseSeq = 0;
 // 只清理真正被 arm 过的 tab；动态 document_start 脚本会在新文档里报告自己。
+// SW 可能随时被回收，已 arm 的 tab 同时写入 storage.session，重启后继续 disarm。
 const commandGuardTabs = new Set();
+let commandGuardTabsLoaded = false;
+let commandGuardTabsLoad = null;
+let commandGuardTabsWrite = Promise.resolve();
 
 class ToolError extends Error {
   constructor(code, message, hint, lines) {
@@ -245,7 +261,10 @@ async function handlePageMessage(message, sender) {
     case 'ema2/guard-armed': {
       const tabId = sender && sender.tab && sender.tab.id;
       // 租约期间的导航文档也纳入清理集合；租约已释放则让页面自己 disarm。
-      if (commandGuardLeases > 0 && Number.isInteger(tabId)) commandGuardTabs.add(tabId);
+      if (commandGuardLeases > 0 && Number.isInteger(tabId)) {
+        commandGuardTabs.add(tabId);
+        await persistCommandGuardTabs();
+      }
       return { ok: true, lease: commandGuardLeases };
     }
     case 'ema2/state': {
@@ -302,6 +321,9 @@ async function handleRelayMessage(data, ws) {
     }
     const params = req.params && typeof req.params === 'object' ? req.params : {};
     const toolArgs = normalizeArgs(params.arguments);
+    // 一次 RPC 内所有 guard 租约都挂在同一个 context 上：watchdog 超时后即使
+    // executeTool 永不 settle，也能在宽限期后统一释放，而不是等 finally。
+    const guardContext = { leases: new Set(), closed: false, abandoned: false };
     let result;
     try {
       // 所有 RPC 都有硬上限：即使某个 chrome.* 调用永远不返回，也必须把错误
@@ -309,13 +331,20 @@ async function handleRelayMessage(data, ws) {
       // 但页面侧的 alert/print 已被 page_guard.js 变成非阻塞记录。
       const watchdog = toolWatchdogMs(params.name, toolArgs);
       result = toResult(await withDeadline(
-        withKeepAlive(() => executeTool(params.name, toolArgs)),
+        withKeepAlive(
+          () => executeTool(params.name, toolArgs, guardContext),
+          watchdog + COMMAND_GUARD_KEEPALIVE_GRACE_MS,
+        ),
         watchdog,
         'tool_timeout',
         `${params.name} did not return within ${Math.round(watchdog / 1000)}s`,
         'the tab may still be busy; inspect with `ema2 status`, close an open dialog, or reload the tab',
       ));
     } catch (error) {
+      // 超时后工具可能永远不 settle；它的 finally 不会运行，必须由 watchdog 兜底。
+      if (error instanceof ToolError && error.code === 'tool_timeout') {
+        abandonCommandGuard(guardContext);
+      }
       result = { content: [{ type: 'text', text: formatError(error) }], isError: true };
     }
     if (hasId && ws.readyState === 1) sendResponse(ws, req.id, { result });
@@ -326,11 +355,23 @@ async function handleRelayMessage(data, ws) {
   }
 }
 
-async function withKeepAlive(run) {
+async function withKeepAlive(run, maxMs) {
   const timer = setInterval(() => {
     try { chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError); } catch (_) {}
   }, 20000);
-  try { return await run(); } finally { clearInterval(timer); }
+  // 永不 settle 的工具会让 finally 永远不执行；keepalive 必须有独立上限，
+  // 否则 service worker 会被自己 20s 一次的 ping 永久保活。
+  let maxTimer = null;
+  if (Number.isFinite(maxMs) && maxMs > 0) {
+    maxTimer = setTimeout(() => {
+      clearInterval(timer);
+      maxTimer = null;
+    }, maxMs);
+  }
+  try { return await run(); } finally {
+    clearInterval(timer);
+    if (maxTimer) clearTimeout(maxTimer);
+  }
 }
 
 function normalizeArgs(value) {
@@ -699,6 +740,9 @@ async function tabsTool(args) {
     if (Array.isArray(args.tabIds) && args.tabIds.length) {
       if (args.tabIds.length > MAX_BATCH_TABS) {
         fail('invalid_argument', `tabIds must contain 1..${MAX_BATCH_TABS} entries`, 'split the close call');
+      }
+      if (new Set(args.tabIds).size !== args.tabIds.length) {
+        fail('invalid_argument', 'tabIds must not contain duplicates', 'remove duplicate ids');
       }
       for (const [index, tabId] of args.tabIds.entries()) {
         if (!Number.isInteger(tabId) || tabId < 0) {
@@ -1084,6 +1128,46 @@ async function runInTab(tabId, func, args, world, attempts = 2) {
   throw lastError;
 }
 
+/** 读取 SW 重启前登记的已 arm tab；storage.session 随浏览器重启清空。 */
+async function loadCommandGuardTabs() {
+  if (commandGuardTabsLoaded) return commandGuardTabs;
+  if (!commandGuardTabsLoad) {
+    commandGuardTabsLoad = (async () => {
+      try {
+        const store = chrome.storage && chrome.storage.session;
+        if (!store) {
+          commandGuardTabsLoaded = true;
+          return;
+        }
+        const stored = (await store.get(COMMAND_GUARD_TABS_KEY)) || {};
+        const ids = stored[COMMAND_GUARD_TABS_KEY];
+        if (Array.isArray(ids)) {
+          for (const id of ids) {
+            if (Number.isInteger(id) && id >= 0) commandGuardTabs.add(id);
+          }
+        }
+        commandGuardTabsLoaded = true;
+      } catch (_) { /* storage.session 暂不可用：下次再试，不把失败缓存成空集合 */ }
+    })();
+  }
+  await commandGuardTabsLoad;
+  commandGuardTabsLoad = null;
+  return commandGuardTabs;
+}
+
+/** 与 sessionTabs 相同的串行写入，避免并发 arm/disarm 后写覆盖先写。 */
+async function persistCommandGuardTabs() {
+  const snapshot = [...commandGuardTabs];
+  const write = commandGuardTabsWrite.then(async () => {
+    try {
+      const store = chrome.storage && chrome.storage.session;
+      if (store) await store.set({ [COMMAND_GUARD_TABS_KEY]: snapshot });
+    } catch (_) { /* 内存集合仍可清理；SW 重启后再试 */ }
+  });
+  commandGuardTabsWrite = write;
+  return write;
+}
+
 /**
  * 命令期间才启用 guard。动态 content script 负责覆盖导航后新文档在
  * document_start 阶段出现的对话框；已经打开的 tab 由这里立即注入并 arm。
@@ -1095,7 +1179,10 @@ async function ensurePageGuard(tabId) {
       files: COMMAND_GUARD_FILES,
       world: 'MAIN',
     });
-    if (Number.isInteger(tabId)) commandGuardTabs.add(tabId);
+    if (Number.isInteger(tabId)) {
+      commandGuardTabs.add(tabId);
+      await persistCommandGuardTabs();
+    }
     return true;
   } catch (_) {
     return false;
@@ -1105,11 +1192,15 @@ async function ensurePageGuard(tabId) {
 async function registerCommandGuard() {
   // 逐条注销：旧版本只注册过 main id，一次传不存在的 id 可能让整批失败。
   for (const id of [COMMAND_GUARD_ID, COMMAND_GUARD_BRIDGE_ID]) {
-    try { await chrome.scripting.unregisterContentScripts({ ids: [id] }); } catch (_) { /* not registered */ }
+    await within(
+      chrome.scripting.unregisterContentScripts({ ids: [id] }),
+      COMMAND_GUARD_LIFECYCLE_MS,
+      null,
+    );
   }
   // bridge 先注册：这样任何被 MAIN guard arm 的新文档都已经有监听者。
-  try {
-    await chrome.scripting.registerContentScripts([{
+  const bridgeOk = await within(
+    chrome.scripting.registerContentScripts([{
       id: COMMAND_GUARD_BRIDGE_ID,
       matches: ['<all_urls>'],
       js: COMMAND_GUARD_BRIDGE_FILES,
@@ -1117,14 +1208,16 @@ async function registerCommandGuard() {
       allFrames: true,
       world: 'ISOLATED',
       persistAcrossSessions: false,
-    }]);
-  } catch (error) {
+    }]).then(() => true),
+    COMMAND_GUARD_LIFECYCLE_MS,
+    false,
+  );
+  if (!bridgeOk) {
     // bridge 只是释放竞态的加固；失败时主 guard 仍然工作。
-    console.warn('[EMA2] command guard bridge registration failed:', error && error.message || error);
+    console.warn('[EMA2] command guard bridge registration failed or timed out');
   }
-  let mainOk = false;
-  try {
-    await chrome.scripting.registerContentScripts([{
+  const mainOk = await within(
+    chrome.scripting.registerContentScripts([{
       id: COMMAND_GUARD_ID,
       matches: ['<all_urls>'],
       js: COMMAND_GUARD_FILES,
@@ -1132,46 +1225,88 @@ async function registerCommandGuard() {
       allFrames: true,
       world: 'MAIN',
       persistAcrossSessions: false,
-    }]);
-    mainOk = true;
-  } catch (error) {
-    console.warn('[EMA2] command guard registration failed:', error && error.message || error);
-  }
+    }]).then(() => true),
+    COMMAND_GUARD_LIFECYCLE_MS,
+    false,
+  );
+  if (!mainOk) console.warn('[EMA2] command guard registration failed or timed out');
   return mainOk;
 }
 
 async function unregisterCommandGuard() {
   for (const id of [COMMAND_GUARD_ID, COMMAND_GUARD_BRIDGE_ID]) {
-    try { await chrome.scripting.unregisterContentScripts({ ids: [id] }); } catch (_) { /* not registered */ }
+    await within(
+      chrome.scripting.unregisterContentScripts({ ids: [id] }),
+      COMMAND_GUARD_LIFECYCLE_MS,
+      null,
+    );
   }
 }
 
-async function disarmPageGuard(tabId) {
-  let needsUpgrade = false;
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      world: 'MAIN',
-      func: () => {
-        const guard = window.__ema2_guard;
-        if (!guard) return { guard: false, disarmed: false };
-        if (typeof guard.disarm !== 'function') return { guard: true, disarmed: false };
+/** 在 top frame 或 all frames 执行一次 disarm；不吞异常，由调用方验证。 */
+async function runGuardDisarm(tabId, allFrames) {
+  const results = await chrome.scripting.executeScript({
+    target: allFrames ? { tabId, allFrames: true } : { tabId },
+    world: 'MAIN',
+    func: () => {
+      const guard = window.__ema2_guard;
+      if (!guard) return { guard: false, disarmed: false };
+      if (typeof guard.disarm !== 'function') return { guard: true, disarmed: false };
+      try {
         guard.disarm();
-        return { guard: true, disarmed: true };
-      },
-    });
-    needsUpgrade = (results || []).some(result =>
-      result && result.result && result.result.guard && !result.result.disarmed);
-  } catch (_) { /* internal/restricted tab */ }
-  if (!needsUpgrade) return;
-  try {
-    // 旧 v1 没有 disarm()：注入 passive v2 会恢复它保存的原生引用。
-    await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      files: ['page_guard.js'],
-      world: 'MAIN',
-    });
-  } catch (_) { /* page became restricted */ }
+      } catch (_) {
+        return { guard: true, disarmed: false };
+      }
+      return { guard: true, disarmed: true };
+    },
+  });
+  return Array.isArray(results) ? results : [];
+}
+
+function guardDisarmed(results) {
+  return Array.isArray(results) && results.length > 0 && results.every(item => {
+    const value = item && item.result;
+    return !!value && (value.disarmed === true || value.guard === false);
+  });
+}
+
+async function upgradePassiveGuard(tabId, allFrames) {
+  await chrome.scripting.executeScript({
+    target: allFrames ? { tabId, allFrames: true } : { tabId },
+    files: ['page_guard.js'],
+    world: 'MAIN',
+  });
+}
+
+/**
+ * 只有在确认 top frame 和所有可脚本化 frame 都已 disarm 后才返回 true。
+ * top-frame 与 all-frames 分开执行：某个受限/刚导航的 frame 不能把 top frame
+ * 一起拖失败，也不能让成功的结果掩盖未清理的 iframe。
+ */
+async function disarmPageGuard(tabId) {
+  try { await chrome.tabs.get(tabId); }
+  catch (_) { return true; } // tab 已关闭：没有页面可残留
+  let top;
+  try { top = await runGuardDisarm(tabId, false); }
+  catch (_) { return false; }
+  if (!guardDisarmed(top)) {
+    try { await upgradePassiveGuard(tabId, true); }
+    catch (_) { return false; }
+    try { top = await runGuardDisarm(tabId, false); }
+    catch (_) { return false; }
+    if (!guardDisarmed(top)) return false;
+  }
+  let all;
+  try { all = await runGuardDisarm(tabId, true); }
+  catch (_) { return false; }
+  if (!guardDisarmed(all)) {
+    // 旧版本可能只在 iframe 里留下没有 disarm() 的 guard。
+    try { await upgradePassiveGuard(tabId, true); }
+    catch (_) { return false; }
+    try { all = await runGuardDisarm(tabId, true); }
+    catch (_) { return false; }
+  }
+  return guardDisarmed(all);
 }
 
 async function allScriptableTabIds() {
@@ -1188,17 +1323,21 @@ async function allScriptableTabIds() {
 /**
  * 清理指定 tab。每个 tab 单独限时，整体再设硬上限：一个卡在原生对话框或
  * 死循环里的渲染进程不能把 release/启动清理拖到命令预算之外。
+ * 只有验证过的 tab 才移出跟踪集合，失败的下次 release/启动继续重试。
  */
 async function disarmPageGuards(tabIds, budget = COMMAND_GUARD_SWEEP_MS) {
   const ids = [...new Set(tabIds)].filter(id => Number.isInteger(id));
-  for (const id of ids) commandGuardTabs.delete(id);
   if (!ids.length) return true;
   const results = await within(
-    Promise.all(ids.map(id => within(
-      disarmPageGuard(id).then(() => true),
-      COMMAND_GUARD_DISARM_MS,
-      false,
-    ))),
+    Promise.all(ids.map(async id => {
+      const ok = await within(
+        disarmPageGuard(id),
+        COMMAND_GUARD_DISARM_MS,
+        false,
+      );
+      if (ok === true && commandGuardTabs.delete(id)) await persistCommandGuardTabs();
+      return ok === true;
+    })),
     budget,
     null,
   );
@@ -1226,20 +1365,27 @@ function enqueueCommandGuard(step) {
  * 注销注册并恢复已 arm 文档的原生对话框 API。
  */
 async function acquireCommandGuard() {
+  const lease = { id: ++commandGuardLeaseSeq, released: false };
   // guard 是优化而不是前置条件：这里失败也必须放行工具调用。
   try {
     await enqueueCommandGuard(async () => {
+      if (lease.released) return;
       commandGuardLeases += 1;
+      commandGuardLeaseTokens.add(lease);
       if (commandGuardLeases === 1) await registerCommandGuard();
     });
   } catch (_) { /* fail open */ }
+  return lease;
 }
 
-async function releaseCommandGuard() {
+async function releaseCommandGuard(lease) {
+  // 同步标记，watchdog 兜底和 finally 谁先到都不会二次扣减别人的租约。
+  if (!lease || lease.released) return;
+  lease.released = true;
   try {
     await enqueueCommandGuard(async () => {
-      if (commandGuardLeases <= 0) return;
-      commandGuardLeases -= 1;
+      if (!commandGuardLeaseTokens.delete(lease)) return;
+      if (commandGuardLeases > 0) commandGuardLeases -= 1;
       if (commandGuardLeases !== 0) return;
       // 顺序很重要：先注销动态脚本，再 disarm。反序会在注销窗口里把正在
       // 加载的新文档 arm 掉，而 sweep 已经结束，guard 会永久残留。
@@ -1249,34 +1395,67 @@ async function releaseCommandGuard() {
   } catch (_) { /* guard failure must not fail the command */ }
 }
 
-async function cleanupLegacyGuardOnce() {
-  let legacy = true;
+/**
+ * watchdog 超时后的兜底：工具可能永远不会 settle，给正常收尾一个宽限期后
+ * 强制释放该 RPC 持有的全部租约。context.closed 会让迟到的新租约立即释放。
+ */
+function abandonCommandGuard(context) {
+  if (!context || context.abandoned) return;
+  context.closed = true;
+  context.abandoned = true;
+  setTimeout(() => {
+    for (const lease of [...context.leases]) {
+      context.leases.delete(lease);
+      void releaseCommandGuard(lease);
+    }
+  }, COMMAND_GUARD_ABANDON_GRACE_MS);
+}
+
+async function cleanupLegacyGuardOnce(forceAll = false) {
+  let legacy = forceAll;
+  let protocolStale = forceAll;
   try {
     const stored = await chrome.storage.local.get(GUARD_PROTOCOL_KEY);
-    legacy = Number(stored && stored[GUARD_PROTOCOL_KEY]) < GUARD_PROTOCOL_VERSION;
+    const stale = Number(stored && stored[GUARD_PROTOCOL_KEY]) < GUARD_PROTOCOL_VERSION;
+    protocolStale = protocolStale || stale;
+    legacy = legacy || stale;
   } catch (_) { /* storage may be unavailable during startup */ }
+  await loadCommandGuardTabs();
 
-  let complete = false;
+  let attempted = false;
   await enqueueCommandGuard(async () => {
     if (commandGuardLeases !== 0) return;
     await unregisterCommandGuard();
-    // 协议升级要扫所有 tab（清 v1/v2 遗留）；普通 SW 启动只清理已 arm 的 tab。
+    // 协议升级/扩展更新要扫所有 tab（清 v1/v2 或重载前的遗留）；普通 SW
+    // 启动只清理已经记录/持久化的 tab。
     const ids = legacy ? await allScriptableTabIds() : [...commandGuardTabs];
-    complete = await disarmPageGuards(ids, legacy ? LEGACY_GUARD_SWEEP_MS : COMMAND_GUARD_SWEEP_MS);
+    if (legacy) {
+      // 未验证成功的 tab 留在集合里，下次 release/启动只重试这些，不再全量扫描。
+      for (const id of ids) commandGuardTabs.add(id);
+      await persistCommandGuardTabs();
+    }
+    await disarmPageGuards(ids, legacy ? LEGACY_GUARD_SWEEP_MS : COMMAND_GUARD_SWEEP_MS);
+    attempted = true;
   });
-  if (legacy && complete) {
+  // 即使整批 sweep 超时，已验证的 tab 已移除、未验证的已持久化；标记协议完成，
+  // 避免慢机器每次 SW 启动都重复全量扫描。
+  if (protocolStale && attempted) {
     try { await chrome.storage.local.set({ [GUARD_PROTOCOL_KEY]: GUARD_PROTOCOL_VERSION }); } catch (_) { /* ignore */ }
   }
 }
 
+/**
+ * 返回本次命令实际 arm 的 tabId。调用方把它写回 args.tabId，保证 guard 与
+ * 真正执行的 tab 是同一个，避免 arm 后用户快速切换活动标签。
+ */
 async function guardTargetForTool(name, args) {
   // open 不在这里：它先导航，再由 openTool 对最终文档 ensurePageGuard。
   // act 只在这里 arm 一次；actTool 不要在动作前重复注入。
   const guarded = new Set([
     'act', 'wait', 'read', 'snapshot', 'js', 'observe', 'files', 'shot',
   ]);
-  if (!guarded.has(name)) return;
-  if (name === 'files' && args.action === 'download-dir') return;
+  if (!guarded.has(name)) return undefined;
+  if (name === 'files' && args.action === 'download-dir') return undefined;
   let tabId = args.tabId;
   if (name === 'wait' && args.await === true && tabId === undefined) {
     const context = await loadLastAct().catch(() => null);
@@ -1287,39 +1466,112 @@ async function guardTargetForTool(name, args) {
       const tab = await activeTab();
       tabId = tab.id;
     } catch (_) {
-      return;
+      return undefined;
     }
   }
-  if (Number.isInteger(tabId)) await ensurePageGuard(tabId);
+  if (!Number.isInteger(tabId)) return undefined;
+  await ensurePageGuard(tabId);
+  return tabId;
 }
 
-async function withCommandGuard(name, args, run) {
-  await acquireCommandGuard();
+async function withCommandGuard(name, args, run, context) {
+  const lease = await acquireCommandGuard();
+  if (context && context.closed) {
+    // 调用方已经因 watchdog 放弃这次 RPC；迟到的内层工具不再新增租约。
+    await releaseCommandGuard(lease);
+    return run();
+  }
+  if (context) context.leases.add(lease);
   try {
-    await guardTargetForTool(name, args);
+    const targetTabId = await guardTargetForTool(name, args);
+    if (targetTabId !== undefined && args.tabId === undefined) args.tabId = targetTabId;
     return await run();
   } finally {
-    await releaseCommandGuard();
+    if (context) context.leases.delete(lease);
+    await releaseCommandGuard(lease);
   }
 }
 
-/** 当前 guard 事件水位；用于区分“本次动作打开的对话框/弹窗”。 */
+async function runInAllFrames(tabId, func, args, world) {
+  const options = { target: { tabId, allFrames: true }, func, args };
+  if (world) options.world = world;
+  const results = await chrome.scripting.executeScript(options);
+  return Array.isArray(results) ? results : [];
+}
+
+const guardProbe = () => ({
+  seq: window.__ema2_guard ? window.__ema2_guard.seq || 0 : 0,
+  origin: Number(performance.timeOrigin) || 0,
+});
+
+const guardEventPayload = () => {
+  const guard = window.__ema2_guard;
+  if (!guard) return { seq: 0, origin: 0, events: [] };
+  return {
+    seq: guard.seq || 0,
+    origin: Number(performance.timeOrigin) || 0,
+    events: guard.events || [],
+  };
+};
+
+/**
+ * 当前每个 frame 的 guard 事件水位。必须 allFrames：iframe 里的 confirm()
+ * 也会被 guard 吞掉，只看 top frame 会漏报 dialog_opened。
+ * 水位带 performance.timeOrigin，frame 导航换代后自动从 0 开始计。
+ */
 async function guardMark(tabId) {
   try {
-    return await runInTab(tabId, () => (window.__ema2_guard ? window.__ema2_guard.seq || 0 : 0), [], 'MAIN');
+    const results = await runInAllFrames(tabId, guardProbe, [], 'MAIN');
+    const frames = {};
+    for (const item of results) {
+      if (!item || !Number.isInteger(item.frameId)) continue;
+      const value = item.result || {};
+      frames[item.frameId] = {
+        seq: Number(value.seq) || 0,
+        origin: Number(value.origin) || 0,
+      };
+    }
+    if (Object.keys(frames).length) return { frames };
+  } catch (_) { /* fall back to the top frame below */ }
+  try {
+    const value = await runInTab(tabId, guardProbe, [], 'MAIN');
+    return {
+      frames: {
+        0: { seq: Number(value && value.seq) || 0, origin: Number(value && value.origin) || 0 },
+      },
+    };
   } catch (_) {
-    return 0;
+    return { frames: {} };
   }
 }
 
-async function guardSince(tabId, seq) {
+async function guardSince(tabId, mark) {
+  const frames = mark && typeof mark === 'object' && mark.frames ? mark.frames : null;
+  const merge = (results) => {
+    const events = [];
+    for (const item of results || []) {
+      const payload = item && item.result;
+      if (!payload || !Array.isArray(payload.events)) continue;
+      const frameId = Number.isInteger(item.frameId) ? item.frameId : 0;
+      const prior = frames ? frames[frameId] : null;
+      const since = prior && Number(prior.origin) === Number(payload.origin)
+        ? Number(prior.seq) || 0
+        : (frames ? 0 : Number(mark) || 0);
+      for (const event of payload.events) {
+        if ((event.seq || 0) > since) events.push(event);
+      }
+    }
+    events.sort((left, right) => (left.at || 0) - (right.at || 0)
+      || (left.seq || 0) - (right.seq || 0));
+    return events;
+  };
   try {
-    const events = await runInTab(tabId, (since) => {
-      const guard = window.__ema2_guard;
-      if (!guard) return [];
-      return (guard.events || []).filter(event => (event.seq || 0) > since);
-    }, [Number(seq) || 0], 'MAIN');
-    return Array.isArray(events) ? events : [];
+    const results = await runInAllFrames(tabId, guardEventPayload, [], 'MAIN');
+    if (results.length) return merge(results);
+  } catch (_) { /* fall back to the top frame below */ }
+  try {
+    const value = await runInTab(tabId, guardEventPayload, [], 'MAIN');
+    return merge([{ frameId: 0, result: value }]);
   } catch (_) {
     return [];
   }
@@ -2413,6 +2665,7 @@ function installHelpers() {
 const DOC_SEQ_KEY = 'ema2_doc_seq';
 let docHandleSeq = 0;
 let docSeqReady = null;
+let docSeqLoaded = false;
 
 /**
  * 只从 storage.session 读一次。
@@ -2426,23 +2679,36 @@ function ensureDocSeq() {
         const stored = await chrome.storage.local.get(DOC_SEQ_KEY);
         // 内存里可能已经发过号（上一次写入失败）；不能回退到更小的持久值。
         docHandleSeq = Math.max(docHandleSeq, Number(stored && stored[DOC_SEQ_KEY]) || 0);
+        docSeqLoaded = true;
       } catch (_) {
         // 读取失败不能永久缓存成 0：下次调用重试；内存里已发过的号必须保留。
         docSeqReady = null;
+        docSeqLoaded = false;
       }
     })();
   }
   return docSeqReady;
 }
 
-/** 下一个文档句柄（d1、d2…）。初始化之后的自增是同步的，两个文档不会拿到同一个号。 */
+/**
+ * 下一个文档句柄（d1、d2…）。初始化之后的自增是同步的，两个文档不会拿到同一个号。
+ * 读取或写入 storage 失败时拒绝发号：发一个无法持久化的号会在 SW 重启后回绕，
+ * 让旧 ref 在新文档上通过校验 —— 这是 @dN 检查存在的意义。
+ */
 async function nextDocHandle() {
   await ensureDocSeq();
+  if (!docSeqLoaded) {
+    fail('doc_handle_failed', 'cannot read the document handle counter from storage',
+      'reload the extension; if it persists, check that chrome.storage.local is available');
+  }
   docHandleSeq += 1;
   try {
     // await：service worker 在写入前被回收会让序号回绕，旧 ref 就可能在新文档上通过校验。
     await chrome.storage.local.set({ [DOC_SEQ_KEY]: docHandleSeq });
-  } catch (_) { /* 没有 storage 就只在内存里递增 */ }
+  } catch (_) {
+    fail('doc_handle_failed', 'cannot persist the document handle counter',
+      'reload the extension; if it persists, check that chrome.storage.local is available');
+  }
   return 'd' + docHandleSeq;
 }
 
@@ -4712,8 +4978,8 @@ function formatJsOutput(value, budget, cursor, extraLine) {
 async function jsTool(args) {
   const tab = await resolveTab(args);
   if (isInternalUrl(tab.url)) fail('internal_page', 'browser internal pages cannot run JS', 'open an http(s) page');
-  // js 里也可能调用 alert/print；先装 guard，避免整个 tab 被同步对话框挂住。
-  await ensurePageGuard(tab.id);
+  // js 里也可能调用 alert/print；page_guard 已由 withCommandGuard/guardTargetForTool
+  // 在动作前安装，这里不能重复注入。
   // js 里的 console.* 也要能被后续 observe console 看到；open 超时跳过 hook 时尤其重要。
   try { await ensureConsoleHook(tab.id); } catch (_) { /* non-http page */ }
   try {
@@ -4854,12 +5120,18 @@ function stringifyValue(value) {
   try { return JSON.stringify(value); } catch (_) { return String(value); }
 }
 
-function buildHar(items, pageUrl) {
+function buildHar(items, pageUrl, options = {}) {
   const now = Date.now();
-  const toHeaders = (list) => (Array.isArray(list) ? list : []).map(item => ({
-    name: String(item.name || ''),
-    value: String(item.value || ''),
-  }));
+  const redact = options.headers !== 'all';
+  // HAR 会落盘并经常被贴进 AI 上下文；凭证头默认脱敏，需要原值才显式 --headers=all。
+  const toHeaders = (list) => (Array.isArray(list) ? list : []).map(item => {
+    const name = String(item.name || '');
+    const value = String(item.value || '');
+    return {
+      name,
+      value: redact && SENSITIVE_HAR_HEADERS.has(name.toLowerCase()) ? '<redacted>' : value,
+    };
+  });
   const entries = items.map(entry => {
     let absolute = String(entry.url || '');
     try { absolute = new URL(absolute, pageUrl || 'about:blank').href; } catch (_) { /* keep raw */ }
@@ -4935,8 +5207,8 @@ function validateBatchInner(toolName, inner) {
     const cursor = numberIn('cursor', 0, Number.MAX_SAFE_INTEGER);
     if (Math.round(cursor) !== cursor) fail('invalid_argument', 'cursor must be an integer', 'fix the inner arguments');
   }
-  if (has('mode') && !['md', 'text', 'html'].includes(inner.mode)) {
-    fail('invalid_argument', 'mode must be md|text|html', 'fix the inner arguments');
+  if (has('mode') && !READ_MODES.includes(inner.mode)) {
+    fail('invalid_argument', `mode must be ${READ_MODES.join('|')}`, 'fix the inner arguments');
   }
   if (has('filter') && !['interactive', 'full', 'links', 'buttons', 'form'].includes(inner.filter)) {
     fail('invalid_argument', 'filter is invalid', 'fix the inner arguments');
@@ -4963,7 +5235,7 @@ function validateBatchInner(toolName, inner) {
  * 在多个标签页上并发执行 read/snapshot/js/wait/open，返回每页一块结果。
  * 传 `urls` 时先打开（新标签）再执行目标工具——「打开→读取」因此只需一次调用。
  */
-async function batchTool(args) {
+async function batchTool(args, context) {
   const allowed = ['open', 'read', 'snapshot', 'js', 'wait'];
   const toolName = args.tool;
   if (!allowed.includes(toolName)) {
@@ -4991,6 +5263,9 @@ async function batchTool(args) {
       }
     }
   } else {
+    if (new Set(tabIds).size !== tabIds.length) {
+      fail('invalid_argument', 'tabIds must not contain duplicates', 'remove duplicate ids');
+    }
     for (const [index, tabId] of tabIds.entries()) {
       if (!Number.isInteger(tabId) || tabId < 0) {
         fail('invalid_argument', `tabIds[${index}] must be a non-negative integer`, 'call tabs to list ids');
@@ -5063,14 +5338,14 @@ async function batchTool(args) {
           }
           let openedText;
           try {
-            openedText = resultText(await executeTool('open', openArgs));
+            openedText = resultText(await executeTool('open', openArgs, context));
           } catch (error) {
             if (reusedTabId === undefined || !(error instanceof ToolError)
                 || error.code !== 'tab_not_found') throw error;
             reusedByIndex.delete(index);
             delete openArgs.tabId;
             delete openArgs.reuseSamePage;
-            openedText = resultText(await executeTool('open', openArgs));
+            openedText = resultText(await executeTool('open', openArgs, context));
           }
           const reusedLine = reusedByIndex.has(index) ? `reused=1 tab=${reusedTabId}\n` : '';
           if (toolName === 'open') {
@@ -5085,7 +5360,7 @@ async function batchTool(args) {
               const innerArgs = { ...inner, tabId };
               delete innerArgs.replace;
               delete innerArgs.reuse;
-              const value = await executeTool(toolName, innerArgs);
+              const value = await executeTool(toolName, innerArgs, context);
               results[index] = `url=${url}\n${reusedLine}tab=${tabId}\n` + resultText(value);
             }
           }
@@ -5096,7 +5371,7 @@ async function batchTool(args) {
       }
       const tabId = tabIds[index];
       try {
-        const value = await executeTool(toolName, { ...inner, tabId });
+        const value = await executeTool(toolName, { ...inner, tabId }, context);
         results[index] = `tab=${tabId}\n` + resultText(value);
       } catch (error) {
         results[index] = `tab=${tabId}\n` + formatError(error);
@@ -5423,7 +5698,9 @@ async function observeTool(args) {
     }
 
     if (args.har) {
-      const har = buildHar(items, pageUrl);
+      const har = buildHar(items, pageUrl, {
+        headers: args.harHeaders === 'all' ? 'all' : 'redact',
+      });
       // HAR 是唯一允许超过 MAX_OUTPUT_CHARS 的 JSON 输出；必须用 content[] 返回，
       // 否则 toResult 的 capText 会把 JSON 截断成非法文件。
       return { content: [{ type: 'text', text: JSON.stringify(har) }] };
@@ -5458,6 +5735,27 @@ async function observeTool(args) {
 
 // ---------------------------------------------------------------- read / snapshot
 
+/** 把注入失败分成 tab 已关闭 / 受限页面 / 真的导航了，避免一律 page_changed。 */
+async function failInjection(tab, error, action) {
+  let current = null;
+  try { current = await chrome.tabs.get(tab.id); } catch (_) { /* tab closed */ }
+  if (!current) {
+    fail('tab_not_found', `tab ${tab.id} was closed while ${action}`,
+      'call tabs to list ids');
+  }
+  if (isInternalUrl(current.url)) {
+    fail('internal_page', `browser internal pages cannot be ${action}`,
+      'open an http(s) page');
+  }
+  const detail = oneLine(error && error.message || error).slice(0, 300);
+  if (/cannot access|not allowed|extensions gallery|chrome web store|cannot be scripted|missing host permission/i.test(detail)) {
+    fail('internal_page', `this page cannot be scripted by the extension (${detail})`,
+      'reload the tab, or open a normal http(s) page');
+  }
+  fail('page_changed', `the page changed while ${action} (${detail || 'injection failed'})`,
+    'retry after the page settles; if the tab is still loading, run `ema2 wait idle` first');
+}
+
 async function readTool(args) {
   const tab = await resolveTab(args);
   if (isInternalUrl(tab.url)) fail('internal_page', 'browser internal pages cannot be read', 'open an http(s) page');
@@ -5468,7 +5766,9 @@ async function readTool(args) {
   const budget = normalizeBudget(args.budget);
   const cursor = normalizeCursor(args.cursor);
   const useMain = args.main !== false && !selector;
-  const data = await runInTab(tab.id, (modeName, selectorArg, mainWanted) => {
+  let data;
+  try {
+    data = await runInTab(tab.id, (modeName, selectorArg, mainWanted) => {
     const helpers = window.__ema2_helpers;
     let root = document.body || document.documentElement;
     let mainSelector = '';
@@ -5500,8 +5800,10 @@ async function readTool(args) {
         + '\nmode=' + modeName
         + (mainSelector ? '\nmain=' + mainSelector : ''),
     };
-  }, [mode, selector || null, useMain]).catch(() => null);
-  if (!data) fail('page_changed', 'the page navigated while reading content', 'retry after the page settles');
+    }, [mode, selector || null, useMain]);
+  } catch (error) {
+    await failInjection(tab, error, 'reading content');
+  }
   if (data.missing) {
     fail('selector_not_found', `selector not found: ${selector}`, 'call snapshot to see available refs/roles');
   }
@@ -5532,8 +5834,8 @@ async function snapshotTool(args) {
     data = await runInTab(tab.id, (filterName, budgetValue, cursorValue, nearRef, showValues) => {
       return window.__ema2_helpers.snapshot(filterName, budgetValue, cursorValue, nearRef, showValues);
     }, [filter, budget, cursor, args.near || null, args.values === true || filter === 'form']);
-  } catch (_) {
-    fail('page_changed', 'the page navigated while taking the snapshot', 'retry after the page settles');
+  } catch (error) {
+    await failInjection(tab, error, 'taking the snapshot');
   }
   if (!data) fail('snapshot_failed', 'snapshot produced no data', 'retry');
   const parts = [data.header];
@@ -5560,7 +5862,7 @@ function requireStringArg(args, key, max, allowEmpty) {
   return args[key];
 }
 
-async function executeTool(name, args) {
+async function executeTool(name, args, context) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
     fail('invalid_arguments', 'tool arguments must be an object', 'run `ema2 <command> --help`; for scripts run `ema2 act --help`');
   }
@@ -5582,22 +5884,22 @@ async function executeTool(name, args) {
         fail('invalid_argument', 'use only one of tabId, replace:true, reuse:"session"', 'pick one navigation target');
       }
       const openArgs = { ...args, url };
-      return withCommandGuard('open', openArgs, () => openTool(openArgs));
+      return withCommandGuard('open', openArgs, () => openTool(openArgs), context);
     }
-    case 'read': return withCommandGuard('read', args, () => readTool(args));
-    case 'snapshot': return withCommandGuard('snapshot', args, () => snapshotTool(args));
-    case 'act': return withCommandGuard('act', args, () => actTool(args));
-    case 'wait': return withCommandGuard('wait', args, () => waitTool(args));
+    case 'read': return withCommandGuard('read', args, () => readTool(args), context);
+    case 'snapshot': return withCommandGuard('snapshot', args, () => snapshotTool(args), context);
+    case 'act': return withCommandGuard('act', args, () => actTool(args), context);
+    case 'wait': return withCommandGuard('wait', args, () => waitTool(args), context);
     case 'js': {
       const code = requireStringArg(args, 'code', 100000, false);
       if (!code) fail('missing_code', 'code is required', 'pass a JS expression');
       const jsArgs = { ...args, code };
-      return withCommandGuard('js', jsArgs, () => jsTool(jsArgs));
+      return withCommandGuard('js', jsArgs, () => jsTool(jsArgs), context);
     }
-    case 'observe': return withCommandGuard('observe', args, () => observeTool(args));
-    case 'files': return withCommandGuard('files', args, () => filesTool(args));
-    case 'batch': return withCommandGuard('batch', args, () => batchTool(args));
-    case 'shot': return withCommandGuard('shot', args, () => shotTool(args));
+    case 'observe': return withCommandGuard('observe', args, () => observeTool(args), context);
+    case 'files': return withCommandGuard('files', args, () => filesTool(args), context);
+    case 'batch': return withCommandGuard('batch', args, () => batchTool(args, context), context);
+    case 'shot': return withCommandGuard('shot', args, () => shotTool(args), context);
     default: fail('unknown_tool', `unknown tool: ${name}`, 'use tabs|open|read|snapshot|act|wait|js|observe|files|shot|batch');
   }
 }
@@ -5627,7 +5929,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   observedConsoleDocs.delete(tabId);
   observedNetworkDocs.delete(tabId);
   webRequestLog.delete(tabId);
-  commandGuardTabs.delete(tabId);
+  if (commandGuardTabs.delete(tabId)) void persistCommandGuardTabs();
 });
 ensureWatchdog();
 // 动态 command guard 不应跨 service worker 重生长时间残留。
@@ -5637,7 +5939,9 @@ connect();
 chrome.runtime.onStartup.addListener(() => { ensureWatchdog(); connect(); });
 chrome.runtime.onInstalled.addListener(() => {
   ensureWatchdog();
-  cleanupLegacyGuardOnce();
+  // 扩展更新/重载会清空 storage.session；already-armed 页面可能还在旧文档里。
+  // 重装时全量扫一遍，避免只依赖已经丢失的跟踪集合。
+  cleanupLegacyGuardOnce(true);
   migrateSettings().finally(() => connect());
 });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
