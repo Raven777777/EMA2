@@ -1,33 +1,39 @@
 /**
- * EMA2 page guard · 在页面主世界（MAIN world）里最早执行。
+ * EMA2 page guard · 只在 EMA2 命令租约期间改变页面对话框行为。
  *
- * 目的：真实站点上的 alert/confirm/prompt/print 会阻塞渲染进程，
- * `chrome.scripting.executeScript` 和 CDP `Runtime.evaluate` 都会一起挂住，
- * 一个对话框就能让整个 tab 不可操作。这里把这几类同步阻塞 API 变成
- * 非阻塞记录 + 默认关闭，并记录 window.open 是否被浏览器拦截。
+ * 默认状态是 disarmed：页面保留原生 alert/confirm/prompt/print/window.open。
+ * 命令执行前由 page_guard_armed.js 或 background.js 调用 guard.arm()，
+ * 把同步阻塞的对话框变成非阻塞记录；命令结束后 guard.disarm() 恢复原生 API。
  *
- * 行为：
- *   - alert(msg)      → 记录，立即返回
- *   - confirm(msg)    → 记录，返回 false（默认不确认有副作用的操作）
- *   - prompt(msg, d)  → 记录，返回 null
- *   - print()         → 记录，不打开打印预览
- *   - window.open()   → 调用原始实现；返回 null 时记录 popup_blocked
- *
- * 记录只放在页面内存 `window.__ema2_guard.events`，snapshot/act 读取后不会
- * 写回 DOM。该文件同时作为 manifest 的 document_start content script 和
- * `chrome.scripting.executeScript({ files: ['page_guard.js'], world: 'MAIN' })`
- * 的注入源使用，因此必须是自包含的 IIFE。
+ * 这个文件必须是自包含 IIFE，因为既会作为动态注册的 document_start content
+ * script，也会由 chrome.scripting.executeScript 注入。
  */
 (function ema2PageGuard() {
-  if (window.__ema2_guard && window.__ema2_guard.version >= 1) return;
+  const prior = window.__ema2_guard;
+  if (prior && prior.version >= 2) return;
 
   const MAX_EVENTS = 50;
+  // 旧 v1 会永久覆盖页面 API；优先复用它保存的原生引用，避免包装套包装。
+  const original = prior && prior.original ? prior.original : {
+    alert: window.alert,
+    confirm: window.confirm,
+    prompt: window.prompt,
+    print: window.print,
+    open: window.open,
+  };
+  const originalBeforeUnload = Object.getOwnPropertyDescriptor(window, 'onbeforeunload')
+    || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(window), 'onbeforeunload');
+
   const state = {
-    version: 1,
+    version: 2,
+    armed: false,
+    lease: '',
     seq: 0,
     events: [],
+    original,
   };
-  window.__ema2_guard = state;
+  let wrapped = false;
+  let beforeUnloadHandler = null;
 
   const record = (kind, detail) => {
     state.seq += 1;
@@ -48,69 +54,103 @@
     }
   };
 
-  // 原生函数可能被页面替换/绑定；保留原始实现的引用，避免递归。
-  const original = {
-    alert: window.alert,
-    confirm: window.confirm,
-    prompt: window.prompt,
-    print: window.print,
-    open: window.open,
+  const setOriginalBeforeUnload = (handler) => {
+    const value = typeof handler === 'function' ? handler : null;
+    if (originalBeforeUnload && typeof originalBeforeUnload.set === 'function') {
+      originalBeforeUnload.set.call(window, value);
+      return;
+    }
+    try {
+      delete window.onbeforeunload;
+      if (value) window.onbeforeunload = value;
+    } catch (_) { /* ignore */ }
   };
 
-  try {
-    window.alert = function ema2Alert(message) {
-      record('dialog', { dialog: 'alert', message: text(message), handled: 'dismissed' });
-    };
-  } catch (_) { /* 某些页面用不可写属性锁定，忽略 */ }
+  const readBeforeUnload = () => {
+    try {
+      if (originalBeforeUnload && typeof originalBeforeUnload.get === 'function') {
+        return originalBeforeUnload.get.call(window);
+      }
+      return window.onbeforeunload;
+    } catch (_) {
+      return null;
+    }
+  };
 
-  try {
-    window.confirm = function ema2Confirm(message) {
-      record('dialog', {
-        dialog: 'confirm', message: text(message), handled: 'dismissed', result: false,
+  const installBeforeUnload = () => {
+    beforeUnloadHandler = readBeforeUnload();
+    // 先让原生事件暂时不注册 handler；disarm 时再把页面自己的 handler 装回去。
+    setOriginalBeforeUnload(null);
+    try {
+      Object.defineProperty(window, 'onbeforeunload', {
+        configurable: true,
+        get() { return beforeUnloadHandler; },
+        set(handler) {
+          beforeUnloadHandler = typeof handler === 'function' ? handler : null;
+          if (beforeUnloadHandler) {
+            record('dialog', {
+              dialog: 'beforeunload',
+              message: 'beforeunload handler suppressed',
+              handled: 'suppressed',
+            });
+          }
+        },
       });
-      return false;
-    };
-  } catch (_) { /* ignore */ }
+    } catch (_) { /* some pages lock the property */ }
+  };
 
-  try {
-    window.prompt = function ema2Prompt(message, defaultValue) {
+  const restoreBeforeUnload = () => {
+    const handler = beforeUnloadHandler || readBeforeUnload();
+    try {
+      if (originalBeforeUnload) {
+        Object.defineProperty(window, 'onbeforeunload', originalBeforeUnload);
+      } else {
+        delete window.onbeforeunload;
+      }
+    } catch (_) { /* ignore */ }
+    setOriginalBeforeUnload(handler);
+    beforeUnloadHandler = null;
+  };
+
+  const wrappers = {
+    alert(message) {
+      record('dialog', {
+        dialog: 'alert',
+        message: text(message),
+        handled: state.armed ? 'dismissed' : 'passed',
+      });
+      if (!state.armed) return original.alert.call(window, message);
+    },
+    confirm(message) {
+      const result = state.armed ? false : original.confirm.call(window, message);
+      record('dialog', {
+        dialog: 'confirm',
+        message: text(message),
+        handled: state.armed ? 'dismissed' : 'passed',
+        result,
+      });
+      return result;
+    },
+    prompt(message, defaultValue) {
+      const result = state.armed ? null : original.prompt.call(window, message, defaultValue);
       record('dialog', {
         dialog: 'prompt',
         message: text(message),
         defaultValue: text(defaultValue),
-        handled: 'dismissed',
-        result: null,
+        handled: state.armed ? 'dismissed' : 'passed',
+        result,
       });
-      return null;
-    };
-  } catch (_) { /* ignore */ }
-
-  try {
-    window.print = function ema2Print() {
-      record('dialog', { dialog: 'print', message: 'window.print()', handled: 'blocked' });
-    };
-  } catch (_) { /* ignore */ }
-
-  // beforeunload 是浏览器原生确认框，不能靠 window.alert 覆盖；把赋值型
-  // handler 吞掉并记录。addEventListener('beforeunload') 仍由页面自己注册。
-  try {
-    Object.defineProperty(window, 'onbeforeunload', {
-      configurable: true,
-      get() { return null; },
-      set(handler) {
-        if (typeof handler === 'function') {
-          record('dialog', {
-            dialog: 'beforeunload',
-            message: 'beforeunload handler suppressed',
-            handled: 'suppressed',
-          });
-        }
-      },
-    });
-  } catch (_) { /* some pages lock the property */ }
-
-  try {
-    window.open = function ema2Open(url, target, features) {
+      return result;
+    },
+    print() {
+      record('dialog', {
+        dialog: 'print',
+        message: 'window.print()',
+        handled: state.armed ? 'blocked' : 'passed',
+      });
+      if (!state.armed) return original.print.call(window);
+    },
+    open(url, target, features) {
       let opened = null;
       let error = '';
       try {
@@ -123,11 +163,54 @@
         target: text(target),
         blocked: !opened,
         error,
+        handled: state.armed ? 'observed' : 'passed',
       });
       return opened;
-    };
-  } catch (_) { /* ignore */ }
+    },
+  };
 
-  // 只保留这些原始引用，避免页面脚本通过 window.open.toString() 等检测时崩溃。
-  state.original = original;
+  const install = () => {
+    if (wrapped) return;
+    wrapped = true;
+    try { window.alert = wrappers.alert; } catch (_) { /* ignore */ }
+    try { window.confirm = wrappers.confirm; } catch (_) { /* ignore */ }
+    try { window.prompt = wrappers.prompt; } catch (_) { /* ignore */ }
+    try { window.print = wrappers.print; } catch (_) { /* ignore */ }
+    try { window.open = wrappers.open; } catch (_) { /* ignore */ }
+    installBeforeUnload();
+  };
+
+  const restore = () => {
+    if (!wrapped) return;
+    try { if (window.alert === wrappers.alert) window.alert = original.alert; } catch (_) { /* ignore */ }
+    try { if (window.confirm === wrappers.confirm) window.confirm = original.confirm; } catch (_) { /* ignore */ }
+    try { if (window.prompt === wrappers.prompt) window.prompt = original.prompt; } catch (_) { /* ignore */ }
+    try { if (window.print === wrappers.print) window.print = original.print; } catch (_) { /* ignore */ }
+    try { if (window.open === wrappers.open) window.open = original.open; } catch (_) { /* ignore */ }
+    restoreBeforeUnload();
+    wrapped = false;
+  };
+
+  state.arm = (lease) => {
+    state.armed = true;
+    state.lease = String(lease || '');
+    install();
+  };
+  state.disarm = () => {
+    state.armed = false;
+    state.lease = '';
+    restore();
+  };
+
+  // 从永久覆盖的 v1 升级时，立即恢复原生 API；真正的 arm 由 armed helper 执行。
+  if (prior && prior.version < 2) {
+    try { window.alert = original.alert; } catch (_) { /* ignore */ }
+    try { window.confirm = original.confirm; } catch (_) { /* ignore */ }
+    try { window.prompt = original.prompt; } catch (_) { /* ignore */ }
+    try { window.print = original.print; } catch (_) { /* ignore */ }
+    try { window.open = original.open; } catch (_) { /* ignore */ }
+    try { delete window.onbeforeunload; } catch (_) { /* ignore */ }
+  }
+
+  window.__ema2_guard = state;
 })();

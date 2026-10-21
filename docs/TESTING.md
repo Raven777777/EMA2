@@ -28,13 +28,13 @@
 
 ```bash
 cd rust
-cargo test                          # 71 项：参数校验、超时预算、脚本解析、路由、落盘
+cargo test                          # 74 项：参数校验、超时预算、脚本解析、路由、落盘
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（102 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（113 项）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 
@@ -43,6 +43,11 @@ python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 open / snapshot / act（按钮+链接+SPA+scroll）/ read（md 链接·表格·列表·shadow DOM）/ js /
 wait / observe console·network / shot / files upload（含 5 MiB 边界）/ batch / 负例错误码，
 并静态断言 `extension/background.js` 的每个 `fail('code'` 都写进了 `docs/TOOLS.md`。
+
+guard 回归还覆盖：未执行 EMA2 命令的页面没有 `window.__ema2_guard`；
+`act` 返回后 guard 必须 `armed=0`；`role:name` 能匹配 HTML `name`；
+非活动标签可由 `act --tab` 修改；`batch --reuse session` 复用会话标签；
+`shot --out ./a/../b.png` 回显规范化路径。
 
 ## 真机验收
 
@@ -78,6 +83,7 @@ bin\ema2.exe status          # extension=connected
 
 | # | 命令 | 期望 |
 |---|---|---|
+| 0 | 普通浏览任意页面（不执行 EMA2 命令） | 无 `window.__ema2_guard`；alert/confirm/prompt/window.open 为原生行为 |
 | 1 | `ema2 server` ×2 | 第二次 `relay=already_running pid=...`，退出 0 |
 | 2 | `ema2 status` | `relay=running`、`extension=connected`、`tabs=N active_tab=ID` |
 | 3 | `ema2 tabs current` | `id/window/os/title/url` |
@@ -92,6 +98,7 @@ bin\ema2.exe status          # extension=connected
 | 7 | `ema2 act fill e2 "x"` / `type e2 "y"` | fill 覆盖、type 在 caret 处插入；`wrote=1 chars=N` |
 | 8 | `ema2 act select e4 <value>` | select 的 value 生效 |
 | 9 | `ema2 act click e1` | 页面变化；旧完整 ref 报 `stale_ref` |
+| 9h | `ema2 act fill ... --tab ID` | 修改非活动 tab，活动 tab 和窗口焦点都不变 |
 | 9a | 点击 5s 才响应的链接 | `settle=pending`、`next_url=`、退出 0 |
 | 9b | 紧接 `ema2 await 10s` | `await=done elapsed=...s tab=... url=...` |
 | 9c | 点击普通 fetch 按钮 | `settle=done ms<800 expect=page`，并提示用 `--wait-for` |
@@ -100,6 +107,7 @@ bin\ema2.exe status          # extension=connected
 | 9f | 脚本里 pending 后不写 `await` | `ok=1/N`、`stopped=1 reason=pending`，不继续点 |
 | 9g | 点击一个不导航的 `<a href="#">` | `nav=none` + hint；`<a>` 只重试一次 |
 | 10 | `ema2 act click e6 --wait-for "url=api/save status=200 timeout=5s"` | `response=200 GET http://.../api/save` |
+| 10a | `ema2 act fill --target "searchbox:q" ...` | 无 label、`name=q` 的 searchbox 被命中 |
 | 11 | `ema2 wait text/selector/time/idle` | `ok=... elapsed=...s` |
 | 12 | `ema2 js '1+1'` / `ema2 js 'return 6*7'` / `--file` | `2` / `42` / 文件结果 |
 | 12a | 弹过密码管理器浮层的 tab 里 `ema2 js` | 结果 + `via=scripting`，不因 `debugger_attach_failed` 丢失 |
@@ -112,6 +120,7 @@ bin\ema2.exe status          # extension=connected
 | 19 | `ema2 shot --annotate --format jpeg` | 标注图落盘 |
 | 20 | `ema2 shot --inline` | `data:image/png;base64,...` |
 | 21 | `ema2 batch read --urls "u1,u2"` | 两块，`---` 分隔，各自 `tab=` |
+| 21a | `ema2 batch read --urls "u1" --reuse session` | 复用本会话精确 URL 标签并回 `reused=1` |
 | 22 | `ema2 batch open --urls "u1,u2"` | 并行开页，各自 `id=` |
 | 23 | `ema2 act --steps 'fill e2 "a"; type e2 "b"'` | 两步；type 在 caret 处插入 |
 | 24 | `ema2 act --script flow.ema2` | 逐行执行，`waitFor` 在所在行执行；失败保留已完成 steps |
@@ -124,6 +133,8 @@ bin\ema2.exe status          # extension=connected
 | 30 | `ema2 read` on shadow DOM | 能看到 open shadow root 正文 |
 | 31 | `ema2 files upload` 5 MiB | 不再被 2MB axum 默认上限截断 |
 | 32 | 运行时 `SyntaxError` | `js_exception` 且副作用只执行一次 |
+| 33 | 命令执行中的 `alert/print` | 非阻塞并回 `dialog_opened=` |
+| 34 | 命令结束后定时检查 guard | `window.__ema2_guard.armed=0`，原生 API 已恢复 |
 
 错误路径：
 

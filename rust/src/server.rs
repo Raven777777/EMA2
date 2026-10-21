@@ -54,7 +54,7 @@ pub async fn run(port: u16) -> i32 {
     }
     tracing::info!(
         "ema2 {} listening on http://127.0.0.1:{port}/ (health/cmd) and ws://127.0.0.1:{port}/ (extension)",
-        env!("CARGO_PKG_VERSION")
+        paths::PRODUCT_VERSION
     );
 
     let graceful = {
@@ -222,7 +222,7 @@ async fn entry(
             StatusCode::OK,
             format!(
                 "ema2 {} relay\nws=ws://127.0.0.1:{} (extension) http=http://127.0.0.1:{}/cmd (cli)\n",
-                env!("CARGO_PKG_VERSION"),
+                paths::PRODUCT_VERSION,
                 state.port,
                 state.port
             ),
@@ -354,7 +354,7 @@ async fn health(
     }
     let body = json!({
         "name": "ema2",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": paths::PRODUCT_VERSION,
         "port": state.port,
         "pid": state.pid,
         "uptime_secs": state.uptime_secs(),

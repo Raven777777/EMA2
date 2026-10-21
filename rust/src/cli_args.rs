@@ -37,7 +37,7 @@ impl ToolCall {
 #[derive(Parser)]
 #[command(
     name = "ema2",
-    version,
+    version = crate::paths::PRODUCT_VERSION,
     about = "AI-driven control of the user's real Edge browser (daemon + CLI, no MCP)",
     disable_help_subcommand = true,
     after_help = "\
@@ -106,9 +106,11 @@ pub enum Command {
         /// 关闭正文提取（读整页）
         #[arg(long = "no-main")]
         no_main: bool,
-        #[arg(long)]
+        /// 返回字符预算（默认 4000，范围 200..200000）
+        #[arg(long, value_name = "N")]
         budget: Option<u64>,
-        #[arg(long)]
+        /// 从上次输出的 next 续读（字符偏移）
+        #[arg(long, value_name = "N")]
         cursor: Option<u64>,
     },
     /// ref 快照：[e12@d1] button "X"
@@ -121,9 +123,11 @@ pub enum Command {
         /// 限定在该 ref 最近的容器内
         #[arg(long)]
         near: Option<String>,
-        #[arg(long)]
+        /// 返回字符预算（默认 4000，范围 200..200000）
+        #[arg(long, value_name = "N")]
         budget: Option<u64>,
-        #[arg(long)]
+        /// 从上次输出的 next 续读
+        #[arg(long, value_name = "N")]
         cursor: Option<u64>,
         /// 附带 text/textarea/select/file/contenteditable 的当前值
         #[arg(long)]
@@ -135,10 +139,12 @@ pub enum Command {
   ema2 act fill e15 "hello world"
   ema2 act press e15 Enter
   ema2 act click e12 --wait-for "url=api/save status=200 timeout=5s"
+  ema2 act click e12 --tab 42
 
 多步:
   ema2 act --steps 'click e12; fill e15 "hi"; press e15 Enter'
   ema2 act --script flow.ema2
+  ema2 act --script flow.ema2 --tab 42
 
 .ema2 脚本（每行一条；空行和 # 注释忽略；含空格的值加双引号）:
   click e12
@@ -213,12 +219,13 @@ pub enum Command {
         file: Option<PathBuf>,
         #[arg(long = "tab")]
         tab: Option<u64>,
-        #[arg(long)]
+        /// 返回字符预算（默认 8000，范围 200..200000）
+        #[arg(long, value_name = "N")]
         budget: Option<u64>,
         /// 从上次输出的 next 续读
         #[arg(long)]
         cursor: Option<u64>,
-        /// 执行上限秒数（默认 10，1..300）；超时会 terminateExecution
+        /// 执行上限秒数（默认 10，0.1..300）；超时会 terminateExecution
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<f64>,
     },
@@ -231,8 +238,8 @@ pub enum Command {
         /// 从上次输出的 next 续读
         #[arg(long)]
         since: Option<u64>,
-        /// log|warn|error（console）
-        #[arg(long)]
+        /// log|warn|error（console 最低级别；默认 error，log 含全部）
+        #[arg(long, value_name = "LEVEL")]
         level: Option<String>,
         /// URL 子串过滤
         #[arg(long)]
@@ -249,7 +256,8 @@ pub enum Command {
         /// 导出 HAR 到指定路径
         #[arg(long, value_name = "PATH")]
         har: Option<PathBuf>,
-        #[arg(long)]
+        /// 返回字符预算（默认 3000，范围 200..200000）
+        #[arg(long, value_name = "N")]
         budget: Option<u64>,
     },
     /// 上传本地文件；download-dir 固定报错
@@ -267,13 +275,14 @@ pub enum Command {
         /// png|jpeg
         #[arg(long)]
         format: Option<String>,
-        /// 落盘路径（缺省进默认输出目录）
+        /// 落盘路径（相对路径按当前目录转绝对并清理 . / ..）
         #[arg(long = "out")]
         out: Option<PathBuf>,
     },
     /// 多标签并发 open/read/snapshot/js/wait
     #[command(after_help = "\
 目标工具 flags（与 --tab-ids/--urls 混用）：
+  --reuse session  与 --urls 使用：精确 URL 命中本会话标签时复用，否则新开
   read      --mode md|text|html|visible  --selector S  --no-main  --budget N  --cursor N
   snapshot  --filter F  --near REF  --budget N  --cursor N
   js        --code CODE  --budget N  --cursor N  --timeout 10s
@@ -309,7 +318,8 @@ pub struct TabsArgs {
 pub enum TabsCommand {
     /// 列出标签页（默认动作）
     List {
-        #[arg(long)]
+        /// 返回字符预算（默认 4000，范围 200..200000）
+        #[arg(long, value_name = "N")]
         budget: Option<u64>,
         #[arg(long)]
         cursor: Option<u64>,
@@ -788,6 +798,7 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
 
     let mut tab_ids: Option<String> = None;
     let mut urls: Option<String> = None;
+    let mut reuse: Option<String> = None;
     let mut concurrency: Option<u32> = None;
     let mut port_override: Option<u16> = None;
     let mut flags: Vec<String> = Vec::new();
@@ -796,11 +807,12 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
         let token = tokens[index].as_str();
         let (flag, inline) = split_flag(token);
         match flag {
-            "--tab-ids" | "--urls" | "--concurrency" | "--port" => {
+            "--tab-ids" | "--urls" | "--reuse" | "--concurrency" | "--port" => {
                 let value = take_flag_value(tokens, &mut index, inline, "batch", flag)?;
                 match flag {
                     "--tab-ids" => tab_ids = Some(value),
                     "--urls" => urls = Some(value),
+                    "--reuse" => reuse = Some(value),
                     "--concurrency" => {
                         let parsed: u32 = value
                             .parse()
@@ -853,6 +865,9 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
     if tab_ids.is_some() && urls.is_some() {
         return Err("batch: --tab-ids and --urls are mutually exclusive".into());
     }
+    if reuse.is_some() && urls.is_none() {
+        return Err("batch: --reuse session only applies to --urls".into());
+    }
     if tab_ids.is_none() && urls.is_none() {
         return Err("batch: pass --tab-ids \"1,2\" or --urls \"u1,u2\"".into());
     }
@@ -879,6 +894,14 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
             return Err("batch: --urls must contain 1..8 urls".into());
         }
         arguments["urls"] = json!(parsed);
+    }
+    if let Some(reuse) = reuse {
+        if reuse != "session" {
+            return Err(format!(
+                "batch: --reuse only accepts \"session\", got {reuse:?}"
+            ));
+        }
+        arguments["reuse"] = json!("session");
     }
     if let Some(concurrency) = concurrency {
         arguments["concurrency"] = json!(concurrency);
@@ -2077,6 +2100,8 @@ click target=\"button:提交\"
             "read".into(),
             "--urls".into(),
             "https://a.com/,https://b.com/".into(),
+            "--reuse".into(),
+            "session".into(),
             "--mode".into(),
             "md".into(),
             "--budget".into(),
@@ -2089,6 +2114,7 @@ click target=\"button:提交\"
         );
         assert_eq!(args_of(&call)["args"]["mode"], "md");
         assert_eq!(args_of(&call)["args"]["budget"], 8000);
+        assert_eq!(args_of(&call)["reuse"], "session");
         assert!(
             args_of(&call).get("mode").is_none(),
             "inner flags must live under args"
@@ -2177,6 +2203,16 @@ click target=\"button:提交\"
         );
         assert!(build_batch(&["open".into(), "--tab-ids".into(), "1".into()]).is_err());
         assert!(build_batch(&["read".into()]).is_err());
+        assert!(
+            build_batch(&[
+                "read".into(),
+                "--tab-ids".into(),
+                "1".into(),
+                "--reuse".into(),
+                "session".into(),
+            ])
+            .is_err()
+        );
         assert!(
             build_batch(&[
                 "read".into(),
@@ -2299,6 +2335,32 @@ click target=\"button:提交\"
         assert!(build_act(&["click".into(), "e12@dfoo".into()]).is_err());
         assert!(build_act(&["click".into(), "e12@d1x".into()]).is_err());
         assert!(build_act(&["click".into(), "e12@d".into()]).is_err());
+    }
+
+    #[test]
+    fn act_and_script_accept_an_explicit_tab() {
+        let call = build_act(&["click".into(), "e12".into(), "--tab".into(), "7".into()]).unwrap();
+        assert_eq!(args_of(&call)["tabId"], 7);
+
+        let call = build_act(&[
+            "--script".into(),
+            {
+                let path = std::env::temp_dir().join(format!(
+                    "ema2-act-tab-{}-{}.ema2",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::write(&path, "click e1\n").unwrap();
+                path.to_string_lossy().into_owned()
+            },
+            "--tab".into(),
+            "8".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["tabId"], 8);
     }
 
     #[test]

@@ -234,8 +234,9 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
   `performance.timeOrigin` 确认 reload 后的新文档，不会被旧文档的 `complete` 提前骗过。
 - 超时不会把旧的 hook/timing/focus 探测拖到后面：整个流程共用一个 deadline，
   中继预算也跟着 `waitTimeout` 走（默认 15s，最大 60s）。
-- 页面加载期间触发的 `alert/confirm/prompt/print` 由 document_start 的 `page_guard.js`
-  记录并自动关闭，不会让 open 卡死。
+- `open` 执行期间会临时注册 document_start 的 `page_guard.js`；页面加载期间触发的
+  `alert/confirm/prompt/print` 被记录并自动关闭，不会让 open 卡死。命令结束后 guard
+  注销并恢复页面原生 API；不使用 EMA2 时不会注入或覆盖对话框。
 
 ## read
 
@@ -308,12 +309,14 @@ wikipedia 32→49、jd 28→47、taobao 27→45、bing 33→46、hn 36→47，x.
 ```bash
 ema2 act <action> [ref] [text] [flags...]     # 单步
 ema2 act --steps 'click e12; type e15 hi'     # 内联多步
-ema2 act --script run.ema2                    # 脚本文件
+ema2 act --script run.ema2 [--tab ID]          # 脚本文件，指定目标标签
 ```
 
 动作：`click | type | fill | select | press | hover | scroll | submit | back | forward | reload`
 
 定位（三选一）：裸写 `ref`（snapshot 给的）优先，其次 `--selector`，再 `--target "button:提交"`。
+`--target "role:name"` 先匹配可访问名称，再精确匹配 HTML `name` 属性；例如没有 label、
+但 `<input type="search" name="q">` 可用 `--target "searchbox:q"`。
 `--selector/--target/--key/--delta-y/--submit` 只属于单步调用；`--steps`/`--script` 里改用脚本写法
 （`selector=` / `target=` / `press <key>` / `submit` 步骤；像素滚动用 `js`）。
 单步动作也会拒绝与该动作不匹配的 flag（例如 `back --selector`、`type --key`）。
@@ -332,6 +335,8 @@ ema2 act --script run.ema2                    # 脚本文件
 | back/forward/reload | — | `--tab ID` |
 
 - 查找、控件校验、执行和结果检查在同一次页面注入内完成；目标被动态移除不会假成功。
+- `--tab ID` 对单步、`--steps` 和 `--script` 都有效；目标标签无需处于活动状态，
+  命令不会切换当前活动标签。`await` 继续跟随该动作所属标签。
 - **隐式 settle**：点击链接/提交表单/back/forward/reload 后最多等 3s，普通按钮最多 800ms，
   其他动作不等待；页面提前稳定就提前返回。SPA 链接只改 DOM 时约 1s 后按 `nav=none` 结算，
   不再拖满 3s。settle 超时**不算动作失败**，退出码仍为 0。
@@ -501,6 +506,8 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
 
 - console：增量日志；首次安装 hook（`open`/`act` 也会自动装）。`--wait` 会先安装 hook 再等待，等待期间的新日志也会被记录；
   `--har` 只适用于 network（console 传 `--har` 会报 `invalid_argument`）。
+- `--level` 是最低级别阈值，默认 `error`；`warn` 包含 warn/error，`log` 包含所有已采集级别。
+  输出尾部明确带 `level=<阈值>`，避免把“没有输出”误认为“没有产生日志”。
 - network：hook `fetch`/`XMLHttpRequest`，真实 `status` + **受限**响应预览；同时用
   `chrome.webRequest` 补齐页面 hook 安装前的首屏文档/资源 status、headers、MIME，
   并给每条记录按 `startedAt` 排序匹配。
@@ -542,6 +549,7 @@ ema2 shot [--tab ID] [--inline] [--annotate] [--format png|jpeg] [--out PATH]
 - `--tab` 会把目标标签激活并把窗口提到前台（成功时回 `activated=1`）；
   激活失败（窗口最小化等）才回 `tab_not_active`，不会返回前台页图片。
 - 默认：落盘 PNG（`--out` 指定路径，缺省进默认输出目录），回 `path=` + `bytes=`。
+- `--out` 的相对路径按 CLI 当前目录转为绝对路径，并清理 `.` / `..`；不解析符号链接。
 - `--inline`：不落盘，CLI 输出 `data:image/png;base64,...`（或 jpeg）。
 - `--annotate`：先快照，再在图上画 ref 编号，回坐标列表 + 标注图
   （`[e3@d3] button "提交" @439,275 43x26`）；截图前后复核 tab/document。
@@ -552,6 +560,7 @@ ema2 shot [--tab ID] [--inline] [--annotate] [--format png|jpeg] [--out PATH]
 
 ```bash
 ema2 batch <tool> [tool flags...] --urls "u1,u2"
+ema2 batch <tool> [tool flags...] --urls "u1,u2" --reuse session
 ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
 ```
 
@@ -560,10 +569,13 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
 - `--tab-ids`：对已有标签并发执行目标工具，每块头部 `tab=<id>`。
 - `--urls`：先为每个 URL 打开新标签，再在该标签上执行目标工具，每块头部 `url=<url>` + `tab=<id>`；
   `tool=open` 时只打开（并行开多页）。**`open` + `read` 因此一次命令完成**，不再串行两次。
-  `--urls` 模式始终新开标签，内层 `--replace`/`--reuse`/`tabId` 会被拒绝。
+  默认始终新开标签；内层 `--replace`/`--reuse`/`tabId` 会被拒绝。
+- `--reuse session`：仅用于 `--urls`。按规范化后的完整 URL 只匹配本会话由
+  `open`/`tabs new` 打开的标签；命中时复用并回 `reused=1 tab=<id>`，未命中仍新开。
+  不会复用任意用户标签，也不会改变默认的新开语义。
 - `--tab-ids` 与 `--urls` 互斥；`tool=open` 只能配 `--urls`。
 - 工具 flag 会与每个目标合并后复用子命令 validator：`ema2 batch wait --time 3600 --tab-ids 1,2`
-  会在执行前拒绝；urls 模式下 `--wait`/`--timeout` 可以传给 open，`--replace`/`--reuse` 会被拒绝。
+  会在执行前拒绝；urls 模式下 `--wait`/`--timeout` 可以传给 open，内层 `--replace`/`--reuse` 会被拒绝。
 - 内层参数：`read --mode/--selector/--no-main/--budget/--cursor`，
   `snapshot --filter/--near/--budget/--cursor/--values`，
   `js --code/--budget/--cursor/--timeout`，`wait --text/--text-gone/--selector/--time/--timeout/--idle`。
@@ -614,10 +626,12 @@ ema2 server stop
 - `press` 的浏览器默认行为（Tab/Backspace/Enter/快捷键）需要 debugger 可用；
   `via=scripting`/`trusted=0` 的降级路径只有页面合成事件，没有浏览器级默认行为。
 - 截图会 `shot --tab` 自动激活目标标签；窗口最小化/不可见仍会失败。
-- `page_guard.js` 会在 MAIN world 把 `alert/confirm/prompt/print` 变成非阻塞记录：
+- 只有 EMA2 页面命令执行期间，`page_guard.js` 才在 MAIN world 把
+  `alert/confirm/prompt/print` 变成非阻塞记录：
   `confirm` 返回 false、`prompt` 返回 null、`print` 不打开预览；赋值型 `window.onbeforeunload`
   也会被吞掉（记录为 `dialog_opened=beforeunload handled=suppressed`），避免离开页面时被原生确认框卡住。
   需要用户确认的流程请先检查 `dialog_opened=`，不要假设页面拿到了“确认”。
+  命令结束或失败后 guard 恢复原生 API；未调用 EMA2 时页面弹窗不会被扩展拦截。
 - 视觉兜底只有编号 + 坐标，没有 OCR。
 - `js` 超时的 `Runtime.terminateExecution` 会终止目标 tab 的全部 JS 执行。
 - `open status=` 依赖 `PerformanceNavigationTiming.responseStatus`（Chromium 109+）；

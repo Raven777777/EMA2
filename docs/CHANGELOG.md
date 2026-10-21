@@ -1,5 +1,26 @@
 # 变更记录
 
+## v2.4.1.1 — guard 仅命令期启用，补齐目标与默认值
+
+- **普通浏览零干预**：移除 manifest 的全局 `page_guard.js` content script。
+  页面 guard 改为命令租约：首个页面命令动态注册 document_start guard，最后一个
+  命令结束注销并向所有可脚本化 tab 广播 `disarm()`，恢复原生
+  `alert/confirm/prompt/print/window.open/onbeforeunload`。不调用 EMA2 时弹窗不再被拦截。
+- **命令期间仍防卡死**：`act/read/snapshot/wait/js/observe/files/shot` 均在同一租约内
+  arm；`open` 和可能新建标签的动作仍覆盖新文档的加载期对话框。
+- **显式 act 标签**：文档和 `ema2 act --help` 补齐
+  `act ... --tab ID`、`act --steps ... --tab ID`、`act --script ... --tab ID`，并增加
+  非活动标签真机回归。
+- **role target 名称回退**：`target="role:name"` 在可访问名称之后精确匹配 HTML
+  `name` 属性，例如 `searchbox:q`；helper 升至 18。
+- **batch 显式复用**：新增 `batch ... --urls ... --reuse session`，仅复用精确 URL
+  命中的本会话标签并输出 `reused=1`。默认继续新开标签，不静默改变输出基数。
+- **默认值与路径可见**：`observe console` 保持默认 `error` 并显式输出 `level=error`；
+  各页面命令 `--help` 写明 budget 默认值/范围；`shot --out` / `observe --har`
+  统一词法规范化绝对路径，清理 `.` / `..`。
+- **版本**：对外产品/扩展 `2.4.1.1`；Cargo crate metadata 仍使用合法 SemVer `2.4.1`。
+- **验收**：`cargo test` 74 passed；真实前台 Edge `python scripts/verify.py` 113 checks passed。
+
 ## v2.4.1 — 文档收口与发布准备
 
 仅文档与发布信息，不改浏览器行为。

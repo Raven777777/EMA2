@@ -35,7 +35,7 @@ pub fn request(
 
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nUser-Agent: ema2/{}\r\nConnection: close\r\n",
-        env!("CARGO_PKG_VERSION")
+        crate::paths::PRODUCT_VERSION
     );
     if let Some(body) = body {
         head.push_str("Content-Type: application/json\r\n");

@@ -74,9 +74,10 @@ EMA2 是**一个单文件 exe + 一个 MV3 扩展**。exe 既能以后台 daemon
 | `rust/src/state.rs` | 扩展连接 generation、pending 请求表、锁中毒兜底 |
 | `rust/src/tools.rs` | 11 个工具白名单 + 参数校验 + 超时预算 |
 | `rust/src/save.rs` | 截图/HAR 落盘，把 base64/JSON 换成 `path=` 行 |
-| `rust/src/paths.rs` | 默认端口、输出目录、临时 PID/日志路径 |
+| `rust/src/paths.rs` | 产品版本、默认端口、输出目录、临时 PID/日志路径 |
 | `extension/background.js` | 11 个工具实现、ref 快照、网络/console hook、webRequest 补齐、debugger 队列、act settle/await 上下文 |
-| `extension/page_guard.js` | MAIN world document_start：把 alert/confirm/prompt/print 变成非阻塞记录，记录 window.open 拦截 |
+| `extension/page_guard.js` | 命令租约内按需启用：非阻塞记录 alert/confirm/prompt/print，解除后恢复原生 API |
+| `extension/page_guard_armed.js` | document_start 动态 guard 的第二个脚本，在页面脚本前立即 arm |
 | `extension/popup.html/js` | 端口输入、保存/重连、连接状态 |
 
 ## 单端口分流
@@ -148,6 +149,21 @@ CLI 参数
 - `act` 的工具超时预算会叠加脚本中的 await + 每步 settle，超过 600s 在执行前拒绝。
 - 脚本里的 `waitFor` 是独立步骤，在所在行执行；失败时已完成的 `stepN` 会随错误返回。
 
+## command guard 生命周期
+
+- manifest 不再永久注入页面 guard；普通浏览和 daemon 空闲时不覆盖任何页面 API。
+- 页面命令开始时登记 guard lease；第一个 lease 通过
+  `chrome.scripting.registerContentScripts` 动态注册 MAIN world、document_start、
+  all-frames 的 `page_guard.js` + `page_guard_armed.js`，覆盖导航后的新文档。
+- 对已经打开的 tab，扩展立即注入并 arm；读取、快照、动作、等待、JS、观测、
+  上传和截图都在租约内执行。
+- 最后一个 lease 结束时注销动态脚本，并向所有可脚本化 tab 广播 `disarm()`。
+  alert/confirm/prompt/print/window.open 以及赋值型 `onbeforeunload` 恢复原生行为。
+- `page_guard.js` 默认 disarmed；从旧 v1 升级时会用其保存的原生引用恢复页面。
+- `ema2_guard_protocol` 标记避免每次 service worker 唤醒都全量清理已升级页面。
+- guard 注册失败不影响工具调用；页面若主动弹出同步对话框，仍由 watchdog
+  返回 `tool_timeout`。
+
 ## ref 模型
 
 - snapshot 给 `[e<seq>@<doc>]`，`doc` 是扩展分配的短句柄（`d1/d2…`），
@@ -218,11 +234,12 @@ CLI 读本地文件 → base64 随 `/cmd` 请求下发 → 扩展在页面 MAIN 
 ## batch
 
 - `--urls`：每个 URL 开新标签再执行目标工具；`tool=open` 只并行开页；
+- `--reuse session`：只按规范化完整 URL 复用本会话标签，未命中仍新开；
 - `--tab-ids`：对已有标签并发执行；
 - 并发默认 2，最大 4；`js` 因全局 debugger 串行，预算按有效并发 1 计算；
 - 每块 `---` 分隔，单块失败不影响其它块；
 - 内层参数复用子工具 validator，不能绕过 `wait time=300` 等上限；
-  `--urls` 模式始终新开标签，`--replace`/`--reuse`/`tabId` 会被拒绝。
+  `--urls` 默认新开标签，内层 `--replace`/`--reuse`/`tabId` 会被拒绝。
 
 ## 输出与退出码
 

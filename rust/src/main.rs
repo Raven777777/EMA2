@@ -715,12 +715,37 @@ fn json_u64(value: &Value, key: &str) -> u64 {
 }
 
 fn absolute(path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
+    };
+    lexical_normalize(&joined)
+}
+
+/// 清理 `.` / `..`，但不解析符号链接，也不要求目标已存在。
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !path.is_absolute() {
+                    out.push("..");
+                }
+            }
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
     }
 }
 
@@ -851,4 +876,31 @@ fn kill_process(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lexical_normalize;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn output_paths_are_normalized_without_touching_disk() {
+        assert_eq!(
+            lexical_normalize(Path::new("./out/../shot.png")),
+            PathBuf::from("shot.png")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("out/./nested/../shot.png")),
+            PathBuf::from("out/shot.png")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_output_paths_do_not_keep_dot_segments() {
+        assert_eq!(
+            lexical_normalize(Path::new(r"C:\work\.\out\..\shot.png")),
+            PathBuf::from(r"C:\work\shot.png")
+        );
+    }
 }

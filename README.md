@@ -26,7 +26,7 @@ cargo build --release --manifest-path rust/Cargo.toml
 ### 2. 加载扩展
 
 1. 打开 `edge://extensions/`，开启“开发人员模式”；
-2. “加载解压缩的扩展”，选择解压 `ema2extension.zip` 的目录；
+2. “加载解压缩的扩展”，选择仓库的 `/extensions` 目录；
 3. 打开 EMA2 拓展菜单，确认端口是 **7744**，点“保存并连接”。
 
 升级扩展后，在 `edge://extensions/` 点“重新加载”。

@@ -101,7 +101,7 @@ fn on_extension_message(state: &Arc<RelayState>, generation: u64, text: &str) ->
                 "jsonrpc": "2.0",
                 "method": "bridge/welcome",
                 "name": "ema2",
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": crate::paths::PRODUCT_VERSION,
             }))
         }
         // 旧扩展会对无 id 的 ping 回一条无 id 的 pong；忽略即可。

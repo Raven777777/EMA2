@@ -41,6 +41,10 @@ const SETTLE_NAV_MS = 3000;
 const SETTLE_NAV_IDLE_MS = 1500;
 const SETTLE_PAGE_MS = 800;
 const SETTLE_NONE_MS = 100;
+const COMMAND_GUARD_ID = 'ema2-command-guard';
+const COMMAND_GUARD_FILES = ['page_guard.js', 'page_guard_armed.js'];
+const GUARD_PROTOCOL_KEY = 'ema2_guard_protocol';
+const GUARD_PROTOCOL_VERSION = 2;
 
 let socket = null;
 let connecting = false;
@@ -63,6 +67,8 @@ let sessionTabsLoaded = false;
 let sessionTabsLoad = null;
 let sessionWriteChain = Promise.resolve();
 let lastActContext = null;
+let commandGuardLeases = 0;
+let commandGuardLifecycle = Promise.resolve();
 
 class ToolError extends Error {
   constructor(code, message, hint, lines) {
@@ -1051,13 +1057,154 @@ async function runInTab(tabId, func, args, world, attempts = 2) {
   throw lastError;
 }
 
-/** 在主世界安装 page_guard.js；失败只意味着该页面不能脚本化，不让调用方崩溃。 */
+/**
+ * 命令期间才启用 guard。动态 content script 负责覆盖导航后新文档在
+ * document_start 阶段出现的对话框；已经打开的 tab 由这里立即注入并 arm。
+ */
 async function ensurePageGuard(tabId) {
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['page_guard.js'], world: 'MAIN' });
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: COMMAND_GUARD_FILES,
+      world: 'MAIN',
+    });
     return true;
   } catch (_) {
     return false;
+  }
+}
+
+async function registerCommandGuard() {
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [COMMAND_GUARD_ID] });
+  } catch (_) { /* not registered */ }
+  try {
+    await chrome.scripting.registerContentScripts([{
+      id: COMMAND_GUARD_ID,
+      matches: ['<all_urls>'],
+      js: COMMAND_GUARD_FILES,
+      runAt: 'document_start',
+      allFrames: true,
+      world: 'MAIN',
+      persistAcrossSessions: false,
+    }]);
+    return true;
+  } catch (error) {
+    console.warn('[EMA2] command guard registration failed:', error && error.message || error);
+    return false;
+  }
+}
+
+async function unregisterCommandGuard() {
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [COMMAND_GUARD_ID] });
+  } catch (_) { /* not registered */ }
+}
+
+async function disarmPageGuard(tabId) {
+  let needsUpgrade = false;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      func: () => {
+        const guard = window.__ema2_guard;
+        if (!guard) return { guard: false, disarmed: false };
+        if (typeof guard.disarm !== 'function') return { guard: true, disarmed: false };
+        guard.disarm();
+        return { guard: true, disarmed: true };
+      },
+    });
+    needsUpgrade = (results || []).some(result =>
+      result && result.result && result.result.guard && !result.result.disarmed);
+  } catch (_) { /* internal/restricted tab */ }
+  if (!needsUpgrade) return;
+  try {
+    // 旧 v1 没有 disarm()：注入 passive v2 会恢复它保存的原生引用。
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ['page_guard.js'],
+      world: 'MAIN',
+    });
+  } catch (_) { /* page became restricted */ }
+}
+
+async function disarmAllPageGuards() {
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({}); } catch (_) { return; }
+  await Promise.all(tabs
+    .filter(tab => Number.isInteger(tab.id) && !isInternalUrl(tab.url))
+    .map(tab => disarmPageGuard(tab.id)));
+}
+
+/**
+ * 登记一个命令租约。第一个租约注册 document_start guard，最后一个释放时
+ * 注销注册并恢复所有已打开页面的原生对话框 API。
+ */
+async function acquireCommandGuard() {
+  await (commandGuardLifecycle = commandGuardLifecycle.then(async () => {
+    commandGuardLeases += 1;
+    if (commandGuardLeases === 1) await registerCommandGuard();
+  }));
+}
+
+async function releaseCommandGuard() {
+  await (commandGuardLifecycle = commandGuardLifecycle.then(async () => {
+    if (commandGuardLeases <= 0) return;
+    commandGuardLeases -= 1;
+    if (commandGuardLeases !== 0) return;
+    await disarmAllPageGuards();
+    await unregisterCommandGuard();
+  }));
+}
+
+async function resetCommandGuardLifecycle() {
+  await (commandGuardLifecycle = commandGuardLifecycle.then(async () => {
+    if (commandGuardLeases === 0) {
+      await disarmAllPageGuards();
+      await unregisterCommandGuard();
+    }
+  }));
+}
+
+async function cleanupLegacyGuardOnce() {
+  try {
+    const stored = await chrome.storage.local.get(GUARD_PROTOCOL_KEY);
+    if (Number(stored && stored[GUARD_PROTOCOL_KEY]) >= GUARD_PROTOCOL_VERSION) return;
+    await resetCommandGuardLifecycle();
+    await chrome.storage.local.set({ [GUARD_PROTOCOL_KEY]: GUARD_PROTOCOL_VERSION });
+  } catch (_) { /* storage may be unavailable during startup */ }
+}
+
+async function guardTargetForTool(name, args) {
+  const guarded = new Set([
+    'act', 'wait', 'read', 'snapshot', 'js', 'observe', 'files', 'shot',
+  ]);
+  if (!guarded.has(name)) return;
+  if (name === 'files' && args.action === 'download-dir') return;
+  let tabId = args.tabId;
+  if (name === 'wait' && args.await === true && tabId === undefined) {
+    const context = await loadLastAct().catch(() => null);
+    tabId = context && (context.targetTabId || context.tabId);
+  }
+  if (tabId === undefined) {
+    try {
+      const tab = await activeTab();
+      tabId = tab.id;
+    } catch (_) {
+      return;
+    }
+  }
+  if (Number.isInteger(tabId)) await ensurePageGuard(tabId);
+}
+
+async function withCommandGuard(name, args, run) {
+  await acquireCommandGuard();
+  try {
+    await guardTargetForTool(name, args);
+    return await run();
+  } finally {
+    await releaseCommandGuard();
   }
 }
 
@@ -1110,7 +1257,7 @@ async function requireValidSelector(tabId, selector) {
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 17) {
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 18) {
     return { installed: false, handle: String(window.__ema2_doc_handle || '') };
   }
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
@@ -1391,6 +1538,9 @@ function installHelpers() {
         }
         const exact = candidates.find(el => nameOf(el).toLowerCase() === name);
         if (exact) return exact;
+        // role:name 同时接受 HTML name 属性；可访问名称精确匹配仍优先。
+        const named = candidates.find(el => String(el.getAttribute('name') || '').toLowerCase() === name);
+        if (named) return named;
         const partial = candidates.find(el => nameOf(el).toLowerCase().includes(name));
         if (partial) return partial;
       }
@@ -2153,7 +2303,7 @@ function installHelpers() {
     collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent,
     setValue, isActionableRole, absoluteHref,
   };
-  window.__ema2_helpers_version = 17;
+  window.__ema2_helpers_version = 18;
   return { installed: true };
 }
 
@@ -3993,7 +4143,7 @@ async function runStep(tab, step) {
 
 /** 在 MAIN world 里按 ref / selector / "role:name" 深度查找（含 shadow root / 同源 iframe）。 */
 function deepFindForDebugger(ref, selector, target) {
-  // helper 17 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
+  // helper 18 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
   const helpers = window.__ema2_helpers;
   if (helpers && typeof helpers.find === 'function') {
     const found = helpers.find(ref || null, selector || null, target || null);
@@ -4060,14 +4210,17 @@ function deepFindForDebugger(ref, selector, target) {
       const role = match[1].toLowerCase();
       const name = match[2].trim().toLowerCase();
       let partial = null;
+      let named = null;
       for (const root of roots) {
         for (const el of root.querySelectorAll(INTERACTIVE)) {
           if (roleOf(el).toLowerCase() !== role) continue;
           const current = nameOf(el).toLowerCase();
           if (current === name) return el;
+          if (!named && String(el.getAttribute('name') || '').toLowerCase() === name) named = el;
           if (!partial && current.includes(name)) partial = el;
         }
       }
+      if (named) return named;
       if (partial) return partial;
     }
   }
@@ -4703,6 +4856,12 @@ async function batchTool(args) {
   if (urls.length && tabIds.length) {
     fail('invalid_argument', 'batch takes either tabIds or urls, not both', 'use urls to open new tabs, or tabIds for tabs you already have');
   }
+  if (args.reuse !== undefined && args.reuse !== 'session') {
+    fail('invalid_argument', 'batch reuse must be session', 'use --reuse session with --urls');
+  }
+  if (args.reuse === 'session' && !urls.length) {
+    fail('invalid_argument', 'batch --reuse session only applies to --urls', 'use --tab-ids for existing tabs');
+  }
   const targets = urls.length ? urls : tabIds;
   if (!targets.length || targets.length > MAX_BATCH_TABS) {
     fail('invalid_argument', `batch needs 1..${MAX_BATCH_TABS} tabIds or urls`, 'fix tabIds/urls');
@@ -4747,6 +4906,28 @@ async function batchTool(args) {
     fail('invalid_argument', 'concurrency must be an integer between 1 and 4', 'fix concurrency');
   }
   const concurrency = requested;
+  const reusedByIndex = new Map();
+  if (args.reuse === 'session' && urls.length) {
+    await loadSessionTabs();
+    const liveTabs = await chrome.tabs.query({});
+    const liveById = new Map(liveTabs.map(tab => [tab.id, tab]));
+    const available = sessionTabs
+      .map(id => liveById.get(id))
+      .filter(Boolean);
+    const used = new Set();
+    const hrefOf = (value) => {
+      try { return new URL(value).href; } catch (_) { return String(value || ''); }
+    };
+    for (const [index, url] of urls.entries()) {
+      const wanted = hrefOf(url);
+      const match = available.find(tab => !used.has(tab.id)
+        && hrefOf(tab.url || tab.pendingUrl || '') === wanted);
+      if (match) {
+        used.add(match.id);
+        reusedByIndex.set(index, match.id);
+      }
+    }
+  }
   const results = new Array(targets.length);
   let cursor = 0;
   async function worker() {
@@ -4756,22 +4937,34 @@ async function batchTool(args) {
       if (urls.length) {
         const url = urls[index];
         try {
+          const reusedTabId = reusedByIndex.get(index);
           const openArgs = { ...inner, url };
-          const openedText = resultText(await executeTool('open', openArgs));
+          if (reusedTabId !== undefined) openArgs.tabId = reusedTabId;
+          let openedText;
+          try {
+            openedText = resultText(await executeTool('open', openArgs));
+          } catch (error) {
+            if (reusedTabId === undefined || !(error instanceof ToolError)
+                || error.code !== 'tab_not_found') throw error;
+            reusedByIndex.delete(index);
+            delete openArgs.tabId;
+            openedText = resultText(await executeTool('open', openArgs));
+          }
+          const reusedLine = reusedByIndex.has(index) ? `reused=1 tab=${reusedTabId}\n` : '';
           if (toolName === 'open') {
-            results[index] = `url=${url}\n` + openedText;
+            results[index] = `url=${url}\n${reusedLine}` + openedText;
           } else {
             const tabId = Number((/^id=(\d+)\s*$/m.exec(openedText) || [])[1]);
             if (!Number.isInteger(tabId)) {
               // open 的输出契约变了就别猜：明确失败，而不是把别的东西当 tabId。
-              results[index] = `url=${url}\n` + openedText
+              results[index] = `url=${url}\n${reusedLine}` + openedText
                 + '\nerror=internal msg=open did not report id= hint=retry with tool=open to inspect the tab';
             } else {
               const innerArgs = { ...inner, tabId };
               delete innerArgs.replace;
               delete innerArgs.reuse;
               const value = await executeTool(toolName, innerArgs);
-              results[index] = `url=${url}\ntab=${tabId}\n` + resultText(value);
+              results[index] = `url=${url}\n${reusedLine}tab=${tabId}\n` + resultText(value);
             }
           }
         } catch (error) {
@@ -5011,6 +5204,7 @@ async function observeTool(args) {
     const next = page.next == null ? data.seq : page.next;
     const dropped = Math.max(0, (data.firstSeq || 1) - (data.reset ? 0 : since) - 1);
     const parts = [page.items.map(item => item.line).join('\n')];
+    parts.push(`level=${args.level || 'error'}`);
     parts.push(footer(records.length, page.items.length, next));
     if (dropped > 0) parts.push(`dropped=${dropped}`);
     if (data.reset) parts.push('reset=1');
@@ -5265,21 +5459,23 @@ async function executeTool(name, args) {
       if (modes > 1) {
         fail('invalid_argument', 'use only one of tabId, replace:true, reuse:"session"', 'pick one navigation target');
       }
-      return openTool({ ...args, url });
+      const openArgs = { ...args, url };
+      return withCommandGuard('open', openArgs, () => openTool(openArgs));
     }
-    case 'read': return readTool(args);
-    case 'snapshot': return snapshotTool(args);
-    case 'act': return actTool(args);
-    case 'wait': return waitTool(args);
+    case 'read': return withCommandGuard('read', args, () => readTool(args));
+    case 'snapshot': return withCommandGuard('snapshot', args, () => snapshotTool(args));
+    case 'act': return withCommandGuard('act', args, () => actTool(args));
+    case 'wait': return withCommandGuard('wait', args, () => waitTool(args));
     case 'js': {
       const code = requireStringArg(args, 'code', 100000, false);
       if (!code) fail('missing_code', 'code is required', 'pass a JS expression');
-      return jsTool({ ...args, code });
+      const jsArgs = { ...args, code };
+      return withCommandGuard('js', jsArgs, () => jsTool(jsArgs));
     }
-    case 'observe': return observeTool(args);
-    case 'files': return filesTool(args);
-    case 'batch': return batchTool(args);
-    case 'shot': return shotTool(args);
+    case 'observe': return withCommandGuard('observe', args, () => observeTool(args));
+    case 'files': return withCommandGuard('files', args, () => filesTool(args));
+    case 'batch': return withCommandGuard('batch', args, () => batchTool(args));
+    case 'shot': return withCommandGuard('shot', args, () => shotTool(args));
     default: fail('unknown_tool', `unknown tool: ${name}`, 'use tabs|open|read|snapshot|act|wait|js|observe|files|shot|batch');
   }
 }
@@ -5311,10 +5507,16 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   webRequestLog.delete(tabId);
 });
 ensureWatchdog();
+// 动态 command guard 不应跨 service worker 重生长时间残留。
+unregisterCommandGuard();
+cleanupLegacyGuardOnce();
 connect();
 chrome.runtime.onStartup.addListener(() => { ensureWatchdog(); connect(); });
 chrome.runtime.onInstalled.addListener(() => {
   ensureWatchdog();
+  resetCommandGuardLifecycle()
+    .then(() => chrome.storage.local.set({ [GUARD_PROTOCOL_KEY]: GUARD_PROTOCOL_VERSION }))
+    .catch(() => {});
   migrateSettings().finally(() => connect());
 });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

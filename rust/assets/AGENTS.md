@@ -27,14 +27,14 @@ ema2 status      # relay=running / extension=connected
 | `ema2 open <url> [--replace\|--reuse session\|--tab ID] [--timeout N]` | 打开 URL，回 `status=` / `net_hook=` / `focused=` |
 | `ema2 read [--mode md\|text\|html\|visible] [--selector X] [--budget N] [--cursor N]` | 读页面正文 |
 | `ema2 snapshot [--filter ...] [--values]` | ref 快照 `[e12@d1] button "X"`；href 是完整 URL |
-| `ema2 act <action> ...` / `--steps` / `--script x.ema2` | click/type/fill/select/press/hover/scroll/submit/back/forward/reload |
+| `ema2 act <action> ... [--tab ID]` / `--steps` / `--script x.ema2` | 操作指定或当前标签；不在后台流程中强制 `tabs activate` |
 | `ema2 await 10s` | 等上一个 act 动作的导航/页面稳定 |
 | `ema2 wait <text\|textGone\|selector\|time\|idle> ...` | 等页面条件 |
 | `ema2 js '<code>' [--file f.js] [--timeout N]` | 页面主世界执行 JS（默认 10s 上限） |
-| `ema2 observe console\|network ... [--har x.har]` | console / network 增量 |
+| `ema2 observe console\|network ... [--har x.har]` | console / network 增量；console 默认 `--level error` |
 | `ema2 files upload <path...> --ref R` | 上传本地文件 |
 | `ema2 shot [--annotate] [--format png\|jpeg] [--out path]` | 截图落盘 |
-| `ema2 batch <open\|read\|snapshot\|js\|wait> --urls "u1,u2"` | 多标签并发 |
+| `ema2 batch <open\|read\|snapshot\|js\|wait> --urls "u1,u2"` | 多标签并发；默认新开，`--reuse session` 显式复用 |
 
 常用细节：
 
@@ -42,6 +42,7 @@ ema2 status      # relay=running / extension=connected
 - `ref` 形如 `e12@d1`；导航/刷新后旧完整 ref 报 `stale_ref`，重新 `snapshot`。
   手敲可用短 ref `e12`（当前文档）；要严格防止误点就用 snapshot 原样返回的完整 ref。
 - 单步写 `ema2 act fill <ref> "<text>"`；`type` 按当前 caret/selection 插入（选中会替换），`fill` 覆盖整个值；`select` 的位置参数是 option 的 `value`，`<select multiple>` 可用逗号分隔多个 value。
+- `--tab ID` 可用于单步、`--steps` 和 `--script`；`--target "role:name"` 也匹配精确 HTML `name` 属性（如 `searchbox:q`）。
 - `read` 默认清洁正文（跳过脚本/隐藏元素）；main 太短会回退 `main=body(fallback)` 并给 hint。
   `--mode md` 是有损渲染：标题/列表/表格/链接保留，样式与合并单元格会丢。
   `--mode visible` 用 `innerText` 读渲染文本（含导航壳），适合复杂 SPA；默认仍受 main/selector 约束。

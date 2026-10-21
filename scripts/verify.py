@@ -32,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -120,6 +121,7 @@ FIXTURE_BUGS = """<!doctype html>
 </head><body>
 <h1>Bug fixture</h1>
 <input id="a" value="abc"><input id="b">
+<input id="named-search" name="q" type="search" placeholder="global search">
 <input id="num" type="number" value="42">
 <select id="sel"><option value="v1">one</option><option value="v2" selected>two</option></select>
 <textarea id="area">secret</textarea>
@@ -136,7 +138,37 @@ FIXTURE_BUGS = """<!doctype html>
   <button id="req-submit" type="submit">submit required</button>
 </form>
 <div id="ov"></div>
+<script>
+setInterval(function () {
+  const guard = window.__ema2_guard;
+  const params = new URLSearchParams({
+    stage: 'runtime',
+    guard: guard ? '1' : '0',
+    armed: guard && guard.armed ? '1' : '0',
+    native: guard && guard.original && guard.original.alert === window.alert ? '1' : '0',
+    at: String(Date.now())
+  });
+  fetch('/guard-report?' + params.toString()).catch(function () {});
+}, 500);
+</script>
 </body></html>
+"""
+
+FIXTURE_IDLE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture idle</title></head>
+<body><h1>Idle</h1>
+<script>
+window.addEventListener('load', function () {
+  const guard = window.__ema2_guard;
+  const params = new URLSearchParams({
+    stage: 'idle',
+    guard: guard ? '1' : '0',
+    armed: guard && guard.armed ? '1' : '0',
+    at: String(Date.now())
+  });
+  fetch('/guard-report?' + params.toString()).catch(function () {});
+});
+</script></body></html>
 """
 
 
@@ -168,7 +200,15 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802 - http.server 约定
-        path = self.path.split("?")[0]
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        if path == "/guard-report":
+            query = urllib.parse.parse_qs(parsed.query)
+            reports = getattr(self.server, "guard_reports", None)
+            if reports is not None:
+                reports.append({key: values[-1] for key, values in query.items()})
+            self._send(b"ok", "text/plain; charset=utf-8")
+            return
         if path in ("/", "/index.html"):
             self._send(FIXTURE_HOME.encode())
         elif path == "/second.html":
@@ -187,6 +227,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._send(FIXTURE_BUGS.encode())
         elif path == "/visible.html":
             self._send(FIXTURE_VISIBLE.encode())
+        elif path == "/idle.html":
+            self._send(FIXTURE_IDLE.encode())
         elif path == "/slow":
             time.sleep(3)
             self._send(FIXTURE_HOME.encode())
@@ -273,7 +315,11 @@ def static_contract_check() -> bool:
     print("PASS  static: AGENTS.md is self-contained" if agents_ok else "FAIL  static: AGENTS.md points outside the package")
     if not agents_ok:
         print("      AGENTS.md must point to `ema2 act --help` and must not mention docs/TOOLS.md")
-    return not missing and agents_ok
+    manifest = json.loads((ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
+    idle_ok = "content_scripts" not in manifest and "COMMAND_GUARD_FILES" in js
+    print("PASS  static: page guard is command-scoped" if idle_ok
+          else "FAIL  static: manifest still injects page_guard globally")
+    return not missing and agents_ok and idle_ok
 
 
 def markdown_link_check() -> bool:
@@ -345,6 +391,7 @@ def main() -> int:
 
     fixture_port = free_port()
     server = ThreadingHTTPServer(("127.0.0.1", fixture_port), FixtureHandler)
+    server.guard_reports = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{fixture_port}"
     print(f"fixture: {base}")
@@ -356,6 +403,9 @@ def main() -> int:
     annotate_path = tmp / "annotate.png"
 
     try:
+        version = runner.run("--version")
+        runner.expect_ok("binary exposes product version", version, "2.4.1.1")
+
         opened = runner.expect_ok("open fixture", runner.run("open", f"{base}/"), "status=200", "net_hook=on", "title=ema2 fixture home")
         tab_match = re.search(r"^id=(\d+)", opened, re.M)
         runner.check("open returns tab id", tab_match is not None, opened)
@@ -409,6 +459,24 @@ def main() -> int:
             re.search(r"^tabs=\d+ active_tab=", status.stdout or "", re.M) is not None,
             (status.stdout or "") + (status.stderr or ""),
         )
+
+        # 普通浏览不注入 guard：tabs new 不是会等待页面的工具命令。
+        server.guard_reports.clear()
+        idle_tab = runner.run("tabs", "new", f"{base}/idle.html")
+        idle_match = re.search(r"^id=(\d+)", (idle_tab.stdout or ""), re.M)
+        idle_deadline = time.time() + 5
+        while time.time() < idle_deadline and not server.guard_reports:
+            time.sleep(0.1)
+        idle_report = server.guard_reports[-1] if server.guard_reports else {}
+        runner.check(
+            "idle browsing has no EMA2 page guard",
+            idle_tab.returncode == 0 and idle_report.get("guard") == "0",
+            f"tabs={idle_tab.stdout or ''}{idle_tab.stderr or ''} report={idle_report}",
+        )
+        if idle_match:
+            runner.run("tabs", "close", idle_match.group(1))
+        # 前面的链接点击已把最初标签导航到 second.html；显式恢复 fixture home。
+        runner.run("open", f"{base}/", "--replace")
 
         tab_page = runner.run("tabs", "list", "--budget", "200")
         tab_page_out = (tab_page.stdout or "") + (tab_page.stderr or "")
@@ -504,8 +572,25 @@ def main() -> int:
             "不能写 open/read/snapshot/wait/js/tabs" in help_act and "waitFor time 1s" in help_act,
             help_act[:1600],
         )
+        runner.check(
+            "act --help documents explicit tab targeting",
+            "ema2 act click e12 --tab 42" in help_act
+            and "ema2 act --script flow.ema2 --tab 42" in help_act,
+            help_act[:1800],
+        )
         runner.expect_ok("top-level help points to act help", runner.run("--help"), "ema2 act --help")
-        runner.expect_ok("read --help lists visible mode", runner.run("read", "--help"), "visible")
+        runner.expect_ok(
+            "read --help lists visible mode and budget defaults",
+            runner.run("read", "--help"), "visible", "默认 4000", "200..200000",
+        )
+        runner.expect_ok(
+            "observe --help exposes console default",
+            runner.run("observe", "--help"), "默认 error",
+        )
+        runner.expect_ok(
+            "batch --help exposes reuse session",
+            runner.run("batch", "--help"), "--reuse session",
+        )
 
         # SPA 链接只改 DOM 不导航：应 settle=done + nav=none，而不是 pending。
         runner.run("open", f"{base}/spa.html")
@@ -574,7 +659,11 @@ def main() -> int:
         runner.run("js", "console.error('verify-boom')")
         console = runner.run("observe", "console", "--level", "error")
         console_out = (console.stdout or "") + (console.stderr or "")
-        runner.check("observe console", "verify-boom" in console_out, console_out[:400])
+        runner.check(
+            "observe console",
+            "verify-boom" in console_out and "level=error" in console_out,
+            console_out[:400],
+        )
         console_next = re.search(r"^total=\d+ shown=\d+ next=(\d+|none)", console_out, re.M)
         runner.check("console observe reports next", console_next is not None, console_out[:400])
 
@@ -599,7 +688,17 @@ def main() -> int:
             shot.returncode == 0 and shot_path.exists() and shot_path.stat().st_size > 1000,
             (shot.stdout or "") + (shot.stderr or ""),
         )
+        normalized_path = tmp / "nested" / ".." / "normalized.png"
+        normalized_shot = runner.run("shot", "--out", str(normalized_path))
+        normalized_out = (normalized_shot.stdout or "") + (normalized_shot.stderr or "")
+        runner.check(
+            "shot --out normalizes . and .. without resolving symlinks",
+            normalized_shot.returncode == 0 and (tmp / "normalized.png").exists()
+            and "..\\" not in normalized_out and "../" not in normalized_out,
+            normalized_out,
+        )
 
+        time.sleep(1.2)
         annotate = runner.run("shot", "--annotate", "--out", str(annotate_path))
         annotate_out = (annotate.stdout or "") + (annotate.stderr or "")
         mark_refs = re.findall(r"^\[(e\d+@d\d+)\]", annotate_out, re.M)
@@ -632,6 +731,17 @@ def main() -> int:
             "batch reads both tabs",
             batch.returncode == 0 and batch.stdout.count("url=") >= 2 and "Second Page" in (batch.stdout or ""),
             (batch.stdout or "") + (batch.stderr or "")[-600:],
+        )
+        reused_batch = runner.run(
+            "batch", "read", "--urls", f"{base}/",
+            "--reuse", "session", "--concurrency", "1", timeout=120,
+        )
+        reused_out = (reused_batch.stdout or "") + (reused_batch.stderr or "")
+        runner.check(
+            "batch --reuse session reuses a session tab",
+            reused_batch.returncode == 0 and "reused=1" in reused_out
+            and "Fixture Home" in reused_out,
+            reused_out[-1000:],
         )
 
         # ---- read --mode visible ----
@@ -727,6 +837,16 @@ def main() -> int:
 
         runner.expect_ok("read textarea value", runner.run("read", "--selector", "#area", "--mode", "text"), "secret")
 
+        named_search = runner.run("act", "fill", "--target", "searchbox:q", "named-search-value")
+        named_search_out = (named_search.stdout or "") + (named_search.stderr or "")
+        named_search_state = runner.run("js", "return document.getElementById('named-search').value")
+        runner.check(
+            "role target falls back to HTML name",
+            named_search.returncode == 0 and "ok=fill" in named_search_out
+            and "named-search-value" in (named_search_state.stdout or ""),
+            named_search_out + (named_search_state.stdout or "") + (named_search_state.stderr or ""),
+        )
+
         alert = runner.run("act", "click", "--selector", "#alert")
         alert_out = (alert.stdout or "") + (alert.stderr or "")
         runner.check(
@@ -734,6 +854,15 @@ def main() -> int:
             alert.returncode == 0 and "dialog_opened=alert" in alert_out
             and alert_out.count("dialog_opened=") == 1,
             alert_out[:1200],
+        )
+        server.guard_reports.clear()
+        time.sleep(0.7)
+        disarm_report = server.guard_reports[-1] if server.guard_reports else {}
+        runner.check(
+            "guard is disarmed when act returns",
+            disarm_report.get("guard") == "1" and disarm_report.get("armed") == "0"
+            and disarm_report.get("native") == "1",
+            f"report={disarm_report}",
         )
         printing = runner.run("act", "click", "--selector", "#print")
         print_out = (printing.stdout or "") + (printing.stderr or "")
@@ -818,6 +947,49 @@ def main() -> int:
             runner.run("tabs", "close", new_match.group(1))
 
         if bug_tab:
+            # act --tab 必须操作非活动标签，而不是当前活动标签。
+            other_tab = runner.run("tabs", "new", f"{base}/second.html")
+            other_match = re.search(r"^id=(\d+)", other_tab.stdout or "", re.M)
+            current_before = runner.run("tabs", "current")
+            tab_act = runner.run(
+                "act", "fill", "--tab", bug_tab, "--selector", "#a", "background-tab-value"
+            )
+            current_after = runner.run("tabs", "current")
+            background_value = runner.run(
+                "js", "--tab", bug_tab, "return document.getElementById('a').value"
+            )
+            tab_act_out = (tab_act.stdout or "") + (tab_act.stderr or "")
+            active_before = re.search(r"^id=(\d+)", current_before.stdout or "", re.M)
+            active_after = re.search(r"^id=(\d+)", current_after.stdout or "", re.M)
+            runner.check(
+                "act --tab changes an inactive tab without activating it",
+                tab_act.returncode == 0 and "ok=fill" in tab_act_out
+                and "background-tab-value" in (background_value.stdout or "")
+                and active_before is not None and active_after is not None
+                and active_before.group(1) == active_after.group(1)
+                and active_after.group(1) != bug_tab,
+                tab_act_out + (background_value.stdout or "")
+                + (current_before.stdout or "") + (current_after.stdout or ""),
+            )
+            tab_script = tmp / "tab-target.ema2"
+            tab_script.write_text('fill selector="#b" "script-tab-value"\n', encoding="utf-8")
+            script_tab_act = runner.run(
+                "act", "--script", str(tab_script), "--tab", bug_tab
+            )
+            script_tab_value = runner.run(
+                "js", "--tab", bug_tab, "return document.getElementById('b').value"
+            )
+            runner.check(
+                "act --script accepts --tab",
+                script_tab_act.returncode == 0 and "ok=1/1" in (script_tab_act.stdout or "")
+                and "script-tab-value" in (script_tab_value.stdout or ""),
+                (script_tab_act.stdout or "") + (script_tab_act.stderr or "")
+                + (script_tab_value.stdout or "") + (script_tab_value.stderr or ""),
+            )
+            if other_match:
+                runner.run("tabs", "close", other_match.group(1))
+            runner.run("tabs", "activate", bug_tab)
+
             # 先切到一个新标签，确保 bug_tab 确实不是活动标签。
             runner.run("open", f"{base}/second.html")
             inactive_shot = tmp / "inactive-tab.png"

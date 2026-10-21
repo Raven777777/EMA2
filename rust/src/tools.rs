@@ -507,6 +507,10 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 .and_then(Value::as_str)
                 .expect("required above");
             let has_urls = urls_arg(object)?;
+            enum_arg(object, "reuse", &["session"], false)?;
+            if object.get("reuse").is_some_and(|value| !value.is_null()) && !has_urls {
+                return Err("reuse=session only applies to urls[]".into());
+            }
             let has_tabs = object
                 .get("tabIds")
                 .is_some_and(|v| !matches!(v, Value::Null));
@@ -1428,6 +1432,20 @@ mod tests {
                 &json!({
                     "tool": "open", "urls": ["https://a.example/"], "args": { "reuse": "session" }
                 })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({ "tool": "read", "urls": ["https://a.example/"], "reuse": "session" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({ "tool": "read", "tabIds": [1], "reuse": "session" })
             )
             .is_err()
         );

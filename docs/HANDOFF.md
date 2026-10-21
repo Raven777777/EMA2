@@ -5,9 +5,9 @@
 ## 当前版本
 
 ```text
-exe        2.4.1
-extension  2.4.1
-helper     17
+exe        2.4.1.1（Cargo crate metadata 仍为 SemVer 2.4.1）
+extension  2.4.1.1
+helper     18
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
@@ -48,7 +48,8 @@ AI / shell
 | `rust/src/client.rs` | 本机 HTTP 客户端 |
 | `rust/src/paths.rs` | 端口、PID/日志、输出目录 |
 | `extension/background.js` | 11 工具实现、ref、hook、webRequest 补全、settle/await、debugger 队列 |
-| `extension/page_guard.js` | MAIN world document_start：非阻塞记录 alert/confirm/prompt/print 与 window.open |
+| `extension/page_guard.js` | 命令租约内非阻塞记录 alert/confirm/prompt/print/window.open；解除后恢复原生 API |
+| `extension/page_guard_armed.js` | document_start 动态 guard 的立即 arm 入口 |
 | `extension/popup.*` | 端口配置与连接状态 |
 | `docs/TOOLS.md` | 命令参考、输出协议、错误码（唯一错误码表） |
 | `docs/TESTING.md` | 真机、前台、可见的验收规定与清单（禁止 Node 测试） |
@@ -96,7 +97,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前 Rust 测试：**71 passed**。
+当前 Rust 测试：**74 passed**。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -128,6 +129,7 @@ cargo test
 - 显式 await 超时返回 `wait_timeout`，退出 4
 - 动作打开新标签：`new_tab=` + opener 明确时自动登记 session（noopener 只用于定位）
 - `.ema2` / `--steps` 里 `await 10s` 是脚本步骤；pending 且下一步不是 await 时脚本停止
+- `act` 单步、`--steps`、`--script` 都支持 `--tab ID`；不要求目标 tab 活动
 - `open` 和新的 act 会清掉旧 lastAct 上下文
 - `open --timeout` 超时返回 `load=pending`，中继预算跟随 `waitTimeout`
 - 脚本里的 `waitFor` 是独立步骤，在原行执行；失败时保留已完成步骤
@@ -149,11 +151,14 @@ cargo test
 - `type` 在 caret/selection 处插入，`fill` 覆盖；控件会清洗值时（number/date/range）返回 `value_rejected` 并恢复原值
 - `act scroll down|up N` 按方向与屏数滚动
 - 上传原始载荷 ≤5 MiB；daemon body / axum 提取器 / 扩展入站上限都已对齐
+- `role:name` 先匹配可访问名称，再精确匹配 HTML `name` 属性
 - `select` 的位置参数是 option 的 `value`
 - `files download-dir` 固定返回 `download_dir_unsupported`
 - `batch` 内层参数放在 `args`；内层校验复用子工具 validator
+- `batch --urls --reuse session` 只复用精确 URL 命中的会话标签；默认仍新开
 - `js` 全局 debugger 串行；attach 非超时失败自动重试一次；运行时 SyntaxError 不重跑
 - `observe console --wait` 先装 hook 再等待；console/network 的 document epoch 分开记录
+- `observe console --level` 默认 `error`，输出显式带 `level=<阈值>`
 - HAR 导出是完整 JSON，不经过 20 万字符文本上限
 - 扩展返回 JSON-RPC error 时 daemon 返回 `extension_error`，不能变成空成功
 - `server` 重复启动输出 `relay=already_running`，退出 0
@@ -210,7 +215,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 ## 开发陷阱
 
 1. **修改页面 helper 必须提升 `__ema2_helpers_version`**
-   当前是 17；否则已打开页面继续用旧 helper。
+   当前是 18；否则已打开页面继续用旧 helper。
 
 2. **Edge 会按 manifest 版本缓存扩展脚本**
    行为没更新时提升 `extension/manifest.json` 版本，或在 `edge://extensions` 重新加载；
@@ -234,13 +239,18 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 8. **真实站点有反自动化**
    携程结果页、去哪儿首页可能不渲染；换站点或外部脚本，不要为单站加适配器。
 
+9. **page guard 只能存在于命令租约内**
+   不要在 manifest 恢复静态 `content_scripts`；否则普通浏览的弹窗会再次被拦截。
+   页面 helper 默认 disarmed，最后一个命令结束时必须注销动态注册并广播 `disarm()`。
+   修改 guard 清理协议时提升 `ema2_guard_protocol`。
+
 ## 下一位维护者的第一步
 
 1. 读 [PHILOSOPHY.md](PHILOSOPHY.md)
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
 4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
-5. `python scripts/verify.py` —— 102 项真机检查，跑不过就别改行为
+5. `python scripts/verify.py` —— 113 项真机检查，跑不过就别改行为
 6. 打开一个真实网站，跑 `open → snapshot → act → read`
 7. 修改行为前先问：这是通用原语，还是网站特例？
 8. 任何动作相关改动，必须真机验证“成功就是真的成功”
