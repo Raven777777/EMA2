@@ -5,9 +5,9 @@
 ## 当前版本
 
 ```text
-exe        2.2.2
-extension  2.2.2
-helper     12
+exe        2.3.0
+extension  2.3.0
+helper     13
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
@@ -44,7 +44,8 @@ AI / shell
 | `rust/src/save.rs` | 截图/HAR 落盘 |
 | `rust/src/client.rs` | 本机 HTTP 客户端 |
 | `rust/src/paths.rs` | 端口、PID/日志、输出目录 |
-| `extension/background.js` | 11 工具实现、ref、hook、settle/await、debugger 队列 |
+| `extension/background.js` | 11 工具实现、ref、hook、webRequest 补全、settle/await、debugger 队列 |
+| `extension/page_guard.js` | MAIN world document_start：非阻塞记录 alert/confirm/prompt/print 与 window.open |
 | `extension/popup.*` | 端口配置与连接状态 |
 | `docs/TOOLS.md` | 命令参考、输出协议、错误码（唯一错误码表） |
 | `docs/TESTING.md` | 真机、前台、可见的验收规定与清单（禁止 Node 测试） |
@@ -140,7 +141,7 @@ cargo test
 
 ### 其他
 
-- `type` 追加，`fill` 覆盖；控件会清洗值时（number/date/range）返回 `value_rejected`
+- `type` 在 caret/selection 处插入，`fill` 覆盖；控件会清洗值时（number/date/range）返回 `value_rejected` 并恢复原值
 - `act scroll down|up N` 按方向与屏数滚动
 - 上传原始载荷 ≤5 MiB；daemon body / axum 提取器 / 扩展入站上限都已对齐
 - `select` 的位置参数是 option 的 `value`
@@ -204,7 +205,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 ## 开发陷阱
 
 1. **修改页面 helper 必须提升 `__ema2_helpers_version`**
-   当前是 11；否则已打开页面继续用旧 helper。
+   当前是 13；否则已打开页面继续用旧 helper。
 
 2. **Edge 会按 manifest 版本缓存扩展脚本**
    行为没更新时提升 `extension/manifest.json` 版本，或在 `edge://extensions` 重新加载；
@@ -234,7 +235,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
 4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
-5. `python scripts/verify.py` —— 59 项真机检查，跑不过就别改行为
+5. `python scripts/verify.py` —— 83 项真机检查，跑不过就别改行为
 6. 打开一个真实网站，跑 `open → snapshot → act → read`
 7. 修改行为前先问：这是通用原语，还是网站特例？
 8. 任何动作相关改动，必须真机验证“成功就是真的成功”

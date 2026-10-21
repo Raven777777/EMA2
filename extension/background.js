@@ -25,6 +25,11 @@ const WAIT_TIMEOUT_MS = 30000;
 const WAIT_MAX_SECONDS = 300;
 const DEBUGGER_TASK_TIMEOUT_MS = 60000;
 const DEBUGGER_QUEUE_TIMEOUT_MS = 600000;
+// js 默认只跑 10s：无限循环必须尽快 terminateExecution，否则同一 tab 的
+// executeScript / 下一次 js 都会一起挂住。--timeout 可以显式放宽。
+const JS_DEFAULT_TIMEOUT_MS = 10000;
+const JS_MAX_TIMEOUT_MS = 300000;
+const TOOL_WATCHDOG_MS = 70000;
 const NET_PREVIEW_BYTES = 8192;
 const NET_PREVIEW_CHARS = 800;
 const NET_PREVIEW_TIMEOUT_MS = 1500;
@@ -277,9 +282,20 @@ async function handleRelayMessage(data, ws) {
       return;
     }
     const params = req.params && typeof req.params === 'object' ? req.params : {};
+    const toolArgs = normalizeArgs(params.arguments);
     let result;
     try {
-      result = toResult(await withKeepAlive(() => executeTool(params.name, normalizeArgs(params.arguments))));
+      // 所有 RPC 都有硬上限：即使某个 chrome.* 调用永远不返回，也必须把错误
+      // 交回 CLI，而不是让 CLI/daemon 一起悬在那里。真正的执行仍可能继续，
+      // 但页面侧的 alert/print 已被 page_guard.js 变成非阻塞记录。
+      const watchdog = toolWatchdogMs(params.name, toolArgs);
+      result = toResult(await withDeadline(
+        withKeepAlive(() => executeTool(params.name, toolArgs)),
+        watchdog,
+        'tool_timeout',
+        `${params.name} did not return within ${Math.round(watchdog / 1000)}s`,
+        'the tab may still be busy; inspect with `ema2 status`, close an open dialog, or reload the tab',
+      ));
     } catch (error) {
       result = { content: [{ type: 'text', text: formatError(error) }], isError: true };
     }
@@ -369,9 +385,20 @@ function normalizeCursor(value) {
 /** 按字符预算切片，返回 {text,total,next}。 */
 function sliceText(text, budget, cursor) {
   const total = text.length;
-  if (cursor >= total) return { text: '', total, next: null };
-  const end = Math.min(total, cursor + budget);
-  return { text: text.slice(cursor, end), total, next: end < total ? end : null };
+  let start = Math.min(Math.max(0, cursor), total);
+  // 游标落在低位代理上时向前挪一格，避免返回半个 emoji/汉字扩展字符。
+  if (start > 0 && start < total) {
+    const code = text.charCodeAt(start);
+    if (code >= 0xDC00 && code <= 0xDFFF) start -= 1;
+  }
+  if (start >= total) return { text: '', total, next: null };
+  let end = Math.min(total, start + budget);
+  if (end < total) {
+    const code = text.charCodeAt(end - 1);
+    if (code >= 0xD800 && code <= 0xDBFF) end -= 1;
+  }
+  if (end <= start) end = Math.min(total, start + 1);
+  return { text: text.slice(start, end), total, next: end < total ? end : null };
 }
 
 function footer(total, shown, next) {
@@ -455,6 +482,7 @@ async function closeTabIds(ids) {
       await chrome.tabs.remove(id);
       observedConsoleDocs.delete(id);
       observedNetworkDocs.delete(id);
+      webRequestLog.delete(id);
       closed.push(id);
     } catch (_) { /* 已经不存在：跳过，不算失败 */ }
   }
@@ -462,6 +490,119 @@ async function closeTabIds(ids) {
   sessionTabs = sessionTabs.filter(id => !closed.includes(id));
   await persistSessionTabs();
   return closed;
+}
+
+// ---------------------------------------------------------------- webRequest
+//
+// 页面 hook 只能看到安装之后的 fetch/XHR；首屏文档/资源的状态码、响应头只能靠
+// webRequest。这里按 tab 保存最近 500 条，observe network 用它补齐 status/headers/MIME，
+// 并把 HAR 的 request.url/时间戳/headers 变成真实值。响应体仍由页面 hook 采样。
+const WEBREQ_PER_TAB = 500;
+const webRequestLog = new Map(); // tabId -> Map<requestId, record>
+
+function webRequestBucket(tabId, create) {
+  let bucket = webRequestLog.get(tabId);
+  if (!bucket && create) {
+    bucket = new Map();
+    webRequestLog.set(tabId, bucket);
+  }
+  return bucket || null;
+}
+
+function webRequestAdd(details) {
+  if (!details || !Number.isInteger(details.tabId) || details.tabId < 0) return;
+  const bucket = webRequestBucket(details.tabId, true);
+  bucket.set(details.requestId, {
+    requestId: details.requestId,
+    url: String(details.url || ''),
+    method: String(details.method || 'GET').toUpperCase(),
+    type: String(details.type || ''),
+    startedAt: Math.round(Number(details.timeStamp) || Date.now()),
+    status: -1,
+    timeMs: 0,
+    requestHeaders: [],
+    responseHeaders: [],
+    mimeType: '',
+    fromCache: false,
+    error: '',
+  });
+  if (bucket.size > WEBREQ_PER_TAB) {
+    const overflow = bucket.size - WEBREQ_PER_TAB;
+    let index = 0;
+    for (const key of bucket.keys()) {
+      if (index++ >= overflow) break;
+      bucket.delete(key);
+    }
+  }
+}
+
+function webRequestPatch(details, patch) {
+  if (!details || !Number.isInteger(details.tabId) || details.tabId < 0) return;
+  const bucket = webRequestBucket(details.tabId, true);
+  const record = bucket.get(details.requestId);
+  if (!record) return;
+  Object.assign(record, patch || {});
+}
+
+function headerMime(headers) {
+  if (!Array.isArray(headers)) return '';
+  const header = headers.find(item => String(item.name || '').toLowerCase() === 'content-type');
+  return header ? String(header.value || '').split(';')[0].trim().toLowerCase() : '';
+}
+
+function getWebRequests(tabId) {
+  const bucket = webRequestBucket(tabId, false);
+  if (!bucket) return [];
+  return [...bucket.values()].sort((left, right) => left.startedAt - right.startedAt);
+}
+
+function registerWebRequestListeners() {
+  try {
+    const api = chrome.webRequest;
+    if (!api || !api.onBeforeRequest) return;
+    api.onBeforeRequest.addListener(
+      details => webRequestAdd(details),
+      { urls: ['<all_urls>'] },
+    );
+    api.onBeforeSendHeaders.addListener(
+      details => webRequestPatch(details, {
+        requestHeaders: Array.isArray(details.requestHeaders) ? details.requestHeaders : [],
+      }),
+      { urls: ['<all_urls>'] },
+      ['requestHeaders', 'extraHeaders'],
+    );
+    api.onHeadersReceived.addListener(
+      details => webRequestPatch(details, {
+        status: Number(details.statusCode) || 0,
+        responseHeaders: Array.isArray(details.responseHeaders) ? details.responseHeaders : [],
+        mimeType: headerMime(details.responseHeaders),
+        fromCache: !!details.fromCache,
+      }),
+      { urls: ['<all_urls>'] },
+      ['responseHeaders', 'extraHeaders'],
+    );
+    api.onCompleted.addListener(
+      details => webRequestPatch(details, {
+        status: Number(details.statusCode) || 0,
+        fromCache: !!details.fromCache,
+        ip: String(details.ip || ''),
+        timeMs: Math.max(0, Math.round((Number(details.timeStamp) || Date.now())
+          - (webRequestBucket(details.tabId, false)?.get(details.requestId)?.startedAt || Date.now()))),
+      }),
+      { urls: ['<all_urls>'] },
+    );
+    api.onErrorOccurred.addListener(
+      details => webRequestPatch(details, {
+        status: 0,
+        error: String(details.error || ''),
+        timeMs: Math.max(0, Math.round((Number(details.timeStamp) || Date.now())
+          - (webRequestBucket(details.tabId, false)?.get(details.requestId)?.startedAt || Date.now()))),
+      }),
+      { urls: ['<all_urls>'] },
+    );
+  } catch (error) {
+    console.warn('[EMA2] webRequest listeners unavailable:', error && error.message || error);
+  }
 }
 
 function isInternalUrl(url) {
@@ -626,43 +767,100 @@ async function openTool(args) {
   }
   let loaded = true;
   let docTimeout = 0;
+  // --timeout 覆盖“打开标签 + 等文档 + 装 hook + 读 timing/focus”全流程。
+  // 只给 waitForDocument 设 deadline 会让后面的 hook/timing/focus 再各花几秒，
+  // 慢页面/挂起页面因此把 3s 拉成 15s。
+  const openBudget = wait === 'none' ? 5000 : Math.min(60000, Math.max(1000, Number(args.waitTimeout || 15) * 1000));
+  if (wait !== 'none') docTimeout = openBudget;
+  const deadline = Date.now() + openBudget;
+  const remaining = () => Math.max(0, deadline - Date.now());
   if (wait !== 'none') {
-    docTimeout = Math.min(60000, Math.max(1000, Number(args.waitTimeout || 15) * 1000));
-    // executeScript 在导航中的标签页上可能长时间不返回；waitForDocument 内部有
-    // deadline，但单个探测也要能被外层硬截止打断，否则 --timeout 形同虚设。
+    // 单个 executeScript 也可能卡住；外层硬截止保证 open 一定按 budget 返回。
     loaded = await within(
       waitForDocument(
         tab.id, args.url, previousUrl,
         wait === 'load' ? 'complete' : 'interactive', docTimeout, previousMarker,
       ),
-      docTimeout + 1000,
+      docTimeout + 250,
       false,
     );
+    // 超时后再做一次单步探测：页面可能刚好在 deadline 后完成，
+    // 不要把已经加载好的页面误报成 load=pending。
+    if (!loaded) {
+      loaded = await within(
+        waitForDocument(
+          tab.id, args.url, previousUrl,
+          wait === 'load' ? 'complete' : 'interactive', 1, previousMarker,
+        ),
+        Math.min(1000, remaining() + 400),
+        false,
+      );
+    }
   }
   let current;
   try { current = await chrome.tabs.get(tab.id); }
   catch (_) { fail('tab_not_found', `tab ${tab.id} was closed during open`, 'call tabs to list ids'); }
   // 等页面稳定后自动装网络 hook，这样后续 fetch/XHR 都能被 observe network 看到。
-  await sleep(250);
+  if (remaining() > 0) await sleep(Math.min(180, remaining()));
   let hook = false;
-  try { hook = await within(ensureNetworkHook(tab.id), 3000, false); } catch (_) { hook = false; }
-  try { await within(ensureConsoleHook(tab.id), 3000, false); } catch (_) { /* ignore */ }
-  const timing = wait === 'none' ? null : await within(navigationTiming(tab.id), 2500, null);
-  const status = !timing ? 'pending' : timing.status > 0 ? String(timing.status) : 'unknown';
+  try {
+    hook = remaining() > 0
+      ? await within(ensureNetworkHook(tab.id), Math.min(2500, remaining()), false)
+      : false;
+  } catch (_) { hook = false; }
+  try {
+    if (remaining() > 0) await within(ensureConsoleHook(tab.id), Math.min(1500, remaining()), false);
+  } catch (_) { /* ignore */ }
+  try {
+    if (remaining() > 0) await within(ensurePageGuard(tab.id), Math.min(1000, remaining()), false);
+  } catch (_) { /* ignore */ }
+  const timing = wait === 'none' || remaining() <= 0
+    ? null
+    : await within(navigationTiming(tab.id), Math.min(1500, remaining()), null);
+  const status = !timing ? (wait === 'none' ? 'pending' : loaded ? 'unknown' : 'pending')
+    : timing.status > 0 ? String(timing.status) : 'unknown';
+  // hook/timing 期间可能又发生重定向；用最新 tab 元数据，而不是早先的快照。
+  let latest = current;
+  try { latest = await chrome.tabs.get(tab.id); } catch (_) { /* keep current */ }
+  // 导航尚未提交时 tab.url/title 仍是旧文档；不要把旧标题当成新页面。
+  const pendingNav = !loaded && !samePageTarget(latest.url || '', args.url);
+  const shownUrl = pendingNav ? (latest.pendingUrl || args.url) : (latest.url || args.url);
+  const shownTitle = pendingNav ? '' : (latest.title || '');
+  const shownStatus = pendingNav ? 'pending' : status;
   const lines = [
-    `id=${current.id}`,
-    `url=${current.url || args.url}`,
-    `title=${oneLine(current.title || '')}`,
-    `status=${status}`,
+    `id=${latest.id}`,
+    `url=${shownUrl}`,
+    `title=${oneLine(shownTitle)}`,
+    `status=${shownStatus}`,
     `reuse=${reuse}`,
     `net_hook=${hook ? 'on' : 'off'}`,
   ];
   if (!loaded) {
-    lines.push(`load=pending timeout=${Math.round(docTimeout / 1000)}s`);
-    lines.push('hint=the document did not reach the requested readyState in time; it may still be loading (try `wait idle` or read again)');
+    lines.push(`load=pending timeout=${Math.round(docTimeout / 1000)}s timed_out=1`);
+    lines.push('hint=the document did not reach the requested readyState before --timeout; the tab is open, read/snapshot may still work (try `ema2 wait idle`)');
   }
   if (timing && timing.redirects > 0) lines.push(`redirects=${timing.redirects}`);
-  const focused = await within(runInTab(tab.id, () => document.hasFocus(), []), 2000, false);
+  const guardEvents = (!loaded || pendingNav)
+    ? []
+    : await within(
+      guardSince(tab.id, 0),
+      Math.min(800, Math.max(1, remaining())),
+      [],
+    );
+  const guardDialogs = (Array.isArray(guardEvents) ? guardEvents : [])
+    .filter(event => event.kind === 'dialog');
+  for (const event of guardDialogs.slice(0, 3)) {
+    lines.push(`dialog_opened=${event.dialog || 'dialog'} handled=${event.handled || 'dismissed'}`
+      + (event.message ? ` msg=${oneLine(event.message).slice(0, 120)}` : ''));
+  }
+  const blockedPopups = (Array.isArray(guardEvents) ? guardEvents : [])
+    .filter(event => event.kind === 'popup' && event.blocked);
+  if (blockedPopups.length) lines.push(`popup_blocked=1 url=${shortText(blockedPopups[0].url || '', 120)}`);
+  const focused = await within(
+    runInTab(tab.id, () => document.hasFocus(), []),
+    Math.min(1200, Math.max(1, remaining())),
+    false,
+  );
   lines.push(`focused=${focused ? 1 : 0}`);
   if (!focused) {
     lines.push('hint=the browser window is not focused; call `ema2 tabs activate ' + tab.id
@@ -805,7 +1003,11 @@ async function waitTool(args) {
     if (!ready) fail('wait_timeout', `page did not become idle in ${timeoutMs / 1000}s`, 'retry, or wait for a specific selector/text');
     return `ok=idle elapsed=${((Date.now() - start) / 1000).toFixed(1)}s`;
   }
-  if (args.selector !== undefined) await ensureHelpers(tab.id);
+  if (args.selector !== undefined) {
+    await ensureHelpers(tab.id);
+    // 非法 CSS 应立即返回 invalid_selector，而不是等到 timeout 后报 wait_timeout。
+    await requireValidSelector(tab.id, args.selector);
+  }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     let matched = false;
@@ -849,15 +1051,70 @@ async function runInTab(tabId, func, args, world, attempts = 2) {
   throw lastError;
 }
 
+/** 在主世界安装 page_guard.js；失败只意味着该页面不能脚本化，不让调用方崩溃。 */
+async function ensurePageGuard(tabId) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['page_guard.js'], world: 'MAIN' });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** 当前 guard 事件水位；用于区分“本次动作打开的对话框/弹窗”。 */
+async function guardMark(tabId) {
+  try {
+    return await runInTab(tabId, () => (window.__ema2_guard ? window.__ema2_guard.seq || 0 : 0), [], 'MAIN');
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function guardSince(tabId, seq) {
+  try {
+    const events = await runInTab(tabId, (since) => {
+      const guard = window.__ema2_guard;
+      if (!guard) return [];
+      return (guard.events || []).filter(event => (event.seq || 0) > since);
+    }, [Number(seq) || 0], 'MAIN');
+    return Array.isArray(events) ? events : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+/** 返回空字符串表示 selector 语法合法；否则返回浏览器给出的 SyntaxError。 */
+async function selectorError(tabId, selector) {
+  if (!selector) return '';
+  try {
+    return await runInTab(tabId, (value) => {
+      try {
+        document.documentElement.matches(value);
+        return '';
+      } catch (error) {
+        return String((error && error.message) || error);
+      }
+    }, [String(selector)], undefined, 1) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function requireValidSelector(tabId, selector) {
+  const error = await selectorError(tabId, selector);
+  if (error) {
+    fail('invalid_selector', `invalid CSS selector: ${selector} (${oneLine(error)})`,
+      'fix the selector syntax, or use a snapshot ref/target instead');
+  }
+}
+
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 12) {
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 13) {
     return { installed: false, handle: String(window.__ema2_doc_handle || '') };
   }
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
-  const shortUrl = (url) => {
-    try { const u = new URL(url); return (u.pathname + u.search).slice(0, 80); } catch (_) { return String(url).slice(0, 80); }
-  };
+
   const roleOf = (el) => {
     const role = el.getAttribute('role'); if (role) return role;
     const tag = el.tagName.toLowerCase();
@@ -918,27 +1175,78 @@ function installHelpers() {
       || safeValue
       || (userValueControl ? '' : el.innerText)
       || '';
-    return clean(text).slice(0, 60);
+    const clipped = clean(text);
+    return clipped.length > 80 ? clipped.slice(0, 79) + '…' : clipped;
+  };
+  const clip = (value, max) => {
+    const text = clean(value);
+    return text.length > max ? text.slice(0, max - 1) + '…' : text;
+  };
+  const absoluteHref = (el) => {
+    const raw = el.getAttribute('href') || '';
+    const base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
+    try { return new URL(raw, base).href; } catch (_) { return raw; }
   };
   const extraOf = (el) => {
     const parts = [];
-    if (el.tagName === 'A' && el.getAttribute('href')) parts.push('href=' + shortUrl(el.href));
+    // 表单当前值默认不输出（密码/textarea/富文本可能含敏感输入）；
+    // 显式 snapshot --values 时才附加。read --selector 仍可直接读单个控件。
+    const showValues = () => !!window.__ema2_show_values;
+    // href 必须是完整绝对 URL：scheme/host/query/fragment 都是定位信息，
+    // 截断成 path 会让 AI 跳到同源错误地址或分不清 mailto/tel。
+    if (el.tagName === 'A' && el.getAttribute('href')) {
+      parts.push('href=' + absoluteHref(el));
+      if (el.hasAttribute('download')) parts.push('download');
+    }
     if (el.tagName === 'INPUT') {
       const t = (el.type || 'text').toLowerCase();
       if (t !== 'text') parts.push('type=' + t);
-      if (el.name) parts.push('name=' + clean(el.name).slice(0, 24));
+      if (el.name) parts.push('name=' + clip(el.name, 24));
       if (el.checked) parts.push('checked');
-      if (t === 'file') parts.push('accept=' + clean(el.getAttribute('accept') || '*').slice(0, 30));
+      if (t === 'file') {
+        parts.push('accept=' + clip(el.getAttribute('accept') || '*', 30));
+        const names = el.files ? [...el.files].map(file => file.name).slice(0, 5) : [];
+        if (names.length) parts.push('files=' + clip(names.join(','), 100));
+      } else if (t === 'password') {
+        // 密码值永远不进入快照，只确认“已填写”。
+        if (showValues() && el.value) parts.push('value=<hidden>');
+      } else if (showValues()
+          && !['checkbox', 'radio', 'hidden', 'submit', 'reset', 'button', 'image'].includes(t)
+          && el.value) {
+        parts.push('value=' + clip(el.value, 80));
+      }
     }
-    if (el.tagName === 'TEXTAREA' && el.name) parts.push('name=' + clean(el.name).slice(0, 24));
+    if (el.tagName === 'TEXTAREA') {
+      if (el.name) parts.push('name=' + clip(el.name, 24));
+      if (showValues() && el.value) parts.push('value=' + clip(el.value, 80));
+    }
+    if (el.tagName === 'SELECT') {
+      if (el.name) parts.push('name=' + clip(el.name, 24));
+      if (el.multiple) parts.push('multiple');
+      const selected = [...el.options].filter(option => option.selected).map(option => option.value);
+      if (showValues() && selected.length) parts.push('value=' + clip(selected.join(','), 100));
+    }
+    // contenteditable 的当前文本只作为 extra 展示，不参与 nameOf，避免把用户输入当成标签。
+    if (showValues() && el.isContentEditable && el.textContent) parts.push('value=' + clip(el.textContent, 80));
     if (el.disabled) parts.push('disabled');
+    if (el.getAttribute('aria-expanded')) parts.push('expanded=' + el.getAttribute('aria-expanded'));
     return parts.join(' ');
   };
   const visible = (el) => {
-    if (!el.getClientRects().length) return false;
-    const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(el);
-    return style.visibility !== 'hidden' && style.display !== 'none';
+    if (!el || el.hidden) return false;
+    try {
+      if (typeof el.checkVisibility === 'function') {
+        if (!el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true })) return false;
+      } else {
+        if (!el.getClientRects().length) return false;
+        const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+        const style = view.getComputedStyle(el);
+        if (style.visibility === 'hidden' || style.display === 'none') return false;
+      }
+    } catch (_) {
+      if (!el.getClientRects().length) return false;
+    }
+    return true;
   };
   const INTERACTIVE = 'a[href],button,input,textarea,select,summary,[role],[contenteditable=""],[contenteditable="true"],[tabindex],[onclick]';
 
@@ -946,20 +1254,24 @@ function installHelpers() {
     const roots = [];
     let frameSeq = 0;
     const seen = new Set();
-    const visit = (root, frame) => {
+    const visit = (root, frame, frameEl, win) => {
       if (!root || seen.has(root)) return;
       seen.add(root);
-      roots.push({ root, frame });
+      const owner = win || (root.ownerDocument && root.ownerDocument.defaultView) || window;
+      roots.push({ root, frame, frameEl: frameEl || null, win: owner });
       for (const el of root.querySelectorAll('*')) {
-        if (el.shadowRoot) visit(el.shadowRoot, frame);
+        if (el.shadowRoot) visit(el.shadowRoot, frame, frameEl, owner);
       }
-      for (const frameEl of root.querySelectorAll('iframe,frame')) {
+      for (const frameNode of root.querySelectorAll('iframe,frame')) {
         let doc = null;
-        try { doc = frameEl.contentDocument; } catch (_) { /* cross-origin */ }
-        if (doc) visit(doc, frame ? frame + '.f' + (++frameSeq) : 'f' + (++frameSeq));
+        try { doc = frameNode.contentDocument; } catch (_) { /* cross-origin */ }
+        if (doc) {
+          visit(doc, frame ? frame + '.f' + (++frameSeq) : 'f' + (++frameSeq),
+            frameNode, doc.defaultView || owner);
+        }
       }
     };
-    visit(document, '');
+    visit(document, '', null, window);
     return roots;
   };
 
@@ -978,22 +1290,63 @@ function installHelpers() {
     return !!parsed && !!docEpoch() && (!parsed.epoch || parsed.epoch === docEpoch());
   };
 
-  const refOf = (el) => {
-    const existing = el.getAttribute('data-ema2-ref');
-    if (refIsCurrent(existing)) {
-      const parsed = parseRef(existing);
-      // snapshot 永远输出完整 ref；页面上遗留的短 ref 补上当前文档句柄。
-      if (parsed && !parsed.epoch) {
-        const full = 'e' + parsed.seq + '@' + docEpoch();
-        el.setAttribute('data-ema2-ref', full);
-        return full;
+  // ref 只存在页面内存：不再写 data-ema2-ref，避免触发 MutationObserver /
+  // 框架 hydration / CSS [data-*] 选择器。WeakRef 让长页面反复 snapshot 也不会
+  // 把已移除的节点永久留在表里。
+  const refs = window.__ema2_refs instanceof Map ? window.__ema2_refs : new Map();
+  window.__ema2_refs = refs;
+  const elRefs = window.__ema2_el_refs instanceof WeakMap ? window.__ema2_el_refs : new WeakMap();
+  window.__ema2_el_refs = elRefs;
+  const deref = (entry) => {
+    if (typeof WeakRef === 'function' && entry instanceof WeakRef) return entry.deref();
+    return entry;
+  };
+  const refElement = (ref) => {
+    const entry = refs.get(ref);
+    if (!entry) return null;
+    const el = deref(entry);
+    if (!el || !el.isConnected) {
+      refs.delete(ref);
+      return null;
+    }
+    return el;
+  };
+  const setRef = (el, ref) => {
+    refs.set(ref, typeof WeakRef === 'function' ? new WeakRef(el) : el);
+    elRefs.set(el, ref);
+    if (el.getAttribute && el.getAttribute('data-ema2-ref')) el.removeAttribute('data-ema2-ref');
+  };
+  const refEntries = (since) => {
+    const floor = Number.isFinite(Number(since)) ? Number(since) : -1;
+    const out = [];
+    for (const [ref, entry] of refs) {
+      const parsed = parseRef(ref);
+      if (!parsed || parsed.seq <= floor) continue;
+      const el = deref(entry);
+      if (!el || !el.isConnected) {
+        refs.delete(ref);
+        continue;
       }
-      return existing;
+      out.push({ ref, el });
+    }
+    out.sort((left, right) => (parseRef(left.ref) || { seq: 0 }).seq - (parseRef(right.ref) || { seq: 0 }).seq);
+    return out;
+  };
+  const refOf = (el) => {
+    const existing = elRefs.get(el);
+    if (existing && refIsCurrent(existing)) return existing;
+    // 旧版本写进 DOM 的 data-ema2-ref：迁移到内存表，然后清掉属性。
+    const legacy = el.getAttribute('data-ema2-ref');
+    if (refIsCurrent(legacy)) {
+      const parsed = parseRef(legacy);
+      const full = parsed && !parsed.epoch ? 'e' + parsed.seq + '@' + docEpoch() : legacy;
+      setRef(el, full);
+      return full;
     }
     const seq = (window.__ema2_ref_seq || 0) + 1;
     window.__ema2_ref_seq = seq;
     const ref = 'e' + seq + '@' + docEpoch();
-    el.setAttribute('data-ema2-ref', ref);
+    setRef(el, ref);
     return ref;
   };
 
@@ -1004,9 +1357,12 @@ function installHelpers() {
       if (!refIsCurrent(wanted)) return null;
       const parsed = parseRef(wanted);
       const full = parsed && !parsed.epoch ? `e${parsed.seq}@${docEpoch()}` : wanted;
+      const fromMap = refElement(full);
+      if (fromMap) return fromMap;
+      // 兼容上一个 helper 版本遗留的 DOM 属性；找到后迁移进内存表。
       for (const { root } of roots) {
         const el = root.querySelector('[data-ema2-ref="' + full + '"]');
-        if (el) return el;
+        if (el) { setRef(el, full); return el; }
       }
       return null;
     }
@@ -1026,7 +1382,10 @@ function installHelpers() {
         const candidates = [];
         for (const { root } of roots) {
           for (const el of root.querySelectorAll(INTERACTIVE)) {
-            if (roleOf(el).toLowerCase() !== role) continue;
+            const currentRole = roleOf(el).toLowerCase();
+            if (currentRole !== role) continue;
+            // 地标容器（role=search 等）不能作为 target 命中；真正的控件在后代里。
+            if (!isActionableRole(el, currentRole)) continue;
             candidates.push(el);
           }
         }
@@ -1059,6 +1418,22 @@ function installHelpers() {
     'switch', 'slider', 'spinbutton', 'tab', 'option', 'menuitem', 'menuitemcheckbox',
     'menuitemradio', 'treeitem', 'file', 'summary', 'input', 'textarea', 'select',
   ]);
+  // 真正可操作的 ARIA widget role。`role=search/banner/main/...` 是地标容器，
+  // 不是控件：把 div[role=search] 当 searchbox 会让 AI 对着不可写的容器 fill。
+  const WIDGET_ROLES = new Set([
+    'button', 'link', 'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'checkbox',
+    'radio', 'switch', 'slider', 'spinbutton', 'tab', 'menuitem', 'menuitemcheckbox',
+    'menuitemradio', 'treeitem', 'gridcell', 'columnheader', 'rowheader', 'scrollbar',
+  ]);
+  const ACTIONABLE_MATCH = 'a[href],button,input,textarea,select,summary,[contenteditable=""],[contenteditable="true"],[tabindex],[onclick]';
+  const isActionableRole = (el, role) => {
+    if (WIDGET_ROLES.has(String(role || '').toLowerCase())) return true;
+    try { if (el.matches(ACTIONABLE_MATCH)) return true; } catch (_) { /* ignore */ }
+    // label 本身可点击（for= 或包着控件），但它是“激活代理”而不是输入控件。
+    if (el.tagName === 'LABEL' && (el.htmlFor || el.querySelector('input,select,textarea,button'))) return true;
+    return ['A', 'BUTTON', 'INPUT', 'TEXTAREA', 'SELECT', 'SUMMARY'].includes(el.tagName)
+      && (el.tagName !== 'A' || el.hasAttribute('href'));
+  };
 
   /**
    * 额外属性（主要是 href）是所有字段里最占预算的：实测占 snapshot 字符的 39%，p90 达 84 字符。
@@ -1066,7 +1441,9 @@ function installHelpers() {
    */
   const clipExtra = (extra, keepFull) => {
     if (!extra || keepFull) return extra;
-    return extra.length > 40 ? extra.slice(0, 40) + '…' : extra;
+    // href 必须完整；value/accept/files 等也在 extraOf 里单独限制了长度。
+    // 这里不再做 40 字符的总截断，否则 value=<hidden> 会被切成误导性的半截文本。
+    return extra;
   };
 
   /** snapshot 过滤器：links / buttons / form。 */
@@ -1080,7 +1457,8 @@ function installHelpers() {
     return null;
   };
 
-  const snapshot = (filter, budget, cursor, nearRef) => {
+  const snapshot = (filter, budget, cursor, nearRef, values) => {
+    window.__ema2_show_values = !!values;
     const predicate = filterFor(filter);
     let container = null;
     if (nearRef) {
@@ -1109,6 +1487,12 @@ function installHelpers() {
         if (predicate && !predicate(el)) continue;
         const role = roleOf(el);
         const name = nameOf(el);
+        // 地标容器（例如 Wikipedia 的 div[role=search]）不是控件；只有 filter=full
+        // 才保留。实际输入框/链接会作为各自的后代单独出现。
+        if (filter !== 'full' && !predicate && !isActionableRole(el, role)) continue;
+        // label 只在 --filter form 里出现；默认 interactive 不把表单标签当控件，
+        // 否则大表单的 snapshot 会被标签文本占满。
+        if (filter !== 'full' && !predicate && tag === 'LABEL') continue;
         // 无名称又不可操作：点了也没意义，只占预算（x.com 这类站点能到 20%）。
         // filter=full 是「无损视图」，保持原样。
         if (filter !== 'full' && !name && !ACTIONABLE_ROLES.has(role)) continue;
@@ -1217,6 +1601,8 @@ function installHelpers() {
    * 不是可回写的 markdown（样式、合并单元格、脚本生成的内容会丢）。
    */
   const markdown = (root) => {
+    // 直接 read 一个控件时，md 也应返回当前值；否则 --selector "#text" 会是空。
+    if (root && ['INPUT', 'TEXTAREA', 'SELECT'].includes(root.tagName)) return plainText(root);
     const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
     const BLOCK = /^(DIV|SECTION|ARTICLE|P|UL|OL|LI|TABLE|THEAD|TBODY|TR|TD|TH|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|DL|DT|DD|FIGURE|FIGCAPTION|MAIN|HEADER|FOOTER|ASIDE|FORM|NAV)$/;
     const blocks = [];
@@ -1230,6 +1616,20 @@ function installHelpers() {
       const raw = el.getAttribute('href') || '';
       if (!raw || /^javascript:/i.test(raw) || raw === '#') return '';
       // 同源 iframe 里的相对链接要按 iframe 的 baseURI 解析，不能用顶层 location。
+      const base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
+      try { return new URL(raw, base).href; } catch (_) { return raw; }
+    };
+    // 链接文字里的 ] 会提前闭合 markdown；URL 里的括号/空格会截断目标。
+    const escapeMdText = (value) => String(value).replace(/([\\\[\]])/g, '\\$1');
+    const escapeMdUrl = (value) => String(value)
+      .replace(/ /g, '%20')
+      .replace(/\(/g, '%28')
+      .replace(/\)/g, '%29')
+      .replace(/</g, '%3C')
+      .replace(/>/g, '%3E');
+    const srcOf = (el) => {
+      const raw = el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src') || '';
+      if (!raw) return '';
       const base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
       try { return new URL(raw, base).href; } catch (_) { return raw; }
     };
@@ -1261,11 +1661,17 @@ function installHelpers() {
       if (!isReadVisible(el)) return '';
       if (el.shadowRoot) return [...el.shadowRoot.childNodes].map(inline).join('');
       if (tag === 'BR') return '\n';
+      if (tag === 'IMG') {
+        const alt = clean(el.getAttribute('alt') || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+        const src = srcOf(el);
+        if (!src) return alt ? alt + ' ' : '';
+        return '![' + escapeMdText(alt) + '](' + escapeMdUrl(src) + ') ';
+      }
       if (tag === 'A') {
-        const text = clean(el.innerText || el.textContent || '');
+        const text = escapeMdText(clean(el.innerText || el.textContent || ''));
         const href = hrefOf(el);
-        if (!text) return href ? href + ' ' : '';
-        return href ? '[' + text + '](' + href + ') ' : text;
+        if (!text) return href ? escapeMdUrl(href) + ' ' : '';
+        return href ? '[' + text + '](' + escapeMdUrl(href) + ') ' : text;
       }
       if (tag === 'CODE') {
         const text = clean(el.innerText || '');
@@ -1299,6 +1705,7 @@ function installHelpers() {
           flush();
           continue;
         }
+        if (tag === 'IMG') { buffer += inline(child); continue; }
         if (!child.innerText && !child.querySelector('img,picture,video')) continue;
         if (/^H[1-4]$/.test(tag)) {
           const text = clean(child.innerText);
@@ -1337,6 +1744,7 @@ function installHelpers() {
         buffer += inline(child);
       }
     };
+    if (root && root.tagName === 'IMG') return inline(root).trim();
     if (root && root.shadowRoot) walk(root.shadowRoot);
     else walk(root);
     flush();
@@ -1344,6 +1752,12 @@ function installHelpers() {
   };
   /** 清洁文本：跳过 script/style/noscript/iframe/媒体/导航等，块级边界换行。 */
   const plainText = (root) => {
+    // `read --selector "#input"` 应该给出控件的当前值，而不是空字符串。
+    if (root && root.tagName === 'INPUT') return String(root.value == null ? '' : root.value);
+    if (root && root.tagName === 'TEXTAREA') return String(root.value == null ? '' : root.value);
+    if (root && root.tagName === 'SELECT') {
+      return [...root.selectedOptions].map(option => option.value).join(',');
+    }
     const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
     const BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|DIV|DL|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/;
     const lines = [];
@@ -1371,6 +1785,11 @@ function installHelpers() {
           flush();
           continue;
         }
+        if (tag === 'IMG') {
+          const alt = clean(child.getAttribute('alt') || child.getAttribute('aria-label') || child.getAttribute('title') || '');
+          if (alt) buffer += (buffer ? ' ' : '') + alt;
+          continue;
+        }
         if (!child.innerText) continue;
         if (BLOCK.test(tag)) {
           flush();
@@ -1387,29 +1806,51 @@ function installHelpers() {
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   };
 
+  /** iframe 内元素的 rect 是相对 iframe viewport 的；标注要换算到顶层截图坐标。 */
+  const frameOffset = (frameEl) => {
+    if (!frameEl) return { x: 0, y: 0 };
+    const rect = frameEl.getBoundingClientRect();
+    const parentWin = frameEl.ownerDocument && frameEl.ownerDocument.defaultView;
+    const parentFrame = parentWin && parentWin.frameElement ? parentWin.frameElement : null;
+    const base = frameOffset(parentFrame);
+    return {
+      x: base.x + rect.left + (Number(frameEl.clientLeft) || 0),
+      y: base.y + rect.top + (Number(frameEl.clientTop) || 0),
+    };
+  };
+
   /** 当前视口内的 ref 标记（用于截图标注，set-of-marks）。 */
   const marks = () => {
     const out = [];
-    for (const { root } of collectRoots()) {
-      for (const el of root.querySelectorAll('[data-ema2-ref]')) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width < 2 || rect.height < 2) continue;
-        if (rect.bottom < 0 || rect.right < 0 || rect.top > innerHeight || rect.left > innerWidth) continue;
-        out.push({
-          ref: el.getAttribute('data-ema2-ref'),
-          role: roleOf(el),
-          name: nameOf(el).slice(0, 30),
-          x: Math.round(rect.left),
-          y: Math.round(rect.top),
-          w: Math.round(rect.width),
-          h: Math.round(rect.height),
-        });
-      }
+    for (const { ref, el } of refEntries(0)) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) continue;
+      const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+      const offset = frameOffset(win.frameElement || null);
+      const x = Math.round(rect.left + offset.x);
+      const y = Math.round(rect.top + offset.y);
+      if (x + rect.width < 0 || y + rect.height < 0
+          || x > window.innerWidth || y > window.innerHeight) continue;
+      out.push({
+        ref,
+        role: roleOf(el),
+        name: nameOf(el).slice(0, 30),
+        x,
+        y,
+        w: Math.round(rect.width),
+        h: Math.round(rect.height),
+      });
     }
     return out;
   };
 
-  const setValue = (el, value) => {
+  /**
+   * 写值。options.mode=replace（fill/select）覆盖；insert（type）按当前 caret/selection 插入。
+   *
+   * 所有失败路径都会恢复原值：命令返回 error 时页面不能被改坏，
+   * 否则 AI 继续提交表单就会提交空值。
+   */
+  const setValue = (el, value, options) => {
     if (!el) return { ok: false, code: 'target_not_found', message: 'target not found' };
     if (el.disabled) return { ok: false, code: 'element_disabled', message: 'target is disabled' };
     const tag = el.tagName;
@@ -1421,19 +1862,41 @@ function installHelpers() {
     }
     const doc = el.ownerDocument || document;
     const win = doc.defaultView || window;
+    const text = String(value == null ? '' : value);
+    const mode = options && options.mode === 'insert' ? 'insert' : 'replace';
+
     if (el.isContentEditable) {
+      // type "" 是合法 no-op；不要让 execCommand('insertText','') 的 false 误报为失败。
+      if (mode === 'insert' && text === '') return { ok: true, selfDispatched: true };
       // X/Slack/Discord 等富文本编辑器依赖原生 input 事件；直接写 textContent
       // 不会更新它们内部状态（例如 X 的“发帖”按钮仍然 disabled）。
-      const text = String(value == null ? '' : value);
+      const beforeText = String(el.textContent || '');
+      const beforeHtml = String(el.innerHTML || '');
+      const restore = () => {
+        try { el.innerHTML = beforeHtml; } catch (_) { el.textContent = beforeText; }
+      };
       const insert = () => {
         el.focus();
         try {
           const selection = win.getSelection();
           if (selection) {
-            const range = doc.createRange();
-            range.selectNodeContents(el);
-            selection.removeAllRanges();
-            selection.addRange(range);
+            if (mode === 'replace') {
+              const range = doc.createRange();
+              range.selectNodeContents(el);
+              selection.removeAllRanges();
+              selection.addRange(range);
+            } else {
+              const anchor = selection.anchorNode;
+              const inside = !!anchor && (el === anchor || el.contains(anchor));
+              if (!selection.rangeCount || !inside) {
+                // 没有 caret 时插到末尾；有选区时必须尊重它，不能清空重写。
+                const range = doc.createRange();
+                range.selectNodeContents(el);
+                range.collapse(false);
+                selection.removeAllRanges();
+                selection.addRange(range);
+              }
+            }
           }
           return doc.execCommand('insertText', false, text);
         } catch (_) {
@@ -1441,71 +1904,147 @@ function installHelpers() {
         }
       };
       let inserted = insert();
-      // 极少数编辑器在首次聚焦/重载后会把同一次 insertText 应用两次；复核并修一次。
-      if (String(el.textContent || '') !== text) {
+      if (mode === 'replace' && String(el.textContent || '') !== text) {
+        // 极少数编辑器在首次聚焦/重载后会把同一次 insertText 应用两次；复核并修一次。
         inserted = insert();
       }
-      if (!inserted || String(el.textContent || '') !== text) {
+      if (mode === 'replace' && (!inserted || String(el.textContent || '') !== text)) {
         el.textContent = text;
         try {
           el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
         } catch (_) { /* ignore */ }
+      } else if (!inserted) {
+        restore();
+        return { ok: false, code: 'input_prevented', message: 'the editor rejected insertText' };
       }
       // execCommand 已经触发原生 input；外层不要再补发，避免某些编辑器重复应用。
       return { ok: true, selfDispatched: true };
     }
+
     let proto = null;
     if (tag === 'INPUT' && win.HTMLInputElement) proto = win.HTMLInputElement.prototype;
     else if (tag === 'TEXTAREA' && win.HTMLTextAreaElement) proto = win.HTMLTextAreaElement.prototype;
     else if (tag === 'SELECT' && win.HTMLSelectElement) proto = win.HTMLSelectElement.prototype;
     if (!proto) return { ok: false, code: 'not_writable', message: `cannot write to ${String(tag).toLowerCase()}` };
     if (el.readOnly && tag !== 'SELECT') return { ok: false, code: 'element_readonly', message: 'target is read-only' };
-    // 输入掩码（IMask / 金额 / 手机号格式化）依赖 beforeinput；
-    // 页面主动 cancel 时说明它自己接管了输入，这时不强写，避免和页面状态打架。
-    if (tag !== 'SELECT') {
-      try {
-        const text = String(value == null ? '' : value);
-        const before = new InputEvent('beforeinput', {
-          bubbles: true, cancelable: true, inputType: 'insertText', data: text,
-        });
-        if (!el.dispatchEvent(before)) {
-          return {
-            ok: false,
-            code: 'input_prevented',
-            message: 'the page cancelled beforeinput for this control',
-          };
-        }
-      } catch (_) { /* 老浏览器/特殊控件忽略 */ }
-    }
     const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
     if (!descriptor || typeof descriptor.set !== 'function') {
       return { ok: false, code: 'not_writable', message: 'value setter is unavailable' };
     }
+
+    if (tag === 'SELECT') {
+      const previous = [...el.options].map(option => option.selected);
+      const restore = () => {
+        [...el.options].forEach((option, index) => { option.selected = !!previous[index]; });
+      };
+      const requested = el.multiple
+        ? text.split(',').map(part => part.trim()).filter(Boolean)
+        : [text];
+      const unique = [...new Set(requested)];
+      const missing = unique.filter(want => ![...el.options].some(option => option.value === want));
+      if (missing.length) {
+        restore();
+        return {
+          ok: false, code: 'value_not_available',
+          message: `select has no option with value: ${missing.join(',')}`,
+        };
+      }
+      try {
+        if (el.multiple) {
+          // <select multiple> 支持逗号分隔的多个 value；真实用户是 Ctrl+click 多选。
+          for (const option of el.options) option.selected = unique.includes(option.value);
+          const done = unique.every(want => [...el.options].some(option => option.selected && option.value === want));
+          if (!done) { restore(); return { ok: false, code: 'value_not_available', message: 'select did not accept all values' }; }
+        } else {
+          descriptor.set.call(el, text);
+          if (String(el.value) !== text) {
+            restore();
+            return { ok: false, code: 'value_not_available', message: 'select has no matching option' };
+          }
+        }
+      } catch (error) {
+        restore();
+        return { ok: false, code: 'value_rejected', message: clean(error && error.message || error) };
+      }
+      return { ok: true };
+    }
+
+    const previousValue = String(el.value == null ? '' : el.value);
+    const previousStart = el.selectionStart;
+    const previousEnd = el.selectionEnd;
+    const restore = () => {
+      try {
+        descriptor.set.call(el, previousValue);
+        if (typeof previousStart === 'number' && typeof previousEnd === 'number') {
+          el.setSelectionRange(previousStart, previousEnd);
+        }
+      } catch (_) { /* 控件可能不支持 selection */ }
+    };
+
+    let nextValue;
+    let caret = null;
+    if (mode === 'insert') {
+      const current = previousValue;
+      const start = typeof previousStart === 'number'
+        ? Math.min(previousStart, current.length) : current.length;
+      const end = typeof previousEnd === 'number'
+        ? Math.min(Math.max(previousEnd, start), current.length) : start;
+      nextValue = current.slice(0, start) + text + current.slice(end);
+      caret = start + text.length;
+    } else {
+      nextValue = text;
+      caret = nextValue.length;
+    }
+
+    // 输入掩码（IMask / 金额 / 手机号格式化）依赖 beforeinput；
+    // 页面主动 cancel 时说明它自己接管了输入，这时不强写，避免和页面状态打架。
     try {
-      descriptor.set.call(el, String(value == null ? '' : value));
+      const before = new InputEvent('beforeinput', {
+        bubbles: true, cancelable: true, inputType: 'insertText', data: text,
+      });
+      if (!el.dispatchEvent(before)) {
+        return {
+          ok: false,
+          code: 'input_prevented',
+          message: 'the page cancelled beforeinput for this control',
+        };
+      }
+    } catch (_) { /* 老浏览器/特殊控件忽略 */ }
+
+    try {
+      descriptor.set.call(el, nextValue);
     } catch (error) {
+      restore();
       return { ok: false, code: 'value_rejected', message: clean(error && error.message || error) };
     }
-    if (tag === 'SELECT' && String(el.value) !== String(value == null ? '' : value)) {
-      return { ok: false, code: 'value_not_available', message: 'select has no matching option' };
-    }
     // number/date/range 等控件会清洗值（例如 "abc" -> ""）；不能把 setter 没抛错当成写入成功。
-    if ((tag === 'INPUT' || tag === 'TEXTAREA')
-        && String(el.value) !== String(value == null ? '' : value)) {
+    if (String(el.value) !== nextValue) {
+      restore();
       return {
         ok: false,
         code: 'value_rejected',
-        message: 'the control normalized the value (type/maxlength/range?)',
+        message: 'the control normalized the value (type/maxlength/range?); the previous value was restored',
       };
+    }
+    if (caret != null) {
+      try { el.setSelectionRange(caret, caret); } catch (_) { /* number/date 等不支持 selection */ }
     }
     return { ok: true };
   };
 
+  // 升级到 helper 13 时把旧版本遗留的 DOM 属性清掉（新 ref 只在内存表里）。
+  try {
+    for (const { root } of collectRoots()) {
+      for (const el of root.querySelectorAll('[data-ema2-ref]')) el.removeAttribute('data-ema2-ref');
+    }
+  } catch (_) { /* ignore */ }
+
   window.__ema2_helpers = {
-    snapshot, markdown, plainText, mainRoot, find, refOf, clean, candidates,
-    collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent, setValue,
+    snapshot, markdown, plainText, mainRoot, find, refOf, refEntries, clean, candidates,
+    collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent,
+    setValue, isActionableRole, absoluteHref,
   };
-  window.__ema2_helpers_version = 12;
+  window.__ema2_helpers_version = 13;
   return { installed: true };
 }
 
@@ -1581,6 +2120,116 @@ function performActionInPage(spec) {
     hadSnapshot: !!helpers.docEpoch(),
     candidates: helpers.candidates(5),
   });
+
+  /** 穿透 shadow root 与同源 iframe 的命中测试。坐标相对传入 document 的 viewport。 */
+  const hitTest = (doc, x, y) => {
+    if (!doc) return null;
+    let hit = doc.elementFromPoint(x, y);
+    for (let guard = 0; hit && hit.shadowRoot && guard < 10; guard++) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    if (hit && /^(IFRAME|FRAME)$/.test(hit.tagName)) {
+      try {
+        const innerDoc = hit.contentDocument;
+        if (innerDoc) {
+          const rect = hit.getBoundingClientRect();
+          const inner = hitTest(
+            innerDoc,
+            x - rect.left - (Number(hit.clientLeft) || 0),
+            y - rect.top - (Number(hit.clientTop) || 0),
+          );
+          if (inner) return inner;
+        }
+      } catch (_) { /* cross-origin */ }
+    }
+    return hit;
+  };
+
+  const relatedTo = (el, hit) => {
+    if (!el || !hit) return false;
+    if (el === hit || el.contains(hit) || hit.contains(el)) return true;
+    // shadow DOM：沿 host 链向上找目标元素。
+    let node = hit;
+    for (let guard = 0; node && guard < 20; guard++) {
+      if (node === el) return true;
+      node = node.parentNode || node.host || null;
+    }
+    return false;
+  };
+
+  /**
+   * 点击前检查真实可点性：隐藏/ inert / pointer-events:none / 被 overlay 覆盖。
+   * 返回 null 表示可点；否则返回可直接映射为 ToolError 的结果。
+   */
+  const clickBlocker = (el) => {
+    if (!helpers.isActionableRole(el, helpers.roleOf(el))) {
+      return {
+        code: 'not_clickable',
+        message: 'target is a non-interactive container',
+        hint: 'snapshot again and click the real button/link/input ref',
+      };
+    }
+    const doc = el.ownerDocument || document;
+    const view = doc.defaultView || window;
+    let style;
+    try { style = view.getComputedStyle(el); } catch (_) { style = null; }
+    if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) {
+      return {
+        code: 'not_clickable',
+        message: 'target is not visible',
+        hint: 'the element may have been hidden after the snapshot; take a fresh snapshot',
+      };
+    }
+    let inert = false;
+    try { inert = !!el.closest('[inert]'); } catch (_) { inert = false; }
+    if (inert) {
+      return {
+        code: 'not_clickable',
+        message: 'target is inside an inert subtree',
+        hint: 'close the modal/overlay that made the page inert, then retry',
+      };
+    }
+    if (style && style.pointerEvents === 'none') {
+      return {
+        code: 'not_clickable',
+        message: 'target has pointer-events:none',
+        hint: 'click the element that actually receives pointer events',
+      };
+    }
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return { code: 'not_clickable', message: 'target has an empty box', hint: 'snapshot again' };
+    }
+    const x = Math.round(rect.left + rect.width / 2);
+    const y = Math.round(rect.top + rect.height / 2);
+    let hit = null;
+    try { hit = hitTest(doc, x, y); } catch (_) { hit = null; }
+    if (!hit) {
+      return {
+        code: 'not_clickable',
+        message: 'target is outside the viewport',
+        hint: 'scroll it into view (act scroll) and snapshot again',
+      };
+    }
+    if (!relatedTo(el, hit)) {
+      const tag = String(hit.tagName || 'element').toLowerCase();
+      return {
+        code: 'obscured',
+        message: `target is covered by <${tag}>`,
+        hint: 'close the overlay/modal/cookie banner first, or click the element that actually receives the pointer',
+      };
+    }
+    return null;
+  };
+
+  const formValidationFailed = (form, submitter) => {
+    if (!form || typeof form.checkValidity !== 'function') return false;
+    if (form.noValidate) return false;
+    if (submitter && submitter.formNoValidate) return false;
+    try { return !form.checkValidity(); } catch (_) { return false; }
+  };
 
   // press 的 key 支持 "Control+Shift+L"：最后一段是键，其余是修饰位。
   const parseKeyCombo = (raw) => {
@@ -1668,12 +2317,14 @@ function performActionInPage(spec) {
     if (!el) return missing();
   }
   if (!el) return missing();
-  try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) { /* ignore */ }
+  try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (_) { /* ignore */ }
   const disabled = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
 
   switch (action) {
     case 'click': {
       if (disabled) return { found: true, ok: false, code: 'element_disabled', message: 'target is disabled' };
+      const blocker = clickBlocker(el);
+      if (blocker) return { found: true, ok: false, ...blocker };
       const tag = el.tagName.toLowerCase();
       const form = el.closest && el.closest('form');
       const anchor = tag === 'a' && !!(el.href || el.getAttribute('href'));
@@ -1689,7 +2340,11 @@ function performActionInPage(spec) {
         && !lowerHref.startsWith('mailto:')
         && !lowerHref.startsWith('tel:')
         && !lowerHref.startsWith('#');
-      const effect = navigable || (submitter && !!form) ? 'nav' : 'page';
+      const download = anchor && el.hasAttribute('download');
+      const validationFailed = submitter && formValidationFailed(form, el);
+      const effect = validationFailed ? 'none'
+        : download ? 'download'
+          : navigable || (submitter && !!form) ? 'nav' : 'page';
       const nextUrl = anchor ? (el.href || el.getAttribute('href') || '') : (submitter && form ? form.action || '' : '');
       // 纯 el.click() 只产生一个 click 事件：没有 pointer/mouse 序列，聚焦还是静默的，
       // 密码管理器这类靠 focusin/pointerdown 出浮层的扩展完全看不到这次点击。
@@ -1725,15 +2380,15 @@ function performActionInPage(spec) {
       // canRetry 只影响 settle 后的重试策略：只有可导航链接允许安全重试，
       // javascript:/download/# 链接和按钮都不重试，避免副作用执行两次。
       const kind = navigable ? 'anchor' : submitter ? 'submit' : 'node';
-      return { found: true, ok: true, info, effect, nextUrl, kind, canRetry: navigable };
+      return {
+        found: true, ok: true, info, effect, nextUrl, kind, canRetry: navigable,
+        download, validation: validationFailed ? 'failed' : '',
+      };
     }
     case 'type': {
       const text = spec.text === undefined ? '' : String(spec.text);
-      // type 追加，fill 覆盖：两者语义不同，模型不用先读旧值拼字符串。
-      const current = el.isContentEditable
-        ? (el.textContent || '')
-        : (el.value === undefined ? '' : String(el.value));
-      const written = helpers.setValue(el, current + text);
+      // type 在 caret/selection 处插入；fill 才覆盖整个值。
+      const written = helpers.setValue(el, text, { mode: 'insert' });
       if (!written.ok) return { found: true, ...written };
       try { el.focus(); } catch (_) { /* ignore */ }
       if (!written.selfDispatched) {
@@ -1743,13 +2398,17 @@ function performActionInPage(spec) {
       let effect = 'none';
       let nextUrl = '';
       let submitted = false;
+      let validation = '';
       if (spec.submit) {
         // 页面已经接管 Enter（preventDefault，例如自己提交过）时不再重复 requestSubmit。
         const notCanceled = el.dispatchEvent(new KeyboardEvent('keydown', {
           key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
         }));
         const form = el.closest && el.closest('form');
-        if (notCanceled && form && form.requestSubmit) {
+        if (formValidationFailed(form, null)) {
+          // HTML5 校验失败时浏览器不会提交；不要伪装成 nav。
+          validation = 'failed';
+        } else if (notCanceled && form && form.requestSubmit) {
           form.requestSubmit();
           submitted = true;
           effect = 'nav';
@@ -1760,9 +2419,10 @@ function performActionInPage(spec) {
       return {
         found: true,
         ok: true,
-        info: `wrote=1 chars=${text.length}${spec.submit ? ` submit=${submitted ? 1 : 0}` : ''}`,
+        info: `wrote=1 chars=${text.length} trusted=0${spec.submit ? ` submit=${submitted ? 1 : 0}` : ''}`,
         effect,
         nextUrl,
+        validation,
       };
     }
     case 'select': {
@@ -1796,16 +2456,20 @@ function performActionInPage(spec) {
       pressTarget.dispatchEvent(new KeyboardEvent('keyup', opts));
       let effect = 'page';
       let nextUrl = '';
+      let validation = '';
       if (combo.key === 'Enter' && notCanceled) {
         const form = pressTarget.closest && pressTarget.closest('form');
-        if (form && form.requestSubmit) {
+        if (formValidationFailed(form, null)) {
+          validation = 'failed';
+          effect = 'none';
+        } else if (form && form.requestSubmit) {
           form.requestSubmit();
           effect = 'nav';
           nextUrl = form.action || '';
         }
       }
       const where = ref ? `ref=${ref}` : selector ? `selector=${selector}` : target ? `target=${target}` : 'target=active';
-      return { found: true, ok: true, info: `key=${spec.key} ${where}`, effect, nextUrl };
+      return { found: true, ok: true, info: `key=${spec.key} ${where} trusted=0`, effect, nextUrl, validation };
     }
     case 'hover': {
       const rect = el.getBoundingClientRect();
@@ -1826,12 +2490,300 @@ function performActionInPage(spec) {
       if (!form || !form.requestSubmit) {
         return { found: true, ok: false, code: 'no_form', message: 'target is not inside a form', hint: 'use click on the submit button or press Enter on the field' };
       }
+      if (formValidationFailed(form, null)) {
+        return { found: true, ok: true, info: 'submitted=0 validation=failed', effect: 'none', validation: 'failed' };
+      }
       form.requestSubmit();
       return { found: true, ok: true, info: 'submitted=1', effect: 'nav', nextUrl: form.action || '' };
     }
     default:
       return { found: true, ok: false, code: 'invalid_action', message: `unsupported action: ${action}` };
   }
+}
+
+/**
+ * 在页面内定位并聚焦目标，供 CDP Input.* 可信按键使用。
+ * 只做校验/聚焦，不修改值；type 还需要知道控件是否支持 Input.insertText。
+ */
+function focusInPage(spec) {
+  const helpers = window.__ema2_helpers;
+  if (!helpers) {
+    return { found: false, code: 'helpers_missing', message: 'page helpers are not installed', hint: 'reload the page and retry' };
+  }
+  const ref = spec.ref || null;
+  const selector = spec.selector || null;
+  const target = spec.target || null;
+  const el = helpers.find(ref, selector, target);
+  if (!el) {
+    return {
+      found: false,
+      stale: !!ref && !helpers.refIsCurrent(ref),
+      candidates: helpers.candidates(5),
+    };
+  }
+  if (el.disabled) return { found: true, ok: false, code: 'element_disabled', message: 'target is disabled' };
+  const activeInfo = (node) => {
+    if (!node) return { tag: '', role: '', name: '' };
+    return {
+      tag: String(node.tagName || '').toLowerCase(),
+      role: helpers.roleOf(node),
+      name: helpers.nameOf(node).slice(0, 80),
+    };
+  };
+  const before = activeInfo(document.activeElement);
+  try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (_) { /* ignore */ }
+  let focused = false;
+  try {
+    el.focus({ preventScroll: true });
+    focused = document.activeElement === el;
+  } catch (_) {
+    try { el.focus(); focused = document.activeElement === el; } catch (_) { /* ignore */ }
+  }
+  if (!focused && el.tagName !== 'BODY') {
+    return {
+      found: true,
+      ok: false,
+      code: 'not_clickable',
+      message: 'target cannot receive keyboard focus',
+      hint: 'focus a nearby input/button, or use click instead',
+    };
+  }
+  const tag = el.tagName;
+  const inputType = tag === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+  const editable = el.isContentEditable
+    || tag === 'TEXTAREA'
+    || (tag === 'INPUT' && !['file', 'checkbox', 'radio', 'hidden', 'submit', 'reset', 'button', 'image'].includes(inputType));
+  const insertable = el.isContentEditable
+    || tag === 'TEXTAREA'
+    || (tag === 'INPUT' && ['text', 'search', 'email', 'url', 'tel', 'password'].includes(inputType));
+  const form = el.closest && el.closest('form');
+  const formInvalid = !!form && !form.noValidate && !el.formNoValidate
+    && typeof form.checkValidity === 'function' && !form.checkValidity();
+  return {
+    found: true,
+    ok: true,
+    editable,
+    insertable,
+    readOnly: !!el.readOnly,
+    formInvalid,
+    nextUrl: form ? (form.action || '') : '',
+    before,
+    after: activeInfo(document.activeElement),
+  };
+}
+
+/**
+ * 背景页侧的键名解析（页面内的 parseKeyCombo 只负责合成事件）。
+ * 与页面侧保持同一套别名；CDP 需要 windowsVirtualKeyCode。
+ */
+function parseKeyComboBackground(raw) {
+  const source = String(raw || '').trim();
+  if (source === '+') {
+    return { key: '+', code: 'Equal', ctrlKey: false, shiftKey: true, altKey: false, metaKey: false };
+  }
+  const parts = source.split('+').map(part => part.trim()).filter(Boolean);
+  const token = parts.pop() || '';
+  const combo = { key: '', code: '', ctrlKey: false, shiftKey: false, altKey: false, metaKey: false };
+  for (const part of parts) {
+    const lower = part.toLowerCase();
+    if (lower === 'ctrl' || lower === 'control') combo.ctrlKey = true;
+    else if (lower === 'shift') combo.shiftKey = true;
+    else if (lower === 'alt' || lower === 'option') combo.altKey = true;
+    else if (lower === 'meta' || lower === 'cmd' || lower === 'command' || lower === 'win') combo.metaKey = true;
+  }
+  if (!token) return combo;
+  const alias = {
+    esc: 'Escape', escape: 'Escape', enter: 'Enter', return: 'Enter', tab: 'Tab', space: ' ',
+    backspace: 'Backspace', delete: 'Delete', del: 'Delete', insert: 'Insert', home: 'Home',
+    end: 'End', pageup: 'PageUp', pagedown: 'PageDown', arrowup: 'ArrowUp', up: 'ArrowUp',
+    arrowdown: 'ArrowDown', down: 'ArrowDown', arrowleft: 'ArrowLeft', left: 'ArrowLeft',
+    arrowright: 'ArrowRight', right: 'ArrowRight',
+  };
+  const lower = token.toLowerCase();
+  if (alias[lower] !== undefined) {
+    combo.key = alias[lower];
+    combo.code = alias[lower] === ' ' ? 'Space' : alias[lower];
+    return combo;
+  }
+  if (token.length === 1) {
+    combo.key = token;
+    combo.code = /[a-z]/i.test(token) ? `Key${token.toUpperCase()}`
+      : (/[0-9]/.test(token) ? `Digit${token}` : '');
+    return combo;
+  }
+  combo.key = token;
+  combo.code = /^f\d{1,2}$/i.test(token) ? token.toUpperCase() : token;
+  return combo;
+}
+
+function modifierMask(combo) {
+  return (combo.altKey ? 1 : 0) | (combo.ctrlKey ? 2 : 0)
+    | (combo.metaKey ? 4 : 0) | (combo.shiftKey ? 8 : 0);
+}
+
+function virtualKeyCode(combo) {
+  const map = {
+    Enter: 13, Tab: 9, Backspace: 8, Delete: 46, Escape: 27, ' ': 32,
+    ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+    Home: 36, End: 35, PageUp: 33, PageDown: 34, Insert: 45,
+    Shift: 16, Control: 17, Alt: 18, Meta: 91,
+  };
+  if (map[combo.key] != null) return map[combo.key];
+  if (combo.code === 'Equal') return 187;
+  if (/^Key[A-Z]$/.test(combo.code)) return combo.code.charCodeAt(3);
+  if (/^Digit\d$/.test(combo.code)) return 48 + Number(combo.code.slice(5));
+  if (/^F\d{1,2}$/.test(combo.key)) return 111 + Number(combo.key.slice(1));
+  const upper = String(combo.key).toUpperCase();
+  return upper.length === 1 ? upper.charCodeAt(0) : 0;
+}
+
+function commandsFor(combo) {
+  if ((!combo.ctrlKey && !combo.metaKey) || combo.altKey) return [];
+  const key = String(combo.key).toLowerCase();
+  if (key === 'a') return ['selectAll'];
+  if (key === 'c') return ['copy'];
+  if (key === 'x') return ['cut'];
+  if (key === 'v') return ['paste'];
+  if (key === 'z') return [combo.shiftKey ? 'redo' : 'undo'];
+  return [];
+}
+
+async function dispatchTrustedKey(tabId, combo, focusedTag) {
+  let key = combo.key;
+  if (key.length === 1 && /[a-z]/i.test(key)) key = combo.shiftKey ? key.toUpperCase() : key.toLowerCase();
+  const vk = virtualKeyCode(combo);
+  const base = {
+    key,
+    code: combo.code || '',
+    modifiers: modifierMask(combo),
+    windowsVirtualKeyCode: vk,
+    nativeVirtualKeyCode: vk,
+  };
+  const isEnter = combo.key === 'Enter';
+  const isSpace = combo.key === ' ' && /^(BUTTON|A|SUMMARY)$/.test(String(focusedTag || '').toUpperCase());
+  const plainText = key.length === 1 && !combo.ctrlKey && !combo.metaKey && !combo.altKey && !isSpace;
+  const down = { ...base, type: plainText || isEnter ? 'keyDown' : 'rawKeyDown' };
+  if (plainText) { down.text = key; down.unmodifiedText = key; }
+  if (isEnter) { down.text = '\r'; down.unmodifiedText = '\r'; }
+  const commands = commandsFor(combo);
+  if (commands.length) down.commands = commands;
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', down);
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
+  await sleep(35);
+}
+
+async function activeElementInfo(tabId) {
+  return runInTab(tabId, () => {
+    const helpers = window.__ema2_helpers;
+    const active = document.activeElement;
+    if (!active) return { tag: '', role: '', name: '', formAction: '', invalid: false };
+    const form = active.closest && active.closest('form');
+    return {
+      tag: String(active.tagName || '').toLowerCase(),
+      role: helpers ? helpers.roleOf(active) : '',
+      name: helpers ? helpers.nameOf(active).slice(0, 80) : '',
+      formAction: form ? (form.action || '') : '',
+      invalid: !!form && !form.noValidate && typeof form.checkValidity === 'function' && !form.checkValidity(),
+    };
+  }, [], undefined, 1).catch(() => ({ tag: '', role: '', name: '', formAction: '', invalid: false }));
+}
+
+/** 可信按键：CDP Input.dispatchKeyEvent 会触发浏览器默认行为（Tab/Backspace/Enter/Ctrl+A）。 */
+async function pressViaDebugger(tab, step) {
+  const spec = {
+    ref: step.ref || null,
+    selector: step.selector || null,
+    target: step.target || null,
+  };
+  const hasLocator = !!(spec.ref || spec.selector || spec.target);
+  let prepared;
+  if (hasLocator) {
+    prepared = await runInTab(tab.id, focusInPage, [spec], undefined, 1);
+    if (!prepared) return null;
+    if (prepared.found === false) return prepared;
+    if (!prepared.ok) return prepared;
+  } else {
+    const before = await activeElementInfo(tab.id);
+    prepared = { ok: true, before, after: null, formInvalid: !!before.invalid, nextUrl: '' };
+  }
+  const combo = parseKeyComboBackground(String(step.key || ''));
+  if (!combo.key) return { found: true, ok: false, code: 'missing_key', message: 'press requires key' };
+  try {
+    await withDebugger(tab.id, async () => {
+      await dispatchTrustedKey(tab.id, combo, prepared.after ? prepared.after.tag : prepared.before.tag);
+    }, { timeoutMs: 8000, queueWaitMs: 15000 });
+  } catch (error) {
+    // debugger 被占用时退回页面合成事件；结果里会标 trusted=0。
+    if (error instanceof ToolError && ['debugger_attach_failed', 'debugger_attach_timeout', 'debugger_busy', 'debugger_timeout'].includes(error.code)) {
+      return null;
+    }
+    throw error;
+  }
+  const after = await activeElementInfo(tab.id);
+  const focusChanged = (prepared.after ? prepared.after.tag : prepared.before.tag) !== after.tag
+    || (prepared.after ? prepared.after.name : prepared.before.name) !== after.name;
+  const validation = (prepared.formInvalid || after.invalid) && combo.key === 'Enter' ? 'failed' : '';
+  // 按键可能已经触发导航，after 里的 form 可能已经消失；用按键前的 form action 判定。
+  const formAction = prepared.nextUrl || (prepared.before && prepared.before.formAction) || after.formAction || '';
+  const effect = combo.key === 'Enter' && ((formAction && !validation) || after.tag === 'a')
+    ? 'nav'
+    : 'page';
+  const where = spec.ref ? `ref=${spec.ref}` : spec.selector ? `selector=${spec.selector}` : spec.target ? `target=${spec.target}` : 'target=active';
+  return {
+    found: true,
+    ok: true,
+    info: `key=${step.key} ${where} trusted=1 focus_changed=${focusChanged ? 1 : 0} active=${after.tag || 'none'}`,
+    effect,
+    nextUrl: effect === 'nav' ? formAction : '',
+    validation,
+  };
+}
+
+/** 可信输入：CDP Input.insertText 在 caret/selection 处插入，不再总是追加到末尾。 */
+async function typeViaDebugger(tab, step) {
+  const spec = {
+    ref: step.ref || null,
+    selector: step.selector || null,
+    target: step.target || null,
+  };
+  if (!spec.ref && !spec.selector && !spec.target) return null;
+  const prepared = await runInTab(tab.id, focusInPage, [spec], undefined, 1);
+  if (!prepared) return null;
+  if (prepared.found === false) return prepared;
+  if (!prepared.ok) return prepared;
+  if (prepared.readOnly) return { found: true, ok: false, code: 'element_readonly', message: 'target is read-only' };
+  if (!prepared.editable) return { found: true, ok: false, code: 'not_writable', message: 'target is not an editable control' };
+  // number/date/range 等不支持 Input.insertText：交给页面 setValue（同样会校验并回滚）。
+  if (!prepared.insertable) return null;
+  const text = step.text === undefined ? '' : String(step.text);
+  try {
+    await withDebugger(tab.id, async () => {
+      await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.insertText', { text });
+      if (step.submit) {
+        await dispatchTrustedKey(tab.id, parseKeyComboBackground('Enter'), 'INPUT');
+      }
+    }, {
+      timeoutMs: Math.max(8000, Math.min(60000, text.length * 5 + 3000)),
+      queueWaitMs: 20000,
+    });
+  } catch (error) {
+    if (error instanceof ToolError && ['debugger_attach_failed', 'debugger_attach_timeout', 'debugger_busy', 'debugger_timeout'].includes(error.code)) {
+      return null;
+    }
+    throw error;
+  }
+  const after = await activeElementInfo(tab.id);
+  const validation = step.submit && after.invalid ? 'failed' : '';
+  const formAction = prepared.nextUrl || after.formAction || '';
+  const effect = step.submit && formAction && !validation ? 'nav' : 'none';
+  return {
+    found: true,
+    ok: true,
+    info: `wrote=1 chars=${text.length} trusted=1${step.submit ? ` submit=${validation ? 0 : 1}` : ''}`,
+    effect,
+    nextUrl: effect === 'nav' ? formAction : '',
+    validation,
+  };
 }
 
 /** 页面内：安装 console 采集钩子（MAIN world）。 */
@@ -1924,13 +2876,25 @@ function installNetworkHook() {
     }
     return entry;
   };
-  // 安装前的请求无法拿到状态码/响应体，用 performance entries 回填，至少能看到发生过什么。
+  // 安装前的请求无法拿到响应体，但 PerformanceResourceTiming.responseStatus
+  // （Chromium 109+）能给真实状态码；它的 name 也已经是绝对 URL。
   try {
+    const timeOrigin = Number(performance.timeOrigin) || Date.now();
+    const nav = performance.getEntriesByType('navigation')[0];
+    if (nav) {
+      push({
+        type: 'document', method: 'GET', url: location.href,
+        status: typeof nav.responseStatus === 'number' ? nav.responseStatus : -1,
+        ms: Math.round(nav.duration || 0), body: '', preview: 'history', backfilled: true,
+        startedAt: Math.round(timeOrigin),
+      });
+    }
     for (const entry of performance.getEntriesByType('resource').slice(-100)) {
       push({
-        type: 'resource', method: 'GET', url: entry.name,
-        status: -1, ms: Math.round(entry.duration || 0), body: '',
-        preview: 'history', backfilled: true,
+        type: entry.initiatorType || 'resource', method: 'GET', url: entry.name,
+        status: typeof entry.responseStatus === 'number' ? entry.responseStatus : -1,
+        ms: Math.round(entry.duration || 0), body: '', preview: 'history', backfilled: true,
+        startedAt: Math.round(timeOrigin + (entry.startTime || 0)),
       });
     }
   } catch (_) { /* ignore */ }
@@ -1980,6 +2944,7 @@ function installNetworkHook() {
   const originalFetch = window.fetch;
   window.fetch = async function (...args) {
     const start = performance.now();
+    const startedAt = Date.now();
     const input = args[0];
     const init = args[1] || {};
     let url = '';
@@ -1989,7 +2954,7 @@ function installNetworkHook() {
       const response = await originalFetch.apply(this, args);
       const entry = push({
         type: 'fetch', method, url, status: response.status,
-        ms: Math.round(performance.now() - start), body: '', preview: 'off',
+        ms: Math.round(performance.now() - start), body: '', preview: 'off', startedAt,
       });
       // 先返回原始 Response；预览在独立任务中读取 clone，失败不影响页面请求。
       if (state.captureBodies) {
@@ -2004,6 +2969,7 @@ function installNetworkHook() {
       push({
         type: 'fetch', method, url, status: 0,
         ms: Math.round(performance.now() - start), body: 'ERR ' + (error && error.message), preview: 'error',
+        startedAt,
       });
       throw error;
     }
@@ -2017,6 +2983,7 @@ function installNetworkHook() {
   XMLHttpRequest.prototype.send = function (...args) {
     const meta = this.__ema2 || {};
     meta.start = performance.now();
+    meta.startedAt = Date.now();
     // once: XHR 对象被复用时不会累积 loadend 监听器，避免一个请求产生多条记录。
     this.addEventListener('loadend', () => {
       let body = '';
@@ -2037,7 +3004,7 @@ function installNetworkHook() {
         url: this.responseURL || meta.url || '',
         status: this.status || 0,
         ms: Math.round(performance.now() - (meta.start || performance.now())),
-        body, preview: previewState,
+        body, preview: previewState, startedAt: meta.startedAt || Date.now(),
       });
     }, { once: true });
     return originalSend.apply(this, args);
@@ -2140,6 +3107,8 @@ function newTabsSince(context, tabs) {
 function actionChangedKeys(baseline, state) {
   const changed = [];
   if (baseline.url && state.url && baseline.url !== state.url) changed.push('url');
+  // performance.timeOrigin 在 reload / 同 URL 导航后会变，pushState 不会。
+  if (baseline.origin && state.origin && baseline.origin !== state.origin) changed.push('reload');
   if (baseline.doc && state.doc && baseline.doc !== state.doc) changed.push('doc');
   if (baseline.title !== state.title) changed.push('title');
   if (baseline.refSeq !== state.refSeq
@@ -2160,7 +3129,12 @@ async function waitForActionEffect(context, timeoutMs) {
   let started = !!context.newTabId;
   let lastSig = '';
   let quietSince = Date.now();
-  let lastState = { url: context.url || baseline.url || '', title: context.title || baseline.title || '', doc: '' };
+  let lastState = {
+    url: context.url || baseline.url || '',
+    title: context.title || baseline.title || '',
+    origin: baseline.origin || 0,
+    doc: '',
+  };
   let changed = [];
 
   while (Date.now() - startedAt < timeoutMs) {
@@ -2188,7 +3162,7 @@ async function waitForActionEffect(context, timeoutMs) {
     }
     let state;
     try { state = await pageState(targetTabId); } catch (_) {
-      state = { url: '', title: '', refSeq: 0, doc: '', nodes: 0, textLen: 0 };
+      state = { url: '', title: '', origin: 0, refSeq: 0, doc: '', nodes: 0, textLen: 0 };
     }
     const url = state.url || tabInfo.url || '';
     const title = state.title || tabInfo.title || '';
@@ -2197,6 +3171,7 @@ async function waitForActionEffect(context, timeoutMs) {
       tabInfo.status || '',
       state.url || '',
       state.title || '',
+      state.origin || 0,
       state.doc || '',
       state.refSeq || 0,
       state.nodes || 0,
@@ -2212,6 +3187,7 @@ async function waitForActionEffect(context, timeoutMs) {
     if (newTabIds.length && !changed.includes('new_tab')) changed.push('new_tab');
     if (tabInfo.status === 'loading') started = true;
     if (baseline.url && url && url !== baseline.url) started = true;
+    if (baseline.origin && state.origin && state.origin !== baseline.origin) started = true;
     if (baseline.doc && state.doc && state.doc !== baseline.doc) started = true;
 
     const elapsed = Date.now() - startedAt;
@@ -2219,7 +3195,7 @@ async function waitForActionEffect(context, timeoutMs) {
     const complete = tabInfo.status === 'complete' || tabInfo.status === undefined;
 
     if (context.expect === 'nav') {
-      const navEvidence = changed.includes('url') || changed.includes('doc')
+      const navEvidence = changed.includes('url') || changed.includes('reload') || changed.includes('doc')
         || newTabIds.length > 0 || tabInfo.status === 'loading';
       const pageActivity = changed.length > 0;
       if (complete && url) {
@@ -2275,7 +3251,9 @@ async function waitForActionEffect(context, timeoutMs) {
 }
 
 async function settleAfterAction(tab, step, outcome, beforeState, beforeTabs) {
-  const expect = outcome.effect === 'nav' || outcome.effect === 'page' ? outcome.effect : 'none';
+  // download 不是页面内变化，但也不该套用“导航失败”的 nav=none 语义。
+  const expect = outcome.effect === 'download' ? 'page'
+    : outcome.effect === 'nav' || outcome.effect === 'page' ? outcome.effect : 'none';
   const context = {
     tabId: tab.id,
     action: step.action,
@@ -2290,6 +3268,7 @@ async function settleAfterAction(tab, step, outcome, beforeState, beforeTabs) {
     baseline: {
       url: beforeState.url || '',
       title: beforeState.title || '',
+      origin: beforeState.origin || 0,
       doc: beforeState.doc || '',
       refSeq: beforeState.refSeq || 0,
       nodes: beforeState.nodes || 0,
@@ -2383,12 +3362,17 @@ async function actTool(args) {
   const netBaseline = await networkMark(tab.id);
   let lastActionNetBaseline = netBaseline;
   try { await ensureConsoleHook(tab.id); } catch (_) { /* ignore */ }
+  // page_guard 在动作前安装，才能把这次点击触发的 alert/print/window.open 记录下来。
+  await ensurePageGuard(tab.id);
+  const guardSeq = await guardMark(tab.id);
   const results = [];
   const newTabIds = [];
   let lastSettle = null;
   let awaitedTargetTabId = null;
   let stoppedAt = null;
   let okCount = 0;
+  let downloadStarted = false;
+  let validationFailed = false;
 
   for (let index = 0; index < steps.length; index++) {
     const step = steps[index];
@@ -2449,11 +3433,14 @@ async function actTool(args) {
     const stepBefore = await pageState(tab.id);
     let tabsBefore = [];
     try { tabsBefore = await chrome.tabs.query({}); } catch (_) { /* ignore */ }
-    // waitFor 要匹配“上一步动作”产生的响应，baseline 必须在该动作之前取。
+    // waitFor 要匹配“上一步动作”产生的响应/导航，baseline 必须在该动作之前取。
     lastActionNetBaseline = await networkMark(tab.id);
+    lastActionNetBaseline.pageUrl = stepBefore.url || '';
+    lastActionNetBaseline.pageOrigin = stepBefore.origin || 0;
     let outcome;
     try {
       await ensureHelpers(tab.id);
+      if (step.selector) await requireValidSelector(tab.id, step.selector);
       outcome = await runStepWithRetry(tab, step);
     } catch (error) {
       await clearLastAct();
@@ -2489,6 +3476,9 @@ async function actTool(args) {
     }
     const settle = settled.settle;
     settle.nextUrl = outcome.nextUrl || '';
+    settle.action = step.action;
+    if (outcome.download) downloadStarted = true;
+    if (outcome.validation === 'failed') validationFailed = true;
     lastSettle = settle;
     for (const id of settle.newTabIds || []) {
       if (!newTabIds.includes(id)) newTabIds.push(id);
@@ -2533,8 +3523,33 @@ async function actTool(args) {
   const changed = [];
   if (before.url !== summaryUrl) changed.push('url');
   if (before.title !== title) changed.push('title');
+  // reload / 同 URL 导航：URL/title 可能完全一样，但 timeOrigin 变了。
+  if (before.origin && after.origin && before.origin !== after.origin) changed.push('reload');
   if (before.doc && after.doc && before.doc !== after.doc) changed.push('doc');
   if (newTabIds.length) changed.push('new_tab');
+  // settle 阶段观察到的 DOM/title 变化也要保留：SPA 链接不导航但有实际效果。
+  if (lastSettle && Array.isArray(lastSettle.changed)) {
+    for (const key of lastSettle.changed) {
+      if (!changed.includes(key)) changed.push(key);
+    }
+  }
+
+  // 这次动作产生的对话框/弹窗记录（来自页面主世界的 page_guard）。
+  const guardEvents = [];
+  const guardSeen = new Set();
+  const guardSources = [[tab.id, guardSeq]];
+  if (summaryTabId !== tab.id) guardSources.push([summaryTabId, 0]);
+  for (const [tabIdValue, since] of guardSources) {
+    for (const event of await guardSince(tabIdValue, since)) {
+      const key = `${event.kind}|${event.dialog || ''}|${event.url || ''}|${event.at || 0}`;
+      if (guardSeen.has(key)) continue;
+      guardSeen.add(key);
+      guardEvents.push(event);
+    }
+  }
+  const dialogs = guardEvents.filter(event => event.kind === 'dialog');
+  const popups = guardEvents.filter(event => event.kind === 'popup');
+  const blockedPopups = popups.filter(event => event.blocked);
 
   const lines = [...results, `ok=${okCount}/${steps.length}`];
   if (stoppedAt !== null) lines.push(`stopped=${stoppedAt} reason=pending`);
@@ -2547,15 +3562,50 @@ async function actTool(args) {
       lines.push(stoppedAt !== null
         ? `hint=stopped at step${stoppedAt}; add \`await 10s\` after it, or call \`ema2 await 10s\``
         : 'hint=page still navigating; call `ema2 await 10s` to keep waiting');
-    } else if (!batch && lastSettle.expect === 'page' && changed.length === 0) {
-      lines.push('hint=no navigation; if this starts async work, use `--wait-for` or `observe network`');
     } else if (lastSettle.expect === 'nav'
-        && !changed.includes('url')
-        && !changed.includes('new_tab')) {
-      // 点了导航意图但 URL / 新标签都没变：这是“动作执行了但没生效”，不是成功。
+        && !changed.includes('url') && !changed.includes('reload') && !changed.includes('doc')
+        && !changed.includes('new_tab') && !newTabIds.length) {
+      // 点了导航意图但 URL / document 身份 / 新标签都没变：动作执行了但没生效。
       lines.push('nav=none');
-      lines.push('hint=the click ran but the page did not navigate; the target may have been re-rendered - snapshot again and retry, or check console_errors');
+      const action = lastSettle.action || '';
+      if (action === 'back' || action === 'forward') {
+        lines.push(`hint=no history entry for ${action}; the page did not change`);
+      } else if (validationFailed) {
+        lines.push('hint=HTML5 validation blocked the submit; fill the required fields first');
+      } else if (dialogs.length) {
+        lines.push('hint=a dialog was opened and auto-dismissed; the page may require confirmation');
+      } else if (blockedPopups.length) {
+        lines.push('hint=the click tried to open a popup; see popup_blocked above');
+      } else if (changed.includes('dom') || changed.includes('title')) {
+        lines.push('hint=no navigation, but the page DOM/title changed; the action had an effect, do not retry it blindly');
+      } else {
+        lines.push('hint=the action ran but produced no navigation; snapshot/read before retrying, and do not blindly repeat a side-effecting action');
+      }
     }
+  }
+  for (const event of dialogs.slice(0, 3)) {
+    lines.push(`dialog_opened=${event.dialog || 'dialog'} handled=${event.handled || 'dismissed'}`
+      + (event.message ? ` msg=${oneLine(event.message).slice(0, 120)}` : ''));
+  }
+  if (dialogs.length) {
+    const onlyBeforeUnload = dialogs.every(event => event.dialog === 'beforeunload');
+    lines.push(onlyBeforeUnload
+      ? 'hint=beforeunload handler was suppressed; navigation will not show a browser confirmation'
+      : 'hint=dialog was auto-dismissed so the command could return; if the page needed confirmation, re-run only after checking the effect');
+  }
+  if (blockedPopups.length) {
+    lines.push(`popup_blocked=1 url=${shortText(blockedPopups[0].url || '', 120)}`);
+    lines.push('hint=window.open was blocked because the click was synthetic; open the popup URL directly with `ema2 open` instead of retrying the click');
+  } else if (popups.length) {
+    lines.push(`popup=1${popups[0].url ? ` url=${shortText(popups[0].url, 120)}` : ''}`);
+  }
+  if (downloadStarted) {
+    lines.push('download=started');
+    lines.push('hint=a download was started; check the browser Downloads folder (EMA2 cannot change the download directory)');
+  }
+  if (validationFailed) {
+    lines.push('validation=failed');
+    lines.push('hint=HTML5 form validation failed; fill the required fields or use a different submit path');
   }
   if (url) lines.push(`url=${url}`);
   if (title) lines.push(`title=${oneLine(title)}`);
@@ -2570,21 +3620,22 @@ async function actTool(args) {
   return lines.join('\n');
 }
 
-function shortPath(url) {
-  try {
-    const parsed = new URL(url);
-    return (parsed.pathname + parsed.search).slice(0, 100);
-  } catch (_) {
-    return String(url).slice(0, 100);
-  }
-}
 
-/** 等某个响应出现（url 子串 + 可选状态码），命中返回一行摘要。 */
+/** 等某个响应或页面导航出现（url 子串 + 可选状态码），命中返回一行摘要。 */
 async function waitForResponse(tabId, spec, baselineOverride) {
   await ensureNetworkHook(tabId);
   const wantUrl = spec.url ? String(spec.url).toLowerCase() : '';
   const wantStatus = typeof spec.status === 'number' ? spec.status : null;
   const timeoutMs = Math.max(0, Math.min(300000, Math.round((typeof spec.timeout === 'number' ? spec.timeout : 10) * 1000)));
+  const beforeUrl = baselineOverride && typeof baselineOverride === 'object' ? String(baselineOverride.pageUrl || '') : '';
+  const beforeOrigin = baselineOverride && typeof baselineOverride === 'object' ? Number(baselineOverride.pageOrigin) || 0 : 0;
+  let pageUrl = beforeUrl;
+  if (!pageUrl) {
+    try { pageUrl = (await chrome.tabs.get(tabId)).url || ''; } catch (_) { pageUrl = ''; }
+  }
+  const absoluteUrl = (value) => {
+    try { return new URL(String(value || ''), pageUrl).href; } catch (_) { return String(value || ''); }
+  };
   const current = await networkMark(tabId);
   let since = current.seq;
   let reset = false;
@@ -2602,6 +3653,24 @@ async function waitForResponse(tabId, spec, baselineOverride) {
   const deadline = Date.now() + timeoutMs;
   let uncertain = false;
   while (Date.now() < deadline) {
+    try {
+      const currentTab = await chrome.tabs.get(tabId);
+      if (currentTab && currentTab.url) pageUrl = currentTab.url;
+    } catch (_) { /* navigating */ }
+    // 页面导航本身也可以是 waitFor 的目标（慢导航不一定产生网络条目，
+    // 同 URL 表单提交甚至不会改 URL；用 timeOrigin 识别 reload）。
+    if (!wantStatus && wantUrl) {
+      try {
+        const tabInfo = await chrome.tabs.get(tabId);
+        const state = await pageState(tabId);
+        const href = state.url || tabInfo.url || '';
+        const navigated = (beforeUrl && href && href !== beforeUrl)
+          || (beforeOrigin && state.origin && state.origin !== beforeOrigin);
+        if (navigated && href && !isInternalUrl(href) && href.toLowerCase().includes(wantUrl)) {
+          return `nav=${href}`;
+        }
+      } catch (_) { /* tab may be navigating */ }
+    }
     // 导航/重定向期间 executeScript 可能瞬时失败；waitFor 应该继续等，而不是把整次 act 判失败。
     let scan = null;
     try {
@@ -2633,15 +3702,15 @@ async function waitForResponse(tabId, spec, baselineOverride) {
     }
     if (scan && scan.uncertain) uncertain = true;
     if (scan && scan.hit) {
-      return `response=${scan.hit.status} ${scan.hit.method} ${shortPath(scan.hit.url)} ${scan.hit.ms}ms${reset ? ' doc=reset' : ''}`;
+      return `response=${scan.hit.status} ${scan.hit.method} ${absoluteUrl(scan.hit.url)} ${scan.hit.ms}ms${reset ? ' doc=reset' : ''}`;
     }
     await sleep(120);
   }
   fail('response_timeout',
-    `no response matching ${wantUrl || '*'} ${wantStatus == null ? '' : wantStatus} within ${timeoutMs / 1000}s${uncertain ? ' observation_gap=status_unavailable' : ''}`,
+    `no response or navigation matching ${wantUrl || '*'} ${wantStatus == null ? '' : wantStatus} within ${timeoutMs / 1000}s${uncertain ? ' observation_gap=status_unavailable' : ''}`,
     uncertain
       ? 'the request happened before the hook was installed; use observe network or repeat the action after open/act installed the hook'
-      : 'call observe network to inspect requests, or raise waitFor.timeout');
+      : 'pass timeout=Ns inside --wait-for (max 30s), or call observe network to inspect requests');
 }
 
 async function runStepWithRetry(tab, step) {
@@ -2668,13 +3737,16 @@ async function pageState(tabId) {
     return await runInTab(tabId, () => ({
       url: location.href,
       title: (document.title || '').slice(0, 120),
+      // origin 是 navigation/reload 的硬证据：同 URL reload 时 doc 句柄可能暂时为空，
+      // 但 performance.timeOrigin 一定换新。pushState 不会改它。
+      origin: Number(performance.timeOrigin) || 0,
       refSeq: window.__ema2_ref_seq || 0,
       doc: window.__ema2_helpers ? window.__ema2_helpers.docEpoch() : '',
       nodes: document.getElementsByTagName('*').length,
       textLen: document.body ? (document.body.textContent || '').length : 0,
     }), []);
   } catch (_) {
-    return { url: '', title: '', refSeq: 0, doc: '', nodes: 0, textLen: 0 };
+    return { url: '', title: '', origin: 0, refSeq: 0, doc: '', nodes: 0, textLen: 0 };
   }
 }
 
@@ -2683,16 +3755,20 @@ async function newRefsSince(tabId, seq, epoch) {
     return await runInTab(tabId, (since, beforeEpoch) => {
       const helpers = window.__ema2_helpers;
       if (helpers && beforeEpoch && helpers.docEpoch() !== beforeEpoch) return [];
+      // ref 现在是页面内存表，不再写 DOM 属性；旧页面遗留属性作为兜底。
+      const entries = helpers && helpers.refEntries
+        ? helpers.refEntries(since)
+        : [...document.querySelectorAll('[data-ema2-ref]')].map((el) => ({
+          ref: el.getAttribute('data-ema2-ref'), el,
+        }));
       const out = [];
-      document.querySelectorAll('[data-ema2-ref]').forEach((el) => {
-        const ref = el.getAttribute('data-ema2-ref');
+      for (const { ref, el } of entries) {
         const parsed = helpers ? helpers.parseRef(ref) : null;
         const n = parsed ? parsed.seq : Number(String(ref).slice(1));
-        if (Number.isFinite(n) && n > since) {
-          const name = helpers ? helpers.nameOf(el) : (el.innerText || el.getAttribute('aria-label') || '');
-          out.push('[' + ref + '] ' + el.tagName.toLowerCase() + ' "' + String(name).replace(/\s+/g, ' ').trim().slice(0, 50) + '"');
-        }
-      });
+        if (!Number.isFinite(n) || n <= since) continue;
+        const name = helpers ? helpers.nameOf(el) : (el.innerText || el.getAttribute('aria-label') || '');
+        out.push('[' + ref + '] ' + el.tagName.toLowerCase() + ' "' + String(name).replace(/\s+/g, ' ').trim().slice(0, 50) + '"');
+      }
       return out.slice(0, 12);
     }, [seq, epoch || null]);
   } catch (_) {
@@ -2735,6 +3811,8 @@ function mapActionResult(step, result) {
     nextUrl: result.nextUrl || '',
     kind: result.kind || '',
     canRetry: !!result.canRetry,
+    validation: result.validation || '',
+    download: !!result.download,
   };
 }
 
@@ -2771,14 +3849,6 @@ async function runStep(tab, step) {
   }
 
   await ensureHelpers(tab.id);
-  if (action === 'fill') {
-    const fields = step.fields || [];
-    if (!Array.isArray(fields) || !fields.length) fail('missing_fields', 'fill requires fields[]', 'pass [{ref|selector,value}]');
-    // 写值不是幂等操作：重试会让 input/change 触发两次。
-    const result = await runInTab(tab.id, performActionInPage, [{ action: 'fill', fields }], undefined, 1);
-    return mapActionResult(step, result);
-  }
-
   const spec = {
     action,
     ref: step.ref || null,
@@ -2789,14 +3859,37 @@ async function runStep(tab, step) {
     key: String(step.key || ''),
     submit: !!step.submit,
   };
+  if (action === 'fill') {
+    const fields = step.fields || [];
+    if (!Array.isArray(fields) || !fields.length) fail('missing_fields', 'fill requires fields[]', 'pass [{ref|selector,value}]');
+    // 写值不是幂等操作：重试会让 input/change 触发两次。
+    const result = await runInTab(tab.id, performActionInPage, [{ action: 'fill', fields }], undefined, 1);
+    return mapActionResult(step, result);
+  }
+  // press/type 优先走 CDP 可信输入：Tab/Backspace/Enter/Ctrl+A 和 caret 插入
+  // 只有真实 Input.* 事件才具备浏览器默认行为。debugger 被占用时回退到合成事件。
+  if (action === 'press') {
+    const trusted = await pressViaDebugger(tab, step);
+    if (trusted) return mapActionResult(step, trusted);
+  }
+  if (action === 'type') {
+    const trusted = await typeViaDebugger(tab, step);
+    if (trusted) return mapActionResult(step, trusted);
+  }
   // 查找与执行在同一次页面注入内完成：目标被动态移除时不会假成功。
-  // attempts=1：type 是追加语义，executeScript 重试会把同一段文字输入两次。
+  // attempts=1：type 会改值，executeScript 重试会把同一段文字输入两次。
   const result = await runInTab(tab.id, performActionInPage, [spec], undefined, 1);
   return mapActionResult(step, result);
 }
 
 /** 在 MAIN world 里按 ref / selector / "role:name" 深度查找（含 shadow root / 同源 iframe）。 */
 function deepFindForDebugger(ref, selector, target) {
+  // helper 13 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
+  const helpers = window.__ema2_helpers;
+  if (helpers && typeof helpers.find === 'function') {
+    const found = helpers.find(ref || null, selector || null, target || null);
+    if (found) return found;
+  }
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
   const roleOf = (el) => {
     const role = el.getAttribute('role'); if (role) return role;
@@ -2904,6 +3997,7 @@ async function filesTool(args) {
       fail('missing_target', 'upload requires ref, selector or target', 'call snapshot and pass the file input ref');
     }
     await ensureHelpers(tab.id);
+    if (args.selector) await requireValidSelector(tab.id, args.selector);
     let targetRef = args.ref || null;
     if (targetRef) {
       // 短 ref（e12）先补成 e12@dX；完整 ref 必须通过当前文档校验。
@@ -3006,17 +4100,61 @@ async function filesTool(args) {
   fail('invalid_action', `unknown files action: ${action}`, 'use upload|download-dir');
 }
 
-function withDeadline(promise, ms, code, message) {
+function withDeadline(promise, ms, code, message, hint) {
   if (!Number.isFinite(ms) || ms <= 0) {
-    return Promise.reject(new ToolError(code, message, 'retry when the queue is free'));
+    return Promise.reject(new ToolError(code, message, hint || 'retry when the queue is free'));
   }
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new ToolError(code, message, 'terminate the long-running JS or retry later')), ms);
+    const timer = setTimeout(
+      () => reject(new ToolError(code, message, hint || 'terminate the long-running JS or retry later')),
+      ms,
+    );
     Promise.resolve(promise).then(
       value => { clearTimeout(timer); resolve(value); },
       error => { clearTimeout(timer); reject(error); },
     );
   });
+}
+
+/**
+ * 扩展侧 RPC watchdog。必须大于扩展自己正常的等待上限，否则会在
+ * `wait time 300s` / 20 步 act / batch 还没结束时先被这里掐断。
+ * 数值与 rust/src/tools.rs 的 timeout_for 保持同一数量级即可；
+ * daemon 侧仍然是最终兜底。
+ */
+function toolWatchdogMs(name, args) {
+  const value = args && typeof args === 'object' ? args : {};
+  const numberFrom = (source, key, fallback) => {
+    const number = Number(source && source[key]);
+    return Number.isFinite(number) ? Math.max(0, number) : fallback;
+  };
+  const seconds = (key, fallback) => numberFrom(value, key, fallback);
+  switch (name) {
+    case 'wait':
+      return Math.round((value.await ? seconds('timeout', 3) : seconds('time', seconds('timeout', 30))) * 1000) + 8000;
+    case 'open':
+      return Math.round(seconds('waitTimeout', 15) * 1000) + 14000;
+    case 'js':
+      return Math.round(seconds('timeout', JS_DEFAULT_TIMEOUT_MS / 1000) * 1000) + 12000;
+    case 'act': {
+      const steps = Array.isArray(value.steps) ? value.steps : [value];
+      let extra = 0;
+      for (const step of steps) {
+        if (!step || typeof step !== 'object') continue;
+        if (step.action === 'await') extra += numberFrom(step, 'timeout', 3) * 1000;
+        if (step.action === 'waitFor') extra += numberFrom(step, 'timeout', 10) * 1000;
+      }
+      if (value.waitFor && typeof value.waitFor === 'object') {
+        const waitTimeout = Number(value.waitFor.timeout);
+        extra += (Number.isFinite(waitTimeout) ? Math.max(0, waitTimeout) : 10) * 1000;
+      }
+      return 70000 + steps.length * 3000 + extra;
+    }
+    case 'batch':
+      return 620000;
+    default:
+      return TOOL_WATCHDOG_MS;
+  }
 }
 
 async function abortDebuggerEvaluation(tabId) {
@@ -3127,7 +4265,13 @@ async function compileProbe(tabId, expression) {
     });
     if (response && response.exceptionDetails) {
       const details = response.exceptionDetails;
-      return { ok: false, message: details.text || (details.exception && details.exception.description) || 'syntax error' };
+      // description 才是带 `SyntaxError: Unexpected token ...` 的完整文本；
+      // text 往往只有 "Uncaught"。
+      return {
+        ok: false,
+        message: (details.exception && details.exception.description)
+          || details.text || 'syntax error',
+      };
     }
     return { ok: true };
   } catch (error) {
@@ -3150,14 +4294,60 @@ function evaluateInTab(tabId, expression) {
   });
 }
 
+function jsTimeoutMs(args) {
+  const seconds = Number(args && args.timeout);
+  const value = Number.isFinite(seconds) ? seconds * 1000 : JS_DEFAULT_TIMEOUT_MS;
+  return Math.max(100, Math.min(JS_MAX_TIMEOUT_MS, Math.round(value)));
+}
+
+/** js 的统一输出：截断时给出明确标记；结构化值用可解析的 JSON 分片信封。 */
+function formatJsOutput(value, budget, cursor, extraLine) {
+  const isString = typeof value === 'string';
+  const raw = value === undefined ? 'undefined' : stringifyValue(value);
+  const slice = sliceText(raw, budget, cursor);
+  const lines = [];
+  if (slice.next != null && !isString && value !== undefined) {
+    // 直接把 JSON 从中间切断会得到非法 JSON；把切片包进合法信封，
+    // 并保留 next 让调用方用 cursor 继续。
+    lines.push(JSON.stringify({
+      ema2_truncated: true,
+      total: slice.total,
+      next: slice.next,
+      chunk: slice.text,
+    }));
+    lines.push(footer(slice.total, slice.text.length, slice.next));
+    lines.push('truncated=1');
+    lines.push('note=structured value is a chunk envelope; pass cursor=<next> to continue');
+  } else {
+    lines.push(slice.text);
+    if (slice.next != null) {
+      lines.push(footer(slice.total, slice.text.length, slice.next));
+      lines.push('truncated=1');
+    }
+  }
+  if (extraLine) lines.push(extraLine);
+  return lines.join('\n');
+}
+
 async function jsTool(args) {
   const tab = await resolveTab(args);
   if (isInternalUrl(tab.url)) fail('internal_page', 'browser internal pages cannot run JS', 'open an http(s) page');
+  // js 里也可能调用 alert/print；先装 guard，避免整个 tab 被同步对话框挂住。
+  await ensurePageGuard(tab.id);
+  // js 里的 console.* 也要能被后续 observe console 看到；open 超时跳过 hook 时尤其重要。
+  try { await ensureConsoleHook(tab.id); } catch (_) { /* non-http page */ }
   try {
     return await jsViaDebugger(tab.id, args);
   } catch (error) {
-    // 别的扩展占住 tab 的页面目标时 attach 会持续失败；js 是原语，不能跟着一起消失。
     if (!(error instanceof ToolError)) throw error;
+    // 无限循环/永不 resolve 的 Promise：withDebugger 已经 terminateExecution，
+    // 把内部的 debugger_timeout 映射成对 AI 更有意义的 script_timeout。
+    if (error.code === 'debugger_timeout') {
+      fail('script_timeout',
+        `JS did not finish within ${Math.round(jsTimeoutMs(args) / 1000)}s; execution was terminated`,
+        'simplify the expression, add --timeout, or use read/snapshot/wait instead of a long-running loop');
+    }
+    // 别的扩展占住 tab 的页面目标时 attach 会持续失败；js 是原语，不能跟着一起消失。
     if (error.code !== 'debugger_attach_failed' && error.code !== 'debugger_attach_timeout') throw error;
     return jsViaScripting(tab.id, args, error);
   }
@@ -3191,16 +4381,18 @@ async function jsViaDebugger(tabId, args) {
       const message = details.exception && details.exception.description || details.text || 'JS error';
       fail('js_exception', oneLine(message).slice(0, 300), jsErrorHint(false));
     }
-    const value = result.result ? result.result.value : undefined;
-    const budget = normalizeBudget(args.budget === undefined ? 8000 : args.budget);
-    const slice = sliceText(value === undefined ? 'undefined' : stringifyValue(value), budget, 0);
-    const lines = [slice.text];
-    if (slice.next != null) lines.push(footer(slice.total, slice.text.length, slice.next));
-    if (ranAsBody && value === undefined) {
-      lines.push('note=ran as an async function body; add `return <value>` to get a value back');
+    let value = result.result ? result.result.value : undefined;
+    // returnByValue 会把 DOM 节点变成 {}；至少回一个可读的节点描述。
+    if (value === undefined && result.result && result.result.objectId) {
+      value = result.result.description || String(result.result.className || 'object');
     }
-    return lines.join('\n');
-  });
+    const budget = normalizeBudget(args.budget === undefined ? 8000 : args.budget);
+    const cursor = normalizeCursor(args.cursor);
+    const extra = ranAsBody && value === undefined
+      ? 'note=ran as an async function body; add `return <value>` to get a value back'
+      : '';
+    return formatJsOutput(value, budget, cursor, extra);
+  }, { timeoutMs: jsTimeoutMs(args), queueWaitMs: jsTimeoutMs(args) + 5000 });
 }
 
 /** 在页面 MAIN world 里执行源码；函数在扩展页被序列化，eval 发生在页面侧。 */
@@ -3267,54 +4459,76 @@ async function jsViaScripting(tabId, args, attachError) {
       jsErrorHint(!!payload.syntax));
   }
   const value = payload.value;
-  const text = value === undefined ? 'undefined' : stringifyValue(value);
-  const slice = sliceText(text, budget, 0);
-  const lines = [slice.text];
-  if (slice.next != null) lines.push(footer(slice.total, slice.text.length, slice.next));
-  lines.push('via=scripting');
-  return lines.join('\n');
+  const cursor = normalizeCursor(args.cursor);
+  return formatJsOutput(value, budget, cursor,
+    'via=scripting (debugger unavailable; this path cannot be interrupted by --timeout)');
 }
 
 function stringifyValue(value) {
   if (typeof value === 'string') return value;
+  if (value && typeof value === 'object' && value.nodeType === 1) {
+    const html = value.outerHTML ? String(value.outerHTML) : String(value);
+    return html.slice(0, 2000);
+  }
+  if (typeof value === 'function') return String(value);
   try { return JSON.stringify(value); } catch (_) { return String(value); }
 }
 
 function buildHar(items, pageUrl) {
-  const now = new Date().toISOString();
-  const entries = items.map(entry => ({
-    startedDateTime: now,
-    time: entry.ms || 0,
-    request: {
-      method: entry.method || 'GET',
-      url: entry.url,
-      httpVersion: 'HTTP/1.1',
-      headers: [],
-      queryString: [],
-      cookies: [],
-      headersSize: -1,
-      bodySize: -1,
-    },
-    response: {
-      status: entry.status,
-      statusText: '',
-      httpVersion: 'HTTP/1.1',
-      headers: [],
-      cookies: [],
-      content: { size: (entry.body || '').length, mimeType: 'text/plain', text: entry.body || '' },
-      redirectURL: '',
-      headersSize: -1,
-      bodySize: -1,
-    },
-    cache: {},
-    timings: { send: 0, wait: entry.ms || 0, receive: 0 },
-    _resourceType: entry.type || 'fetch',
+  const now = Date.now();
+  const toHeaders = (list) => (Array.isArray(list) ? list : []).map(item => ({
+    name: String(item.name || ''),
+    value: String(item.value || ''),
   }));
+  const entries = items.map(entry => {
+    let absolute = String(entry.url || '');
+    try { absolute = new URL(absolute, pageUrl || 'about:blank').href; } catch (_) { /* keep raw */ }
+    let queryString = [];
+    try { queryString = [...new URL(absolute).searchParams].map(([name, value]) => ({ name, value })); } catch (_) { /* ignore */ }
+    const requestHeaders = toHeaders(entry.requestHeaders);
+    const responseHeaders = toHeaders(entry.responseHeaders);
+    const contentType = responseHeaders.find(item => item.name.toLowerCase() === 'content-type');
+    const mimeType = entry.mimeType
+      || (contentType ? String(contentType.value).split(';')[0].trim() : '')
+      || 'text/plain';
+    const body = String(entry.body || '');
+    const started = Number(entry.startedAt) || now;
+    return {
+      startedDateTime: new Date(started).toISOString(),
+      time: entry.ms || 0,
+      request: {
+        method: entry.method || 'GET',
+        url: absolute,
+        httpVersion: 'HTTP/1.1',
+        headers: requestHeaders,
+        queryString,
+        cookies: [],
+        headersSize: -1,
+        bodySize: -1,
+      },
+      response: {
+        status: Number(entry.status) || 0,
+        statusText: '',
+        httpVersion: 'HTTP/1.1',
+        headers: responseHeaders,
+        cookies: [],
+        content: { size: body.length, mimeType, text: body },
+        redirectURL: '',
+        headersSize: -1,
+        bodySize: body.length,
+      },
+      cache: entry.fromCache ? { fromCache: true } : {},
+      timings: { send: 0, wait: entry.ms || 0, receive: 0 },
+      _resourceType: entry.type || 'fetch',
+      ...(entry.ip ? { serverIPAddress: entry.ip } : {}),
+    };
+  });
+  const first = items.length && Number(items[0].startedAt) ? Number(items[0].startedAt) : now;
   return {
     log: {
       version: '1.2',
       creator: { name: 'EMA2', version: chrome.runtime.getManifest().version },
-      pages: [{ startedDateTime: now, id: 'page', title: '', pageTimings: {} }],
+      pages: [{ startedDateTime: new Date(first).toISOString(), id: 'page', title: '', pageTimings: {} }],
       entries,
     },
   };
@@ -3322,7 +4536,7 @@ function buildHar(items, pageUrl) {
 
 function validateBatchInner(toolName, inner) {
   if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
-    fail('invalid_argument', 'batch args must be an object', 'see docs/TOOLS.md');
+    fail('invalid_argument', 'batch args must be an object', 'see `ema2 <command> --help` (docs/TOOLS.md in the repo)');
   }
   const has = (key) => inner[key] !== undefined && inner[key] !== null;
   const numberIn = (key, min, max) => {
@@ -3399,7 +4613,7 @@ async function batchTool(args) {
   }
   const inner = args.args === undefined ? {} : args.args;
   if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
-    fail('invalid_argument', 'batch args must be an object', 'see docs/TOOLS.md');
+    fail('invalid_argument', 'batch args must be an object', 'see `ema2 <command> --help` (docs/TOOLS.md in the repo)');
   }
   if (urls.length) {
     // 复合模式的内层参数属于目标工具；open 自身只接受 wait/replace/reuse。
@@ -3516,13 +4730,24 @@ async function requireActiveShotTab(tab) {
   if (!active || active.id !== tab.id) {
     fail('tab_not_active',
       `tab ${tab.id} is not the active tab in window ${tab.windowId}`,
-      'call tabs activate first; captureVisibleTab always captures the active tab');
+      'shot --tab auto-activates the tab; if it still fails, call tabs activate and keep Edge in the foreground');
   }
 }
 
 async function shotTool(args) {
   const tab = await resolveTab(args);
   const format = args.format === 'jpeg' ? 'jpeg' : 'png';
+  // `--tab` 语义：自动把目标标签/窗口提到前台，而不是让用户猜为什么永远失败。
+  let activated = false;
+  const active = await activeTabInWindow(tab.windowId);
+  if (!active || active.id !== tab.id) {
+    try {
+      await chrome.tabs.update(tab.id, { active: true });
+      await chrome.windows.update(tab.windowId, { focused: true });
+      activated = true;
+      await sleep(120);
+    } catch (_) { /* requireActiveShotTab 会给出稳定错误 */ }
+  }
   await requireActiveShotTab(tab);
   let marks = [];
   let marksText = '';
@@ -3555,12 +4780,17 @@ async function shotTool(args) {
   if (!match) fail('capture_empty', 'screenshot payload was empty', 'retry');
   if (!args.annotate) {
     const mime = 'image/' + (format === 'png' ? 'png' : 'jpeg');
-    return { content: [{ type: 'image', data: match[2], mimeType: mime }] };
+    const content = [];
+    if (activated) content.push({ type: 'text', text: `activated=1 tab=${tab.id}` });
+    content.push({ type: 'image', data: match[2], mimeType: mime });
+    return { content };
   }
   const dpr = await runInTab(tab.id, () => window.devicePixelRatio || 1, []).catch(() => 1);
   const annotated = await annotateScreenshot(dataUrl, marks, dpr, format);
   const content = [];
-  if (marks.length) content.push({ type: 'text', text: marksText + '\nmarks=' + marks.length });
+  const prefix = activated ? `activated=1 tab=${tab.id}\n` : '';
+  if (marks.length) content.push({ type: 'text', text: prefix + marksText + '\nmarks=' + marks.length });
+  else if (prefix) content.push({ type: 'text', text: prefix.trimEnd() });
   content.push({ type: 'image', data: annotated.base64, mimeType: annotated.mime });
   return { content };
 }
@@ -3704,6 +4934,7 @@ async function observeTool(args) {
         items: list.map(entry => ({
           seq: entry.seq, type: entry.type, method: entry.method, url: entry.url,
           status: entry.status, ms: entry.ms, body: entry.body, preview: entry.preview || 'done',
+          startedAt: entry.startedAt || 0, backfilled: !!entry.backfilled,
         })),
       };
     }, [since, args.filter || null, forceReset], 'MAIN').catch(() => null);
@@ -3723,24 +4954,64 @@ async function observeTool(args) {
     } else {
       pendingSeqs = items.filter(entry => entry.preview === 'pending').map(entry => entry.seq);
     }
+
+    // webRequest 提供页面 hook 装好之前的真实 status/headers/MIME；
+    // 页面 hook 提供响应体预览。按 method+URL（必要时 path+query）与时间邻近匹配。
+    const webRecords = getWebRequests(tab.id);
+    const pageUrl = tab.url || '';
+    const absoluteNetworkUrl = (value) => {
+      try { return new URL(String(value || ''), pageUrl).href; } catch (_) { return String(value || ''); }
+    };
+    const sameRequest = (record, entry) => {
+      if (String(record.method || '').toUpperCase() !== String(entry.method || '').toUpperCase()) return false;
+      if (record.url === entry.url) return true;
+      try {
+        const left = new URL(record.url);
+        const right = new URL(entry.url);
+        return left.pathname === right.pathname && left.search === right.search;
+      } catch (_) {
+        return false;
+      }
+    };
+    for (const entry of items) {
+      entry.url = absoluteNetworkUrl(entry.url);
+      const candidates = webRecords.filter(record => sameRequest(record, entry));
+      let match = null;
+      if (candidates.length) {
+        match = candidates[candidates.length - 1];
+        if (entry.startedAt) {
+          match = candidates.reduce((best, record) =>
+            Math.abs(record.startedAt - entry.startedAt) < Math.abs(best.startedAt - entry.startedAt)
+              ? record : best, match);
+        }
+      }
+      if (match) {
+        if (!(Number(entry.status) > 0) && Number(match.status) > 0) entry.status = match.status;
+        entry.startedAt = entry.startedAt || match.startedAt;
+        entry.requestHeaders = match.requestHeaders || [];
+        entry.responseHeaders = match.responseHeaders || [];
+        entry.mimeType = match.mimeType || '';
+        entry.fromCache = !!match.fromCache;
+        entry.ip = match.ip || '';
+      }
+      if (!entry.startedAt) entry.startedAt = Date.now();
+    }
+
     if (args.har) {
-      const har = buildHar(items, tab.url);
+      const har = buildHar(items, pageUrl);
       // HAR 是唯一允许超过 MAX_OUTPUT_CHARS 的 JSON 输出；必须用 content[] 返回，
       // 否则 toResult 的 capText 会把 JSON 截断成非法文件。
       return { content: [{ type: 'text', text: JSON.stringify(har) }] };
     }
     const records = items.map(entry => {
-      let path = entry.url;
-      try {
-        const parsed = new URL(entry.url);
-        path = (parsed.pathname + parsed.search).slice(0, 100);
-      } catch (_) { /* keep raw */ }
+      // 完整 URL 至少保留 host，跨域请求不能只剩 /foo；过长时明确给省略号。
+      const display = shortText(entry.url, 400);
       const body = entry.body ? ' body=' + oneLine(entry.body).slice(0, 200) : '';
       // 保留整条记录（method/status/url 始终有效），只把“body 还没读完”标出来。
       const streaming = entry.preview === 'pending' ? ' streaming=1' : '';
       return {
         seq: entry.seq,
-        line: `#${entry.seq} ${entry.method} ${entry.status} ${entry.ms}ms ${path}${body}${streaming}`,
+        line: `#${entry.seq} ${entry.method} ${entry.status} ${entry.ms}ms ${display}${body}${streaming}`,
       };
     });
     const page = paginateRecords(records, budget);
@@ -3768,6 +5039,7 @@ async function readTool(args) {
   await ensureHelpers(tab.id);
   const mode = args.mode || 'md';
   const selector = args.selector;
+  if (selector) await requireValidSelector(tab.id, selector);
   const budget = normalizeBudget(args.budget);
   const cursor = normalizeCursor(args.cursor);
   const useMain = args.main !== false && !selector;
@@ -3799,6 +5071,7 @@ async function readTool(args) {
       textLength,
       bodyLength,
       header: 'url=' + location.href + '\ntitle=' + helpers.clean(document.title)
+        + '\nmode=' + modeName
         + (mainSelector ? '\nmain=' + mainSelector : ''),
     };
   }, [mode, selector || null, useMain]).catch(() => null);
@@ -3808,8 +5081,10 @@ async function readTool(args) {
   }
   const slice = sliceText(data.text || '', budget, cursor);
   const parts = [data.header, slice.text, footer(slice.total, slice.text.length, slice.next)];
+  if (slice.next != null) parts.push('truncated=1');
   const hint = truncationHint('read', slice.total, slice.text.length, slice.next, cursor);
-  if (hint) parts.push(hint);
+  if (hint) parts.push(`hint=${hint.replace(/^hint=/, '')} (keep --mode ${mode})`);
+  if (cursor > 0) parts.push(`hint=cursor is a character offset for mode=${mode}; use the same mode when continuing`);
   if (data.mainFallback) {
     parts.push(`hint=main extraction too short (${data.textLength || 0} chars); fell back to body. Use --selector or --no-main to control this.`);
   }
@@ -3825,9 +5100,9 @@ async function snapshotTool(args) {
   const cursor = normalizeCursor(args.cursor);
   let data;
   try {
-    data = await runInTab(tab.id, (filterName, budgetValue, cursorValue, nearRef) => {
-      return window.__ema2_helpers.snapshot(filterName, budgetValue, cursorValue, nearRef);
-    }, [filter, budget, cursor, args.near || null]);
+    data = await runInTab(tab.id, (filterName, budgetValue, cursorValue, nearRef, showValues) => {
+      return window.__ema2_helpers.snapshot(filterName, budgetValue, cursorValue, nearRef, showValues);
+    }, [filter, budget, cursor, args.near || null, args.values === true || filter === 'form']);
   } catch (_) {
     fail('page_changed', 'the page navigated while taking the snapshot', 'retry after the page settles');
   }
@@ -3835,12 +5110,13 @@ async function snapshotTool(args) {
   const parts = [data.header];
   if (data.body) parts.push(data.body);
   parts.push(footer(data.total, data.shown, data.next));
+  if (data.next != null) parts.push('truncated=1');
   const hint = truncationHint('snapshot', data.total, data.shown, data.next, cursor, 'refs');
   if (hint) parts.push(hint);
   const refs = Number((/refs=(\d+)/.exec(data.header) || [])[1] || 0);
   const visual = Number((/visual=(\d+)/.exec(data.header) || [])[1] || 0);
   if (refs === 0 && visual > 0) {
-    parts.push('hint=page looks visual (canvas/img); try shot annotate=true, or read the DOM with js');
+    parts.push('hint=page looks visual (canvas/img); try `ema2 shot --annotate`, or read the DOM with js');
   }
   return parts.join('\n');
 }
@@ -3850,14 +5126,14 @@ async function snapshotTool(args) {
 function requireStringArg(args, key, max, allowEmpty) {
   if (args[key] === undefined) return undefined;
   if (typeof args[key] !== 'string' || args[key].length > max || (!allowEmpty && !args[key].trim())) {
-    fail('invalid_argument', `${key} must be a string (max ${max})`, 'see docs/TOOLS.md');
+    fail('invalid_argument', `${key} must be a string (max ${max})`, 'see `ema2 <command> --help` (docs/TOOLS.md in the repo)');
   }
   return args[key];
 }
 
 async function executeTool(name, args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
-    fail('invalid_arguments', 'tool arguments must be an object', 'see docs/TOOLS.md');
+    fail('invalid_arguments', 'tool arguments must be an object', 'see `ema2 <command> --help` (docs/TOOLS.md in the repo)');
   }
   switch (name) {
     case 'tabs': return tabsTool(args);
@@ -3915,6 +5191,12 @@ async function migrateSettings() {
   } catch (_) { /* storage 不可用时仍按默认端口连接 */ }
 }
 
+registerWebRequestListeners();
+chrome.tabs.onRemoved.addListener((tabId) => {
+  observedConsoleDocs.delete(tabId);
+  observedNetworkDocs.delete(tabId);
+  webRequestLog.delete(tabId);
+});
 ensureWatchdog();
 connect();
 chrome.runtime.onStartup.addListener(() => { ensureWatchdog(); connect(); });

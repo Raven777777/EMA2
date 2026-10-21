@@ -201,7 +201,7 @@ cargo fmt --check
 一键验收：
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（59 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（83 项）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 
@@ -212,16 +212,19 @@ python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 
 - 网络 body 只是 ≤800 字符预览，HAR 是采样；不是完整抓包代理。
 - 跨域 iframe 不可遍历；`edge://` 等内置页不可脚本化。
-- 合成 `press` 不提供浏览器原生 Tab/组合键默认行为。
-- 截图要求目标 tab 是活动 tab 且窗口可见（最小化会失败）。
-- `js` 超时的 `Runtime.terminateExecution` 会终止目标 tab 的全部 JS 执行。
+- `press` 在 debugger 可用时是可信按键（Tab/Backspace/Enter/Ctrl+A 有浏览器默认行为）；
+  debugger 被占用时回退为合成事件（`trusted=0`）。
+- `shot --tab` 会自动激活目标标签；窗口最小化/不可见仍会失败。
+- `js` 默认 10s 执行上限（`--timeout` 可调）；超时的 `Runtime.terminateExecution` 会终止目标 tab 的全部 JS 执行。
+- `page_guard.js` 会把 `alert/confirm/prompt/print` 变成非阻塞记录并自动关闭；`confirm` 返回 false、
+  `prompt` 返回 null，依赖用户确认的流程要先检查 `dialog_opened=`。
 - `open status=` 依赖 `PerformanceNavigationTiming.responseStatus`（Chromium 109+）；
   Service Worker 缓存返回或 `--wait none` 时可能是 `unknown|pending`。
 - `files download-dir` 固定返回 `download_dir_unsupported`，下载目录需在
   `edge://settings/downloads` 手动设置；`files upload` 单次 ≤20 个文件、载荷 ≤5 MiB。
-- **前台要求**：窗口必须可见；`shot` 还要求目标 tab 是活动 tab。无头/后台窗口不支持。
-- `click`/`press` 是合成事件（`isTrusted=false`），校验 `isTrusted` 的站点会忽略；
-  浏览器级快捷键（`chrome.commands`）不可达。
+- **前台要求**：窗口必须可见；`shot --tab` 会自动激活目标标签。无头/后台窗口不支持。
+- `click` 仍是合成事件（`isTrusted=false`），校验 `isTrusted` 的站点会忽略；
+  `press` 的 CDP 按键不受此限制，但点击类副作用仍按合成点击处理。
 - **别的扩展的浮层 UI 不可点击**（密码管理器下拉、翻译面板）：EMA2 只能把它召唤出来，
   浮层内容在跨扩展隔离的 iframe / closed shadow root 里。
 - `read --mode md` 是有损渲染（标题/列表/表格/链接保留，样式与合并单元格丢失）。

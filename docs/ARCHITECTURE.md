@@ -75,7 +75,8 @@ EMA2 是**一个单文件 exe + 一个 MV3 扩展**。exe 既能以后台 daemon
 | `rust/src/tools.rs` | 11 个工具白名单 + 参数校验 + 超时预算 |
 | `rust/src/save.rs` | 截图/HAR 落盘，把 base64/JSON 换成 `path=` 行 |
 | `rust/src/paths.rs` | 默认端口、输出目录、临时 PID/日志路径 |
-| `extension/background.js` | 11 个工具实现、ref 快照、网络/console hook、debugger 队列、act settle/await 上下文 |
+| `extension/background.js` | 11 个工具实现、ref 快照、网络/console hook、webRequest 补齐、debugger 队列、act settle/await 上下文 |
+| `extension/page_guard.js` | MAIN world document_start：把 alert/confirm/prompt/print 变成非阻塞记录，记录 window.open 拦截 |
 | `extension/popup.html/js` | 端口输入、保存/重连、连接状态 |
 
 ## 单端口分流
@@ -124,7 +125,7 @@ CLI 参数
 ```
 
 - 工具超时预算在 `tools.rs`：wait = timeout+15s；open = waitTimeout+15s；
-  act = 60s + 每步最多 3s 的隐式 settle + 脚本 waitFor/await；js/shot/files=120s；
+  act = 60s + 每步最多 3s 的隐式 settle + 脚本 waitFor/await；js = --timeout(默认 10s)+15s；shot/files=120s；
   batch 按目标数/并发/内层工具估算，超过 600s 在执行前拒绝。
 - pending 表按扩展连接 generation 隔离；旧连接的迟到响应不会解决新请求。
 - CLI 中途断开时 `PendingGuard` 清掉 pending 条目。
@@ -183,6 +184,7 @@ CLI 参数
 `js` 默认走 debugger（`Runtime.evaluate`，`returnByValue` + `awaitPromise`），
 先用 `Runtime.compileScript` 做 compile-only 探测：表达式能编译就只执行一次，
 否则按 async 函数体执行；运行时 `SyntaxError` 绝不重跑（避免副作用执行两次）。
+默认 10s 执行上限（`--timeout` 可调），超时返回 `script_timeout` 并 `Runtime.terminateExecution`。
 
 当 `debugger.attach` 被拒（DevTools 占用，或 tab 里有**别的扩展**的页面目标）时：
 

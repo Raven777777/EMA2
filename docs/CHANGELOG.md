@@ -1,5 +1,38 @@
 # 变更记录
 
+## v2.3.0 — 真实环境 bug 报告修复：不再卡死、不再假成功
+
+针对 `bin/BUGREPORT.md` 的 20 项复现逐条修复；核心是“对话框/慢页面不能把会话卡死，动作结果必须可信”。
+
+- **阻止同步对话框卡死**：新增 `extension/page_guard.js`（MAIN world，document_start + 动作前注入），
+  把 `alert/confirm/prompt/print` 变成非阻塞记录并自动关闭；`act` 输出 `dialog_opened=`，
+  不再让 `executeScript`/CDP 永久挂起。所有 RPC 再加扩展侧 watchdog（`tool_timeout`）。
+- **open --timeout 是硬上限**：打开、等文档、装 hook、读 timing/focus 共用一个 deadline；
+  超时输出 `load=pending ... timed_out=1`，并做最终探测避免把已完成页面误报 pending。
+- **reload / 同 URL 导航判定**：`performance.timeOrigin` 加入 settle 证据，`act reload`、
+  同 URL 表单提交回 `changed=reload`，不再误报 `nav=none`；只有真正无变化才提示重试。
+- **可信按键与 caret**：`press` 走 CDP `Input.dispatchKeyEvent`（Tab/Backspace/Enter/Ctrl+A 等
+  浏览器默认行为），`type` 走 `Input.insertText` 按 caret/selection 插入；debugger 不可用时
+  回退并标 `trusted=0`。
+- **snapshot 保真**：href 用完整绝对 URL；name 截断带省略号；`role=search/banner/...` 地标容器
+  不再当控件；ref 改存页面内存 WeakRef，不再写 `data-ema2-ref`；`--values` 可选输出表单值。
+- **点击真实性**：点击前检查 visibility/inert/pointer-events/`elementFromPoint`，隐藏报
+  `not_clickable`、被遮罩报 `obscured`；`window.open` 被拦截回 `popup_blocked=1`，
+  `<a download>` 回 `download=started`，HTML5 校验失败回 `validation=failed`。
+- **失败原子性**：`select`/`fill` 失败恢复原值；`select multiple` 支持逗号分隔多选。
+- **js 超时/输出**：默认 10s 执行上限（`--timeout` 可调），超时 `script_timeout` + terminate；
+  截断回 `truncated=1`，对象/数组用合法 JSON 分片信封 + `--cursor`；保留完整 SyntaxError 文本；
+  DOM 节点不再变 `{}`。
+- **截图 iframe 坐标**：`shot --annotate` 给 iframe 内 ref 加偏移；`shot --tab` 自动激活目标标签。
+- **网络/HAR 真实性**：新增 `webRequest` 观测补齐首屏 status/headers/MIME，列表输出完整 URL，
+  HAR 使用绝对 URL、真实 headers/queryString/MIME/startedDateTime；页面 hook 回填
+  `responseStatus` 与 navigation 条目。
+- **无效 selector 分类**：`invalid_selector` 立即报错，不再等成 `wait_timeout`/`selector_not_found`。
+- **CLI/文档**：`tabs new` 默认激活（`--background` 才后台）；`batch` 支持位置参数 CODE/TEXT、
+  `--timeout`/`--values` 并显示内层 flags；`read` Markdown 转义/图片 alt；截断标记；
+  EPIPE 不再 panic；错误码/提示同步。
+- 版本：exe/扩展 2.3.0；helper 13；`cargo test` 68 passed；真机 verify 83 项。
+
 ## v2.2.2 — 状态隔离、输出完整性与参数真实性
 
 第二轮代码 review 的收口，全部围绕“不要静默成功 / 不要丢状态”。
@@ -27,6 +60,7 @@
 - **shutdown**：`notify_one` 保留 permit，避免 handler 早于 graceful future 注册时丢掉关闭信号。
 - **batch open 预算**：`tool=open` 的单次预算跟随内层 `waitTimeout`，不会再被固定 30s 提前掐断。
 - 版本：exe/扩展 2.2.2；helper 12；`cargo test` 68 passed；真机 verify 59 项。
+  （v2.3.0 起 helper 13，命令/错误码数量见 HANDOFF。）
 
 ## v2.2.1 — 动作可信度、请求限制与超时预算
 

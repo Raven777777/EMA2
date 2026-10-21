@@ -29,7 +29,7 @@ bin/ema2.exe act --script examples/form.ema2
 - 含空格的值用双引号；
 - `waitFor` 独立成行，挂在上一动作后；
 - `await 10s` 等上一个动作的导航/页面稳定；
-- `type` 追加，`fill` 覆盖。
+- `type` 在 caret/selection 处插入，`fill` 覆盖。
 
 ## batch-read.sh —— 一次读多个页面
 

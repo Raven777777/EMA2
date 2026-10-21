@@ -34,7 +34,7 @@ cargo fmt --check
 ```
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（59 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（83 项）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 
@@ -89,7 +89,7 @@ bin\ema2.exe status          # extension=connected
 | 5d | 本地短 `<main>` + 长 body | `main=body(fallback)` + `hint=main extraction too short` |
 | 5e | `read --mode html` | 仍是原始 HTML（允许 script/style） |
 | 6 | `ema2 snapshot` | `[e1@d1] ...`，无密码 value |
-| 7 | `ema2 act fill e2 "x"` / `type e2 "y"` | fill 覆盖、type 追加；`wrote=1 chars=N` |
+| 7 | `ema2 act fill e2 "x"` / `type e2 "y"` | fill 覆盖、type 在 caret 处插入；`wrote=1 chars=N` |
 | 8 | `ema2 act select e4 <value>` | select 的 value 生效 |
 | 9 | `ema2 act click e1` | 页面变化；旧完整 ref 报 `stale_ref` |
 | 9a | 点击 5s 才响应的链接 | `settle=pending`、`next_url=`、退出 0 |
@@ -99,7 +99,7 @@ bin\ema2.exe status          # extension=connected
 | 9e | `.ema2` 里 `click` 后写 `await 10s` | 每步 `ok`，最终仍在正确的新页面 |
 | 9f | 脚本里 pending 后不写 `await` | `ok=1/N`、`stopped=1 reason=pending`，不继续点 |
 | 9g | 点击一个不导航的 `<a href="#">` | `nav=none` + hint；`<a>` 只重试一次 |
-| 10 | `ema2 act click e6 --wait-for "url=api/save status=200 timeout=5s"` | `response=200 GET /api/save` |
+| 10 | `ema2 act click e6 --wait-for "url=api/save status=200 timeout=5s"` | `response=200 GET http://.../api/save` |
 | 11 | `ema2 wait text/selector/time/idle` | `ok=... elapsed=...s` |
 | 12 | `ema2 js '1+1'` / `ema2 js 'return 6*7'` / `--file` | `2` / `42` / 文件结果 |
 | 12a | 弹过密码管理器浮层的 tab 里 `ema2 js` | 结果 + `via=scripting`，不因 `debugger_attach_failed` 丢失 |
@@ -113,7 +113,7 @@ bin\ema2.exe status          # extension=connected
 | 20 | `ema2 shot --inline` | `data:image/png;base64,...` |
 | 21 | `ema2 batch read --urls "u1,u2"` | 两块，`---` 分隔，各自 `tab=` |
 | 22 | `ema2 batch open --urls "u1,u2"` | 并行开页，各自 `id=` |
-| 23 | `ema2 act --steps 'fill e2 "a"; type e2 "b"'` | 两步；type 追加 |
+| 23 | `ema2 act --steps 'fill e2 "a"; type e2 "b"'` | 两步；type 在 caret 处插入 |
 | 24 | `ema2 act --script flow.ema2` | 逐行执行，`waitFor` 在所在行执行；失败保留已完成 steps |
 | 25 | `ema2 open url --replace` / `--reuse session` / `--tab ID` | `reuse=replace/session/tabId` |
 | 25a | `ema2 open url --timeout 30` | 慢页面也能等到文档接位；超时输出 `load=pending` |

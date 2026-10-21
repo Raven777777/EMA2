@@ -85,9 +85,10 @@ fn main() {
             near,
             budget,
             cursor,
+            values,
         } => run_built(
             Ok(cli_args::build_snapshot(
-                tab, &filter, &near, budget, cursor,
+                tab, &filter, &near, budget, cursor, values,
             )),
             port,
         ),
@@ -106,7 +107,12 @@ fn main() {
             file,
             tab,
             budget,
-        } => run_built(cli_args::build_js(code.as_ref(), &file, tab, budget), port),
+            cursor,
+            timeout,
+        } => run_built(
+            cli_args::build_js(code.as_ref(), &file, tab, budget, cursor, timeout),
+            port,
+        ),
         cli_args::Command::Observe {
             kind,
             tab,
@@ -169,10 +175,10 @@ fn run_daemon(port: u16) -> ! {
 fn start_server(port: u16) -> i32 {
     if let Some(health) = health(port) {
         if is_ema2(&health) {
-            println!(
+            out_line(format!(
                 "relay=already_running pid={} port={port}",
                 json_u64(&health, "pid")
-            );
+            ));
             return 0;
         }
         return port_in_use(port);
@@ -234,11 +240,11 @@ fn start_server(port: u16) -> i32 {
     while Instant::now() < deadline {
         if let Some(health) = health(port) {
             if is_ema2(&health) {
-                println!(
+                out_line(format!(
                     "relay=running pid={} port={port} log={}",
                     json_u64(&health, "pid"),
                     log_path.display()
-                );
+                ));
                 return 0;
             }
             return port_in_use(port);
@@ -264,7 +270,7 @@ fn start_server(port: u16) -> i32 {
 fn stop_server(port: u16) -> i32 {
     if !port_alive(port) {
         cleanup_pid_file(port);
-        println!("relay=not_running port={port}");
+        out_line(format!("relay=not_running port={port}"));
         return 0;
     }
     let health_value = health(port);
@@ -284,7 +290,7 @@ fn stop_server(port: u16) -> i32 {
             && wait_until_down(port, Duration::from_secs(4))
         {
             cleanup_pid_file(port);
-            println!("relay=stopped port={port} pid={pid} forced=1");
+            out_line(format!("relay=stopped port={port} pid={pid} forced=1"));
             return 0;
         }
         eprintln!(
@@ -309,10 +315,10 @@ fn stop_server(port: u16) -> i32 {
     );
     if wait_until_down(port, Duration::from_secs(6)) {
         cleanup_pid_file(port);
-        println!(
+        out_line(format!(
             "relay=stopped port={port}{}",
             pid.map(|pid| format!(" pid={pid}")).unwrap_or_default()
-        );
+        ));
         return 0;
     }
 
@@ -322,7 +328,7 @@ fn stop_server(port: u16) -> i32 {
         && wait_until_down(port, Duration::from_secs(4))
     {
         cleanup_pid_file(port);
-        println!("relay=stopped port={port} pid={pid} forced=1");
+        out_line(format!("relay=stopped port={port} pid={pid} forced=1"));
         return 0;
     }
     eprintln!(
@@ -334,10 +340,10 @@ fn stop_server(port: u16) -> i32 {
 
 fn status(port: u16) -> i32 {
     let Some(health) = health(port).filter(is_ema2) else {
-        println!("relay=not_running port={port}");
+        out_line(format!("relay=not_running port={port}"));
         return 2;
     };
-    println!(
+    out_line(format!(
         "relay=running pid={} port={} uptime={}",
         json_u64(&health, "pid"),
         port,
@@ -347,7 +353,7 @@ fn status(port: u16) -> i32 {
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
         )
-    );
+    ));
     let extension = health.get("extension").cloned().unwrap_or(Value::Null);
     let connected = extension
         .get("connected")
@@ -363,16 +369,18 @@ fn status(port: u16) -> i32 {
         .map(|secs| format!("{secs}s"))
         .unwrap_or_else(|| "never".to_owned());
     if connected {
-        println!("extension=connected version={version} last_ping={last_ping}");
+        out_line(format!(
+            "extension=connected version={version} last_ping={last_ping}"
+        ));
     } else {
-        println!("extension=disconnected last_ping={last_ping}");
+        out_line(format!("extension=disconnected last_ping={last_ping}"));
     }
 
     if connected {
         let (tabs, active) = tabs_summary(port);
-        println!("tabs={tabs} active_tab={active}");
+        out_line(format!("tabs={tabs} active_tab={active}"));
     } else {
-        println!("tabs=unknown active_tab=unknown");
+        out_line("tabs=unknown active_tab=unknown");
     }
     0
 }
@@ -465,7 +473,7 @@ fn init_agents() -> i32 {
         );
         return 1;
     }
-    println!("path={}\naction={action}", path.display());
+    out_line(format!("path={}\naction={action}", path.display()));
     0
 }
 
@@ -476,7 +484,7 @@ fn run_built(call: Result<cli_args::ToolCall, String>, port: u16) -> i32 {
         Ok(call) => run_tool(call, port),
         Err(message) => {
             eprintln!(
-                "error=invalid_argument msg={} hint=see `ema2 <command> --help` or docs/TOOLS.md",
+                "error=invalid_argument msg={} hint=see `ema2 <command> --help` (or docs/TOOLS.md in the repo)",
                 one_line(&message)
             );
             1
@@ -505,13 +513,13 @@ fn run_tool(call: cli_args::ToolCall, port: u16) -> i32 {
                 return exit_for_error_text(&text);
             }
             if !text.is_empty() {
-                print!("{text}");
+                emit_stdout(&text);
                 if !text.ends_with('\n') {
-                    println!();
+                    emit_stdout("\n");
                 }
             }
             for image in images {
-                println!("{}", image);
+                out_line(image);
             }
             0
         }
@@ -755,6 +763,23 @@ fn print_log_tail(path: &Path) {
     for line in tail.into_iter().rev() {
         eprintln!("  {line}");
     }
+}
+
+/// 写入 stdout 并忽略 BrokenPipe（EPIPE）。
+///
+/// `println!`/`print!` 在管道提前关闭时会 panic（`shot --inline | head -c 20` → 101 +
+/// Rust backtrace）。CLI 的正常契约是“输出被消费方截断”不算错误，因此这里手动写
+/// 并吞掉错误，让进程以 0 退出。
+fn emit_stdout(text: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+}
+
+fn out_line(text: impl AsRef<str>) {
+    emit_stdout(text.as_ref());
+    emit_stdout("\n");
 }
 
 fn one_line(value: &str) -> String {

@@ -113,6 +113,28 @@ FIXTURE_SECOND = """<!doctype html>
 <a id="back" href="/">back home</a></body></html>
 """
 
+FIXTURE_BUGS = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>ema2 fixture bugs</title>
+<style>#ov{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99;display:none}</style>
+</head><body>
+<h1>Bug fixture</h1>
+<input id="a" value="abc"><input id="b">
+<input id="num" type="number" value="42">
+<select id="sel"><option value="v1">one</option><option value="v2" selected>two</option></select>
+<textarea id="area">secret</textarea>
+<a id="abs" href="https://example.org/x?a=1#f">abs</a>
+<a id="under" href="/second.html">under overlay</a>
+<button id="alert" type="button" onclick="alert('boom')">alert</button>
+<button id="print" type="button" onclick="window.print()">print</button>
+<button id="pop" type="button" onclick="window.open('/second.html')">popup</button>
+<form id="reqform" action="/second.html" method="get">
+  <input id="req" name="req" required>
+  <button id="req-submit" type="submit">submit required</button>
+</form>
+<div id="ov"></div>
+</body></html>
+"""
+
 
 class FixtureHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):  # 静默：验收输出只留 PASS/FAIL
@@ -141,6 +163,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._send(FIXTURE_SPA.encode())
         elif path == "/wait.html":
             self._send(FIXTURE_WAIT.encode())
+        elif path == "/bugs.html":
+            self._send(FIXTURE_BUGS.encode())
         elif path == "/slow":
             time.sleep(3)
             self._send(FIXTURE_HOME.encode())
@@ -553,6 +577,146 @@ def main() -> int:
             batch.returncode == 0 and batch.stdout.count("url=") >= 2 and "Second Page" in (batch.stdout or ""),
             (batch.stdout or "") + (batch.stderr or "")[-600:],
         )
+
+        # ---- bin/BUGREPORT.md regressions ----
+        bug_open = runner.run("open", f"{base}/bugs.html", "--replace", "--timeout", "5")
+        bug_out = (bug_open.stdout or "") + (bug_open.stderr or "")
+        bug_match = re.search(r"^id=(\d+)", bug_out, re.M)
+        runner.check(
+            "bug fixture opens",
+            bug_open.returncode == 0 and bug_match is not None,
+            bug_out[:1200],
+        )
+        bug_tab = bug_match.group(1) if bug_match else None
+
+        net = runner.run("observe", "network", "--filter", "bugs.html")
+        net_out = (net.stdout or "") + (net.stderr or "")
+        runner.check(
+            "page-load request has real status",
+            net.returncode == 0 and "bugs.html" in net_out and " 200 " in net_out and "-1" not in net_out,
+            net_out[:800],
+        )
+
+        links = runner.run("snapshot", "--filter", "links")
+        links_out = (links.stdout or "") + (links.stderr or "")
+        runner.check(
+            "snapshot href keeps scheme/query/fragment",
+            links.returncode == 0 and "href=https://example.org/x?a=1#f" in links_out
+            and "href=http://127.0.0.1:" in links_out,
+            links_out[:900],
+        )
+
+        form = runner.run("snapshot", "--filter", "form")
+        form_out = (form.stdout or "") + (form.stderr or "")
+        runner.check(
+            "snapshot --filter form exposes values (not password)",
+            form.returncode == 0 and "value=secret" in form_out and "value=v2" in form_out,
+            form_out[:1200],
+        )
+
+        runner.expect_ok("read textarea value", runner.run("read", "--selector", "#area", "--mode", "text"), "secret")
+
+        alert = runner.run("act", "click", "--selector", "#alert")
+        alert_out = (alert.stdout or "") + (alert.stderr or "")
+        runner.check(
+            "alert is recorded and dismissed",
+            alert.returncode == 0 and "dialog_opened=alert" in alert_out
+            and alert_out.count("dialog_opened=") == 1,
+            alert_out[:1200],
+        )
+        printing = runner.run("act", "click", "--selector", "#print")
+        print_out = (printing.stdout or "") + (printing.stderr or "")
+        runner.check(
+            "window.print is blocked",
+            printing.returncode == 0 and "dialog_opened=print" in print_out,
+            print_out[:900],
+        )
+        popup = runner.run("act", "click", "--selector", "#pop")
+        popup_out = (popup.stdout or "") + (popup.stderr or "")
+        runner.check(
+            "blocked window.open is reported",
+            popup.returncode == 0 and "popup_blocked=1" in popup_out,
+            popup_out[:900],
+        )
+        required = runner.run("act", "click", "--selector", "#req-submit")
+        required_out = (required.stdout or "") + (required.stderr or "")
+        runner.check(
+            "HTML5 validation is reported",
+            required.returncode == 0 and "validation=failed" in required_out,
+            required_out[:900],
+        )
+
+        runner.run("js", "document.getElementById('ov').style.display='block'")
+        obscured = runner.run("act", "click", "--selector", "#under")
+        runner.expect_error("overlay makes click obscured", obscured, "obscured", 4)
+        runner.run("js", "document.getElementById('ov').style.display='none'")
+
+        runner.expect_ok("fill caret setup", runner.run("act", "fill", "--selector", "#a", "abc"), "ok=fill")
+        runner.expect_ok(
+            "press Control+A is trusted",
+            runner.run("act", "press", "--selector", "#a", "Control+A"),
+            "trusted=1",
+        )
+        runner.expect_ok(
+            "type replaces selection at caret",
+            runner.run("act", "type", "--selector", "#a", "X"),
+            "trusted=1",
+        )
+        caret = runner.run("js", "return JSON.stringify(document.getElementById('a').value)")
+        runner.check("caret insertion replaced selection", '"X"' in (caret.stdout or ""), (caret.stdout or "") + (caret.stderr or ""))
+        runner.run("act", "press", "--selector", "#a", "Backspace")
+        erased = runner.run("js", "return JSON.stringify(document.getElementById('a').value)")
+        runner.check("trusted Backspace deletes", '""' in (erased.stdout or ""), (erased.stdout or "") + (erased.stderr or ""))
+        runner.run("act", "type", "--selector", "#a", "hello")
+        runner.run("act", "press", "--selector", "#a", "Tab")
+        focused = runner.run("js", "return document.activeElement.id")
+        runner.check("trusted Tab moves focus", "b" in (focused.stdout or "").strip(), (focused.stdout or "") + (focused.stderr or ""))
+
+        runner.expect_error(
+            "select failure restores selection",
+            runner.run("act", "select", "--selector", "#sel", "nope"),
+            "value_not_available",
+            4,
+        )
+        sel_kept = runner.run("js", "return document.getElementById('sel').value")
+        runner.check("select value survived failure", "v2" in (sel_kept.stdout or ""), (sel_kept.stdout or "") + (sel_kept.stderr or ""))
+        runner.expect_error(
+            "fill failure restores value",
+            runner.run("act", "fill", "--selector", "#num", "abc"),
+            "value_rejected",
+            4,
+        )
+        num_kept = runner.run("js", "return document.getElementById('num').value")
+        runner.check("number value survived failure", "42" in (num_kept.stdout or ""), (num_kept.stdout or "") + (num_kept.stderr or ""))
+
+        timed = runner.run("js", "--timeout", "1", "while(true){}")
+        runner.expect_error("js hard timeout", timed, "script_timeout", 4)
+        runner.expect_ok("js recovers after timeout", runner.run("js", "1+1"), "2")
+
+        new_tab = runner.run("tabs", "new", f"{base}/second.html")
+        new_out = (new_tab.stdout or "") + (new_tab.stderr or "")
+        new_match = re.search(r"^id=(\d+)", new_out, re.M)
+        current_tab = runner.run("tabs", "current")
+        runner.check(
+            "tabs new activates by default",
+            new_tab.returncode == 0 and new_match is not None
+            and f"id={new_match.group(1)}" in (current_tab.stdout or ""),
+            new_out + (current_tab.stdout or "") + (current_tab.stderr or ""),
+        )
+        if new_match:
+            runner.run("tabs", "close", new_match.group(1))
+
+        if bug_tab:
+            # 先切到一个新标签，确保 bug_tab 确实不是活动标签。
+            runner.run("open", f"{base}/second.html")
+            inactive_shot = tmp / "inactive-tab.png"
+            shot_tab = runner.run("shot", "--tab", bug_tab, "--out", str(inactive_shot))
+            shot_tab_out = (shot_tab.stdout or "") + (shot_tab.stderr or "")
+            runner.check(
+                "shot --tab activates an inactive tab",
+                shot_tab.returncode == 0 and "activated=1" in shot_tab_out and inactive_shot.exists(),
+                shot_tab_out[:900],
+            )
 
         runner.expect_error("unknown act flag", runner.run("act", "click", "--at", "10,20"), "invalid_argument", 1)
         runner.expect_error("non-ref positional", runner.run("act", "click", "not-a-ref"), "invalid_argument", 1)

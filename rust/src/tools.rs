@@ -22,8 +22,6 @@ pub const PAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 单次工具调用的产品总时长上限；超出时在调用前明确拒绝，而不是让 daemon 伪装成超时。
 pub const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MARGIN_SECS: f64 = 15.0;
-/// 扩展侧 debugger 任务本身的执行上限（全局串行队列）。
-const DEBUGGER_TASK_SECS: f64 = 60.0;
 const MAX_BUDGET: u64 = 200_000;
 const MAX_WAIT_SECS: f64 = 300.0;
 
@@ -45,10 +43,21 @@ pub fn timeout_for(name: &str, arguments: &Value) -> Duration {
             }
         }
         "act" => Duration::from_secs_f64(act_budget_seconds(arguments)),
-        "js" | "shot" | "files" => LONG_TIMEOUT,
+        // js 的 --timeout 是硬执行上限；中继预算必须跟着它走。
+        "js" => Duration::from_secs_f64(js_timeout_seconds(arguments) + RELAY_MARGIN_SECS),
+        "shot" | "files" => LONG_TIMEOUT,
         "batch" => batch_budget(arguments).min(MAX_CALL_TIMEOUT),
         _ => DEFAULT_TIMEOUT,
     }
+}
+
+/// js 执行上限（默认 10s，已由参数校验限制在 0.1..300）。
+fn js_timeout_seconds(arguments: &Value) -> f64 {
+    arguments
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .unwrap_or(10.0)
+        .clamp(0.1, 300.0)
 }
 
 /// open 等待文档接位的秒数（默认 15，已由参数校验限制在 1..60）。
@@ -187,7 +196,7 @@ fn batch_budget_seconds(arguments: &Value) -> f64 {
     let (per_call, open_cost) = match tool {
         "wait" => (wait_seconds(inner), opens > 0.0),
         "open" => (open_wait_seconds(inner) + 12.0, false),
-        "js" => (DEBUGGER_TASK_SECS, opens > 0.0),
+        "js" => (js_timeout_seconds(inner) + 8.0, opens > 0.0),
         _ => (DEFAULT_TIMEOUT.as_secs_f64(), opens > 0.0),
     };
     // 复合模式（urls + read/snapshot/js/wait）每个目标多一次 open；open 模式已计入 per_call。
@@ -286,6 +295,7 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             string_arg(object, "near", 32, false, true)?;
             budget_arg(object)?;
             cursor_arg(object)?;
+            bool_arg(object, "values")?;
         }
         "act" => {
             let has_steps = object
@@ -378,6 +388,12 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
             string_arg(object, "code", 100_000, true, false)?;
             tab_id(object)?;
             budget_arg(object)?;
+            cursor_arg(object)?;
+            if let Some(timeout) = number_arg(object, "timeout", false)?
+                && !(0.1..=300.0).contains(&timeout)
+            {
+                return Err("js timeout must be between 0.1 and 300 seconds".into());
+            }
         }
         "observe" => {
             enum_arg(object, "kind", &["console", "network"], true)?;
@@ -1081,6 +1097,11 @@ mod tests {
     fn js_and_observe_validation() {
         assert!(validate_arguments("js", &json!({ "code": "1+1" })).is_ok());
         assert!(validate_arguments("js", &json!({ "code": "  " })).is_err());
+        assert!(
+            validate_arguments("js", &json!({ "code": "1", "cursor": 10, "timeout": 5 })).is_ok()
+        );
+        assert!(validate_arguments("js", &json!({ "code": "1", "timeout": 0 })).is_err());
+        assert!(validate_arguments("js", &json!({ "code": "1", "timeout": 301 })).is_err());
         assert!(validate_arguments("observe", &json!({ "kind": "console" })).is_ok());
         assert!(validate_arguments("observe", &json!({ "kind": "dom" })).is_err());
         assert!(validate_arguments("observe", &json!({ "kind": "network", "since": -2 })).is_err());
@@ -1478,7 +1499,11 @@ mod tests {
             timeout_for("open", &json!({ "wait": "none", "waitTimeout": 60 })),
             DEFAULT_TIMEOUT
         );
-        assert_eq!(timeout_for("js", &json!({})), LONG_TIMEOUT);
+        assert_eq!(timeout_for("js", &json!({})), Duration::from_secs(25));
+        assert_eq!(
+            timeout_for("js", &json!({ "code": "1", "timeout": 30 })),
+            Duration::from_secs(45)
+        );
         assert_eq!(timeout_for("shot", &json!({})), LONG_TIMEOUT);
         assert_eq!(timeout_for("batch", &json!({})), LONG_TIMEOUT);
         // batch open 的单次预算必须跟随内层 waitTimeout，而不是固定 30s。
@@ -1530,7 +1555,8 @@ mod tests {
             ),
             Duration::from_secs(95)
         );
-        // js 受全局 debugger 串行队列限制：声明并发 4 时仍按 1 计算波次。
+        // js 受全局 debugger 串行队列限制：声明并发 4 时仍按 1 计算波次；
+        // 单次预算跟随 args.timeout（默认 10s + 8s）。
         assert_eq!(
             timeout_for(
                 "batch",
@@ -1539,7 +1565,7 @@ mod tests {
                     "args": { "code": "1+1" }
                 })
             ),
-            Duration::from_secs(135)
+            Duration::from_secs(51)
         );
         assert_eq!(timeout_for("tabs", &json!({})), DEFAULT_TIMEOUT);
         assert_eq!(

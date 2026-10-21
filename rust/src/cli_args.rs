@@ -113,6 +113,9 @@ pub enum Command {
         budget: Option<u64>,
         #[arg(long)]
         cursor: Option<u64>,
+        /// 附带 text/textarea/select/file/contenteditable 的当前值
+        #[arg(long)]
+        values: bool,
     },
     /// 单步或多步操作：act click e12 / act --steps '...' / act --script run.ema2
     Act {
@@ -150,6 +153,12 @@ pub enum Command {
         tab: Option<u64>,
         #[arg(long)]
         budget: Option<u64>,
+        /// 从上次输出的 next 续读
+        #[arg(long)]
+        cursor: Option<u64>,
+        /// 执行上限秒数（默认 10，1..300）；超时会 terminateExecution
+        #[arg(long)]
+        timeout: Option<f64>,
     },
     /// console 增量 / network（真实状态码+响应体，HAR）
     Observe {
@@ -201,6 +210,16 @@ pub enum Command {
         out: Option<PathBuf>,
     },
     /// 多标签并发 open/read/snapshot/js/wait
+    #[command(after_help = "\
+目标工具 flags（与 --tab-ids/--urls 混用）：
+  read      --mode md|text|html  --selector S  --no-main  --budget N  --cursor N
+  snapshot  --filter F  --near REF  --budget N  --cursor N
+  js        --code CODE  --budget N  --cursor N  --timeout 10s
+            （也可以直接写位置参数 CODE）
+  wait      --text S | --text-gone S | --selector S | --time 5s | --timeout 30s | --idle
+            （也可以直接写位置参数 TEXT，等价于 --text）
+  open      --wait load|dom|none  --timeout 15
+")]
     Batch {
         /// `<tool>` 之后的所有 token：--tab-ids / --urls / --concurrency / --port
         /// 以及目标工具自己的 flags（如 read 的 --mode md）。
@@ -235,12 +254,15 @@ pub enum TabsCommand {
     },
     /// 当前活动标签页
     Current,
-    /// 新建标签页
+    /// 新建标签页并激活：tabs new <URL> [--background]
     New {
         url: String,
-        /// 顺带激活
+        /// 兼容旧写法：显式激活（默认就是激活）
         #[arg(long)]
         active: bool,
+        /// 在后台新建，不切换当前标签
+        #[arg(long)]
+        background: bool,
     },
     /// 关闭标签页（位置参数 id ≤8 个，或 --session）
     Close {
@@ -317,10 +339,16 @@ pub fn build_tabs(args: &TabsArgs) -> Result<ToolCall, String> {
             arguments
         }
         Some(TabsCommand::Current) => json!({ "action": "current" }),
-        Some(TabsCommand::New { url, active }) => json!({
+        Some(TabsCommand::New {
+            url,
+            active,
+            background,
+        }) => json!({
             "action": "new",
             "url": url,
-            "active": *active,
+            // 默认激活：AI 执行 `tabs new` 后紧接着 snapshot/act 时，
+            // 不应默默操作旧标签。只有 --background 才保持后台。
+            "active": *active || !*background,
         }),
         Some(TabsCommand::Close { ids, session }) => {
             if *session {
@@ -412,6 +440,7 @@ pub fn build_snapshot(
     near: &Option<String>,
     budget: Option<u64>,
     cursor: Option<u64>,
+    values: bool,
 ) -> ToolCall {
     let mut arguments = json!({});
     set_opt(&mut arguments, "tabId", tab);
@@ -419,6 +448,9 @@ pub fn build_snapshot(
     set_opt(&mut arguments, "near", near.clone());
     set_opt(&mut arguments, "budget", budget);
     set_opt(&mut arguments, "cursor", cursor);
+    if values {
+        arguments["values"] = json!(true);
+    }
     ToolCall::new("snapshot", arguments)
 }
 
@@ -480,6 +512,8 @@ pub fn build_js(
     file: &Option<PathBuf>,
     tab: Option<u64>,
     budget: Option<u64>,
+    cursor: Option<u64>,
+    timeout: Option<f64>,
 ) -> Result<ToolCall, String> {
     if code.is_none() == file.is_none() {
         return Err("js: pass the code inline or use --file, exactly one".into());
@@ -496,9 +530,18 @@ pub fn build_js(
     if source.trim().is_empty() {
         return Err("js: code must not be empty".into());
     }
+    if let Some(seconds) = timeout
+        && !(0.1..=300.0).contains(&seconds)
+    {
+        return Err(format!(
+            "js: --timeout must be 0.1..300 seconds, got {seconds}"
+        ));
+    }
     let mut arguments = json!({ "code": source });
     set_opt(&mut arguments, "tabId", tab);
     set_opt(&mut arguments, "budget", budget);
+    set_opt(&mut arguments, "cursor", cursor);
+    set_opt(&mut arguments, "timeout", timeout);
     Ok(ToolCall::new("js", arguments))
 }
 
@@ -833,6 +876,12 @@ fn parse_tool_flags(tool: &str, flags: &[String]) -> Result<Value, String> {
         match tool {
             "open" => match flag {
                 "--wait" => out["wait"] = json!(value!()),
+                "--timeout" => {
+                    let raw = value!();
+                    let seconds =
+                        parse_duration_secs(&raw).map_err(|error| format!("batch: {error}"))?;
+                    out["waitTimeout"] = json!(seconds);
+                }
                 "--replace" => {
                     out["replace"] = json!(true);
                     index += 1;
@@ -856,11 +905,28 @@ fn parse_tool_flags(tool: &str, flags: &[String]) -> Result<Value, String> {
                 "--near" => out["near"] = json!(value!()),
                 "--budget" => out["budget"] = numeric_flag("batch", flag, value!())?,
                 "--cursor" => out["cursor"] = numeric_flag("batch", flag, value!())?,
+                "--values" => {
+                    out["values"] = json!(true);
+                    index += 1;
+                }
                 _ => return Err(format!("batch: unknown flag {flag:?} for tool {tool}")),
             },
             "js" => match flag {
                 "--code" => out["code"] = json!(value!()),
                 "--budget" => out["budget"] = numeric_flag("batch", flag, value!())?,
+                "--cursor" => out["cursor"] = numeric_flag("batch", flag, value!())?,
+                "--timeout" => {
+                    let raw = value!();
+                    let seconds =
+                        parse_duration_secs(&raw).map_err(|error| format!("batch: {error}"))?;
+                    out["timeout"] = json!(seconds);
+                }
+                // 兼容 `batch js --urls u 'return document.title'`：
+                // 位置参数就是 code，不再报 unknown flag。
+                _ if !flag.starts_with('-') => {
+                    out["code"] = json!(flag);
+                    index += 1;
+                }
                 _ => return Err(format!("batch: unknown flag {flag:?} for tool {tool}")),
             },
             "wait" => match flag {
@@ -876,6 +942,11 @@ fn parse_tool_flags(tool: &str, flags: &[String]) -> Result<Value, String> {
                 }
                 "--idle" => {
                     out["idle"] = json!(true);
+                    index += 1;
+                }
+                // 位置参数 TEXT 等价于 --text。
+                _ if !flag.starts_with('-') => {
+                    out["text"] = json!(flag);
                     index += 1;
                 }
                 _ => return Err(format!("batch: unknown flag {flag:?} for tool {tool}")),
@@ -1888,6 +1959,28 @@ click target=\"button:提交\"
         .unwrap();
         assert_eq!(args_of(&call)["args"]["wait"], "dom");
 
+        // batch 的位置参数：js 的 code / wait 的 text 都允许直接写。
+        let call = build_batch(&[
+            "js".into(),
+            "--urls".into(),
+            "https://a.example/".into(),
+            "return document.title".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["args"]["code"], "return document.title");
+        let call =
+            build_batch(&["wait".into(), "--tab-ids".into(), "1".into(), "Done".into()]).unwrap();
+        assert_eq!(args_of(&call)["args"]["text"], "Done");
+        let call = build_batch(&[
+            "js".into(),
+            "--tab-ids".into(),
+            "1".into(),
+            "--code".into(),
+            "return 1".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["args"]["code"], "return 1");
+
         assert!(build_batch(&["act".into(), "--tab-ids".into(), "1".into()]).is_err());
         assert!(
             build_batch(&[
@@ -2088,6 +2181,29 @@ click target=\"button:提交\"
         assert_eq!(args_of(&call)["cursor"], 3);
 
         let call = build_tabs(&TabsArgs {
+            cmd: Some(TabsCommand::New {
+                url: "https://x.y".into(),
+                active: false,
+                background: false,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            args_of(&call)["active"],
+            true,
+            "tabs new must activate by default"
+        );
+        let call = build_tabs(&TabsArgs {
+            cmd: Some(TabsCommand::New {
+                url: "https://x.y".into(),
+                active: false,
+                background: true,
+            }),
+        })
+        .unwrap();
+        assert_eq!(args_of(&call)["active"], false);
+
+        let call = build_tabs(&TabsArgs {
             cmd: Some(TabsCommand::Close {
                 ids: vec![1, 2, 3],
                 session: false,
@@ -2184,9 +2300,22 @@ click target=\"button:提交\"
 
     #[test]
     fn js_forms() {
-        let call = build_js(Some(&"1+1".to_owned()), &None, None, None).unwrap();
+        let call = build_js(Some(&"1+1".to_owned()), &None, None, None, None, None).unwrap();
         assert_eq!(args_of(&call)["code"], "1+1");
 
-        assert!(build_js(None, &None, None, None).is_err());
+        let call = build_js(
+            Some(&"1+1".to_owned()),
+            &None,
+            None,
+            Some(500),
+            Some(200),
+            Some(5.0),
+        )
+        .unwrap();
+        assert_eq!(args_of(&call)["budget"], 500);
+        assert_eq!(args_of(&call)["cursor"], 200);
+        assert_eq!(args_of(&call)["timeout"], 5.0);
+        assert!(build_js(None, &None, None, None, None, None).is_err());
+        assert!(build_js(Some(&"1".to_owned()), &None, None, None, None, Some(0.0)).is_err());
     }
 }
