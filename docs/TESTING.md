@@ -34,7 +34,7 @@ cargo fmt --check
 ```
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（93 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（102 项）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 

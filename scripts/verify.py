@@ -140,6 +140,22 @@ FIXTURE_BUGS = """<!doctype html>
 """
 
 
+FIXTURE_VISIBLE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture visible</title></head>
+<body>
+<nav id="nav">nav-only-text <a href="/second.html">nav-link</a></nav>
+<main id="visible-main">
+<h1>Visible Main</h1>
+<p>main paragraph one has enough text to be selected as the main container. It mentions visible rendering, raw text, and the difference between cleaned article extraction and the browser innerText result.</p>
+<p>main paragraph two adds another sentence so the main container clearly dominates the page text.</p>
+<input id="visible-input" value="visible-value">
+<div style="display:none">hidden-text</div>
+<button id="visible-btn" type="button">visible button</button>
+</main>
+</body></html>
+"""
+
+
 class FixtureHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):  # 静默：验收输出只留 PASS/FAIL
         return
@@ -169,6 +185,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._send(FIXTURE_WAIT.encode())
         elif path == "/bugs.html":
             self._send(FIXTURE_BUGS.encode())
+        elif path == "/visible.html":
+            self._send(FIXTURE_VISIBLE.encode())
         elif path == "/slow":
             time.sleep(3)
             self._send(FIXTURE_HOME.encode())
@@ -487,6 +505,7 @@ def main() -> int:
             help_act[:1600],
         )
         runner.expect_ok("top-level help points to act help", runner.run("--help"), "ema2 act --help")
+        runner.expect_ok("read --help lists visible mode", runner.run("read", "--help"), "visible")
 
         # SPA 链接只改 DOM 不导航：应 settle=done + nav=none，而不是 pending。
         runner.run("open", f"{base}/spa.html")
@@ -613,6 +632,54 @@ def main() -> int:
             "batch reads both tabs",
             batch.returncode == 0 and batch.stdout.count("url=") >= 2 and "Second Page" in (batch.stdout or ""),
             (batch.stdout or "") + (batch.stderr or "")[-600:],
+        )
+
+        # ---- read --mode visible ----
+        runner.run("open", f"{base}/visible.html")
+        visible_main = runner.expect_ok(
+            "read visible follows the default main root",
+            runner.run("read", "--mode", "visible"),
+            "Visible Main",
+            "main paragraph one",
+        )
+        runner.check(
+            "visible main excludes nav",
+            "nav-only-text" not in visible_main,
+            visible_main[:800],
+        )
+        visible_body = runner.expect_ok(
+            "read visible --no-main reads the whole rendered page",
+            runner.run("read", "--mode", "visible", "--no-main"),
+            "nav-only-text",
+            "Visible Main",
+            "visible button",
+        )
+        runner.check(
+            "visible body excludes display:none text",
+            "hidden-text" not in visible_body,
+            visible_body[:1200],
+        )
+        visible_nav = runner.expect_ok(
+            "read visible --selector scopes to the subtree",
+            runner.run("read", "--mode", "visible", "--selector", "#nav"),
+            "nav-only-text",
+        )
+        runner.check(
+            "visible selector excludes main",
+            "Visible Main" not in visible_nav,
+            visible_nav[:600],
+        )
+        visible_input = runner.expect_ok(
+            "read visible returns control value",
+            runner.run("read", "--mode", "visible", "--selector", "#visible-input"),
+            "visible-value",
+        )
+        clean_text = runner.run("read", "--mode", "text")
+        clean_out = (clean_text.stdout or "") + (clean_text.stderr or "")
+        runner.check(
+            "clean text still excludes nav",
+            clean_text.returncode == 0 and "Visible Main" in clean_out and "nav-only-text" not in clean_out,
+            clean_out[:800],
         )
 
         # ---- bin/BUGREPORT.md regressions ----

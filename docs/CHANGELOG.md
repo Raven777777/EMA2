@@ -1,5 +1,17 @@
 # 变更记录
 
+## v2.4.0 — read --mode visible，md/text 共用遍历
+
+- **新增 `read --mode visible`**：直接返回所选 root 的 `innerText`，绕过 main 启发式和正文清洗；
+  复用现有 `--selector` / `--no-main` / 默认 main 选区，适合 ChatGPT 这类复杂 SPA。
+  它读渲染文本（包含滚动到视口外的已渲染内容），不是严格视口内；原生 PDF 查看器、canvas、
+  跨域 iframe 仍是盲区。
+- **md/text 合并内部遍历**：两套几乎相同的 DOM walker 合并为一次 block/inline 遍历 + 两个 renderer，
+  避免跳过规则以后只改一边；输出契约保持不变。
+- `html` 继续走 `root.innerHTML`；`visible` 走独立 `innerText` 路径。
+- 新增 `visible` 空文本 hint；文本/控件值和错误处理复用原 read 管线。
+- 版本：exe/扩展 2.4.0；helper 17；`cargo test` 71 passed；真机 verify 102 项。
+
 ## v2.3.1 — exe 自描述：脚本语法进 --help，AGENTS 保持简洁
 
 分发包只有 `ema2.exe` + `ema2 init` 生成的 `AGENTS.md`；本版把用户侧文档从仓库搬进 exe。

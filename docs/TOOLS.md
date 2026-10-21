@@ -16,7 +16,7 @@
 | `ema2 init` | 在当前目录写 AGENTS.md |
 | `ema2 tabs` | 列出 / 当前 / 新建 / 关闭 / 激活标签页 |
 | `ema2 open` | 打开 URL，回 `status=` / `net_hook=` |
-| `ema2 read` | 读页面为 `md\|text\|html`，支持 selector/budget/cursor |
+| `ema2 read` | 读页面为 `md\|text\|html\|visible`，支持 selector/budget/cursor |
 | `ema2 snapshot` | ref 快照 `[e12@d1] button "X"` |
 | `ema2 act` | click/type/fill/... 单步或批量脚本 |
 | `ema2 await` | 等上一个 act 动作的页面效果（导航/页面稳定） |
@@ -240,7 +240,7 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 ## read
 
 ```bash
-ema2 read [--tab ID] [--mode md|text|html] [--selector X] [--no-main] [--budget N] [--cursor N]
+ema2 read [--tab ID] [--mode md|text|html|visible] [--selector X] [--no-main] [--budget N] [--cursor N]
 ```
 
 - `--main` 默认开：按清洁后文本量/链接密度选正文容器，头部回 `main=<selector>`。
@@ -250,6 +250,11 @@ ema2 read [--tab ID] [--mode md|text|html] [--selector X] [--no-main] [--budget 
 - `text`/`md` 会跳过 `script/style/noscript/template/textarea/input/select/option`、
   nav/header/footer/aside/form 等页面壳，以及 `display:none`/`visibility:hidden`/
   `content-visibility` 的隐藏元素；`html` 仍是原始 HTML。
+- `visible` 直接返回所选 root 的 `innerText`：不跳过导航/页脚/表单等页面壳，也不做
+  Markdown/正文清洗；默认仍走 `main`，`--no-main` 读整页，`--selector` 读子树。
+  它读的是**渲染文本**（包含滚动到视口外的已渲染内容），不是严格视口内文本；
+  Edge 原生 PDF 查看器、canvas 和跨域 iframe 仍读不到。`text`/`md` 的内部遍历已合并，
+  `visible` 和 `html` 是独立的提取路径。
 - 正文遍历会进入 open shadow root（Web Component）；closed shadow root 仍不可见。
 - Markdown 按 `childNodes` 遍历，根节点直接文本、p/h1/pre、文本+块混排都不会漏字或重复。
 - `md` 是**有损**渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对URL)`，
@@ -260,7 +265,9 @@ ema2 read [--tab ID] [--mode md|text|html] [--selector X] [--no-main] [--budget 
 - `read --selector "#input"` 会返回控件当前值（input/textarea/select），不再总是 0 字符。
 - 尾部 `truncated=1` 明确表示还有内容；`--cursor` 是**字符偏移**，换 `--mode` 续读会错位，
   续读时保持同一个 mode（头部会回 `mode=`）。
-- 头部 `url/title[/main]`，正文，尾部 `total/shown/next`。
+- 头部 `url/title[/main]` 和 `mode=md|text|html|visible`，正文，尾部 `total/shown/next`。
+- 四种 mode 共用 `--selector` / `--no-main` / 默认 `main` 的选区，以及 budget/cursor；
+  换 mode 续读会错位，保持同一个 mode。
 - **被截断时尾部多一行** `hint=truncated: returned 4000 of 12345 chars; call read with --cursor 4000 to continue`：
   不要把这 4000 字当成全文，按提示传 `--cursor` 续读（长页面的 FAQ/页脚常在后半段）。
 

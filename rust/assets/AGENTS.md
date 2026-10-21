@@ -25,7 +25,7 @@ ema2 status      # relay=running / extension=connected
 | `ema2 init` | 在当前目录写/更新本文件 |
 | `ema2 tabs [list\|current\|new\|close\|activate]` | 标签页；`tabs new` 默认激活 |
 | `ema2 open <url> [--replace\|--reuse session\|--tab ID] [--timeout N]` | 打开 URL，回 `status=` / `net_hook=` / `focused=` |
-| `ema2 read [--mode md\|text\|html] [--selector X] [--budget N] [--cursor N]` | 读页面正文 |
+| `ema2 read [--mode md\|text\|html\|visible] [--selector X] [--budget N] [--cursor N]` | 读页面正文 |
 | `ema2 snapshot [--filter ...] [--values]` | ref 快照 `[e12@d1] button "X"`；href 是完整 URL |
 | `ema2 act <action> ...` / `--steps` / `--script x.ema2` | click/type/fill/select/press/hover/scroll/submit/back/forward/reload |
 | `ema2 await 10s` | 等上一个 act 动作的导航/页面稳定 |
@@ -44,6 +44,7 @@ ema2 status      # relay=running / extension=connected
 - 单步写 `ema2 act fill <ref> "<text>"`；`type` 按当前 caret/selection 插入（选中会替换），`fill` 覆盖整个值；`select` 的位置参数是 option 的 `value`，`<select multiple>` 可用逗号分隔多个 value。
 - `read` 默认清洁正文（跳过脚本/隐藏元素）；main 太短会回退 `main=body(fallback)` 并给 hint。
   `--mode md` 是有损渲染：标题/列表/表格/链接保留，样式与合并单元格会丢。
+  `--mode visible` 用 `innerText` 读渲染文本（含导航壳），适合复杂 SPA；默认仍受 main/selector 约束。
 - `act` 默认最多 settle 3s；返回 `settle=pending` 不是失败，接 `ema2 await 10s`。
   点了链接但没导航会给 `nav=none`（`<a>` 只自动重试一次，输出 `retried=1`）。
   `.ema2` 脚本里写 `await 10s`；pending 且下一步不是 await 时脚本会停止。

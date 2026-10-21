@@ -1110,7 +1110,7 @@ async function requireValidSelector(tabId, selector) {
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 14) {
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 17) {
     return { installed: false, handle: String(window.__ema2_doc_handle || '') };
   }
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
@@ -1604,222 +1604,308 @@ function installHelpers() {
     };
   };
 
-  /**
-   * 有损正文渲染：保留标题/列表/表格/代码块，链接写成 [text](href)。
-   * 不是可回写的 markdown（样式、合并单元格、脚本生成的内容会丢）。
-   */
-  const markdown = (root) => {
-    // 直接 read 一个控件时，md 也应返回当前值；否则 --selector "#text" 会是空。
-    if (root && ['INPUT', 'TEXTAREA', 'SELECT'].includes(root.tagName)) return plainText(root);
-    const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
-    const BLOCK = /^(DIV|SECTION|ARTICLE|P|UL|OL|LI|TABLE|THEAD|TBODY|TR|TD|TH|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|DL|DT|DD|FIGURE|FIGCAPTION|MAIN|HEADER|FOOTER|ASIDE|FORM|NAV)$/;
-    const blocks = [];
-    let buffer = '';
-    const flush = () => {
-      const text = clean(buffer);
-      if (text) blocks.push(text);
-      buffer = '';
-    };
-    const hrefOf = (el) => {
-      const raw = el.getAttribute('href') || '';
-      if (!raw || /^javascript:/i.test(raw) || raw === '#') return '';
-      // 同源 iframe 里的相对链接要按 iframe 的 baseURI 解析，不能用顶层 location。
-      const base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
-      try { return new URL(raw, base).href; } catch (_) { return raw; }
-    };
-    // 链接文字里的 ] 会提前闭合 markdown；URL 里的括号/空格会截断目标。
-    const escapeMdText = (value) => String(value).replace(/([\\\[\]])/g, '\\$1');
-    const escapeMdUrl = (value) => String(value)
-      .replace(/ /g, '%20')
-      .replace(/\(/g, '%28')
-      .replace(/\)/g, '%29')
-      .replace(/</g, '%3C')
-      .replace(/>/g, '%3E');
-    const srcOf = (el) => {
-      const raw = el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src') || '';
-      if (!raw) return '';
-      const base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
-      try { return new URL(raw, base).href; } catch (_) { return raw; }
-    };
-    const cellText = (cell) => clean(cell.innerText || cell.textContent || '').replace(/\|/g, '\\|');
-    const tableText = (table) => {
-      const rows = [...table.querySelectorAll('tr')]
-        .map(row => [...row.children]
-          .filter(cell => /^(TD|TH)$/.test(cell.tagName))
-          .map(cellText))
-        .filter(cells => cells.length);
-      if (!rows.length) return '';
-      const width = Math.max(...rows.map(cells => cells.length));
-      const pad = (cells) => [...cells, ...Array(Math.max(0, width - cells.length)).fill('')];
-      const head = pad(rows[0]);
-      const lines = [
-        '| ' + head.join(' | ') + ' |',
-        '| ' + head.map(() => '---').join(' | ') + ' |',
-      ];
-      for (const cells of rows.slice(1)) lines.push('| ' + pad(cells).join(' | ') + ' |');
-      return lines.join('\n');
-    };
-    // 行内节点：链接/行内代码/强调转成 markdown，其余退回纯文本。
-    const inline = (node) => {
-      if (node.nodeType === 3) return node.nodeValue || '';
-      if (node.nodeType !== 1) return '';
+  // ---------------------------------------------------------------- read 渲染
+  // md / text 共用一次 DOM 遍历，产出轻量 block/inline 结构；html 走 innerHTML，
+  // visible 直接使用浏览器渲染后的 innerText。三种来源共用 read 的选区、预算和游标。
+  const READ_SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
+  const READ_BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|DIV|DL|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/;
+
+  const hrefOf = (el) => {
+    const raw = el.getAttribute('href') || '';
+    if (!raw || /^javascript:/i.test(raw) || raw === '#') return '';
+    // 同源 iframe 里的相对链接要按 iframe 的 baseURI 解析，不能用顶层 location。
+    const base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
+    try { return new URL(raw, base).href; } catch (_) { return raw; }
+  };
+  // 链接文字里的 ] 会提前闭合 markdown；URL 里的括号/空格会截断目标。
+  const escapeMdText = (value) => String(value).replace(/([\\\[\]])/g, '\\$1');
+  const escapeMdUrl = (value) => String(value)
+    .replace(/ /g, '%20')
+    .replace(/\(/g, '%28')
+    .replace(/\)/g, '%29')
+    .replace(/</g, '%3C')
+    .replace(/>/g, '%3E');
+  const srcOf = (el) => {
+    const raw = el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src') || '';
+    if (!raw) return '';
+    const base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
+    try { return new URL(raw, base).href; } catch (_) { return raw; }
+  };
+  const controlValue = (root) => {
+    if (!root) return null;
+    if (root.tagName === 'INPUT') return String(root.value == null ? '' : root.value);
+    if (root.tagName === 'TEXTAREA') return String(root.value == null ? '' : root.value);
+    if (root.tagName === 'SELECT') {
+      return [...root.selectedOptions].map(option => option.value).join(',');
+    }
+    return null;
+  };
+  const cellText = (cell) => clean(cell.innerText || cell.textContent || '');
+  const tableRows = (table) => [...table.querySelectorAll('tr')]
+    .map(row => [...row.children]
+      .filter(cell => /^(TD|TH)$/.test(cell.tagName))
+      .map(cellText))
+    .filter(cells => cells.length);
+  const mdCell = (value) => String(value).replace(/\|/g, '\\|');
+
+  /** 单个不可再拆的行内节点；A/CODE/STRONG/EM 保持和旧 inline() 一样的原子语义。 */
+  const inlineNode = (el) => {
+    const tag = el.tagName;
+    if (tag === 'A') {
+      return {
+        t: 'link',
+        text: clean(el.innerText || el.textContent || ''),
+        href: hrefOf(el),
+      };
+    }
+    if (tag === 'IMG') {
+      return {
+        t: 'img',
+        alt: clean(el.getAttribute('alt') || el.getAttribute('aria-label') || el.getAttribute('title') || ''),
+        src: srcOf(el),
+      };
+    }
+    if (tag === 'CODE') return { t: 'code', text: clean(el.innerText || '') };
+    if (tag === 'STRONG' || tag === 'B') return { t: 'strong', text: clean(el.innerText || '') };
+    if (tag === 'EM' || tag === 'I') return { t: 'em', text: clean(el.innerText || '') };
+    return { t: 'text', v: '' };
+  };
+
+  /** 行内层：文本节点、BR、链接、图片、行内代码/强调；其他元素递归。 */
+  const inlineIn = (parent) => {
+    const out = [];
+    for (const node of parent.childNodes || []) {
+      if (node.nodeType === 3) {
+        out.push({ t: 'text', v: node.nodeValue || '' });
+        continue;
+      }
+      if (node.nodeType !== 1) continue;
       const el = node;
       const tag = el.tagName;
-      if (!tag || SKIP.test(tag)) return '';
-      if (!isReadVisible(el)) return '';
-      if (el.shadowRoot) return [...el.shadowRoot.childNodes].map(inline).join('');
-      if (tag === 'BR') return '\n';
-      if (tag === 'IMG') {
-        const alt = clean(el.getAttribute('alt') || el.getAttribute('aria-label') || el.getAttribute('title') || '');
-        const src = srcOf(el);
-        if (!src) return alt ? alt + ' ' : '';
-        return '![' + escapeMdText(alt) + '](' + escapeMdUrl(src) + ') ';
+      if (!tag || READ_SKIP.test(tag)) continue;
+      if (!isReadVisible(el)) continue;
+      if (el.shadowRoot) { out.push(...inlineIn(el.shadowRoot)); continue; }
+      if (tag === 'BR') { out.push({ t: 'br' }); continue; }
+      if (['A', 'IMG', 'CODE', 'STRONG', 'B', 'EM', 'I'].includes(tag)) {
+        out.push(inlineNode(el));
+        continue;
       }
-      if (tag === 'A') {
-        const text = escapeMdText(clean(el.innerText || el.textContent || ''));
-        const href = hrefOf(el);
-        if (!text) return href ? escapeMdUrl(href) + ' ' : '';
-        return href ? '[' + text + '](' + escapeMdUrl(href) + ') ' : text;
+      out.push(...inlineIn(el));
+    }
+    return out;
+  };
+
+  const listBlock = (el) => {
+    const ordered = el.tagName === 'OL';
+    const reversed = ordered && el.hasAttribute('reversed');
+    const parsedStart = Number.parseInt(el.getAttribute('start') || '', 10);
+    const items = [...el.children]
+      .filter(item => item.tagName === 'LI')
+      .map(li => {
+        const ownValue = Number.parseInt(li.getAttribute('value') || '', 10);
+        return {
+          inlines: inlineIn(li),
+          value: Number.isFinite(ownValue) ? ownValue : null,
+        };
+      });
+    return {
+      b: 'list',
+      ordered,
+      reversed,
+      start: Number.isFinite(parsedStart) ? parsedStart : null,
+      items,
+    };
+  };
+
+  /** 块级层：段落、标题、代码块、表格、列表；段落内部用 inlineIn。 */
+  const readBlocks = (root) => {
+    const blocks = [];
+    let pending = [];
+    const flush = () => {
+      if (pending.length) {
+        blocks.push({ b: 'p', inlines: pending });
+        pending = [];
       }
-      if (tag === 'CODE') {
-        const text = clean(el.innerText || '');
-        return text ? '`' + text + '`' : '';
-      }
-      if (tag === 'STRONG' || tag === 'B') {
-        const text = clean(el.innerText || '');
-        return text ? '**' + text + '**' : '';
-      }
-      if (tag === 'EM' || tag === 'I') {
-        const text = clean(el.innerText || '');
-        return text ? '*' + text + '*' : '';
-      }
-      return [...el.childNodes].map(inline).join('');
     };
     const walk = (parent) => {
-      // childNodes（而不是 children）确保根节点/混合结构中的直接文本不会丢失。
       for (const node of parent.childNodes || []) {
         if (node.nodeType === 3) {
-          buffer += node.nodeValue || '';
+          pending.push({ t: 'text', v: node.nodeValue || '' });
           continue;
         }
         if (node.nodeType !== 1) continue;
-        const child = node;
-        const tag = child.tagName;
-        if (!tag || SKIP.test(tag)) continue;
-        if (!isReadVisible(child)) continue;
-        if (child.shadowRoot) {
-          flush();
-          walk(child.shadowRoot);
-          flush();
+        const el = node;
+        const tag = el.tagName;
+        if (!tag || READ_SKIP.test(tag)) continue;
+        if (!isReadVisible(el)) continue;
+        if (el.shadowRoot) { flush(); walk(el.shadowRoot); flush(); continue; }
+        if (tag === 'BR') { pending.push({ t: 'br' }); continue; }
+        if (['A', 'IMG', 'CODE', 'STRONG', 'B', 'EM', 'I'].includes(tag)) {
+          pending.push(inlineNode(el));
           continue;
         }
-        if (tag === 'IMG') { buffer += inline(child); continue; }
-        if (!child.innerText && !child.querySelector('img,picture,video')) continue;
+        if (!el.innerText && !el.querySelector('img,picture,video')) continue;
         if (/^H[1-4]$/.test(tag)) {
-          const text = clean(child.innerText);
-          if (text) { flush(); blocks.push('#'.repeat(Number(tag[1])) + ' ' + text); }
+          flush();
+          const text = clean(el.innerText);
+          if (text) blocks.push({ b: 'h', level: Number(tag[1]), text });
           continue;
         }
         if (tag === 'PRE') {
-          const code = (child.innerText || '').replace(/^\n+/, '').replace(/\s+$/, '');
-          if (code.trim()) { flush(); blocks.push('```\n' + code + '\n```'); }
+          flush();
+          const code = (el.innerText || '').replace(/^\n+/, '').replace(/\s+$/, '');
+          if (code.trim()) blocks.push({ b: 'pre', text: code });
           continue;
         }
         if (tag === 'TABLE') {
-          const table = tableText(child);
-          if (table) { flush(); blocks.push(table); }
+          const rows = tableRows(el);
+          if (rows.length) { flush(); blocks.push({ b: 'table', rows }); }
           continue;
         }
         if (tag === 'UL' || tag === 'OL') {
           flush();
-          const items = [...child.children].filter(item => item.tagName === 'LI');
-          const reversed = tag === 'OL' && child.hasAttribute('reversed');
-          const parsedStart = Number.parseInt(child.getAttribute('start') || '', 10);
-          let number = Number.isFinite(parsedStart)
-            ? parsedStart
-            : (reversed ? items.length : 1);
-          const lines = [];
-          for (const li of items) {
-            const ownValue = Number.parseInt(li.getAttribute('value') || '', 10);
-            if (tag === 'OL' && Number.isFinite(ownValue)) number = ownValue;
-            const text = clean([...li.childNodes].map(inline).join(' '));
-            if (text) lines.push((tag === 'OL' ? number + '. ' : '- ') + text);
-            if (tag === 'OL') number += reversed ? -1 : 1;
-          }
-          if (lines.length) blocks.push(lines.join('\n'));
+          const list = listBlock(el);
+          if (list.items.length) blocks.push(list);
           continue;
         }
-        // 块级元素本身就是段落边界：两个连续 <p> 不能粘成一段。
-        // （以前只判断“子元素里有块”，纯文本的 <p> 会被直接追加到 buffer。）
-        if (BLOCK.test(tag)) {
+        if (READ_BLOCK.test(tag)) {
           flush();
-          walk(child);
+          walk(el);
           flush();
           continue;
         }
-        buffer += inline(child);
+        pending.push(...inlineIn(el));
       }
     };
-    if (root && root.tagName === 'IMG') return inline(root).trim();
+    if (root && ['A', 'IMG', 'CODE', 'STRONG', 'B', 'EM', 'I'].includes(root.tagName)) {
+      return [{ b: 'p', inlines: [inlineNode(root)] }];
+    }
     if (root && root.shadowRoot) walk(root.shadowRoot);
     else walk(root);
     flush();
-    return blocks.join('\n\n');
+    return blocks;
   };
-  /** 清洁文本：跳过 script/style/noscript/iframe/媒体/导航等，块级边界换行。 */
+
+  const markdownInline = (nodes, separator = '') => nodes.map(node => {
+    switch (node.t) {
+      case 'text': return node.v;
+      case 'br': return '\n';
+      case 'link':
+        if (!node.text) return node.href ? escapeMdUrl(node.href) + ' ' : '';
+        return node.href
+          ? '[' + escapeMdText(node.text) + '](' + escapeMdUrl(node.href) + ') '
+          : escapeMdText(node.text);
+      case 'img':
+        if (!node.src) return node.alt ? escapeMdText(node.alt) + ' ' : '';
+        return '![' + escapeMdText(node.alt) + '](' + escapeMdUrl(node.src) + ') ';
+      case 'code': return node.text ? '`' + node.text + '`' : '';
+      case 'strong': return node.text ? '**' + node.text + '**' : '';
+      case 'em': return node.text ? '*' + node.text + '*' : '';
+      default: return '';
+    }
+  }).join(separator);
+
+  const markdown = (root) => {
+    // 直接 read 一个控件时，md 也应返回当前值；否则 --selector "#text" 会是空。
+    const control = controlValue(root);
+    if (control !== null) return control;
+    const out = [];
+    for (const block of readBlocks(root)) {
+      if (block.b === 'p') {
+        const text = clean(markdownInline(block.inlines));
+        if (text) out.push(text);
+      } else if (block.b === 'h') {
+        out.push('#'.repeat(block.level) + ' ' + block.text);
+      } else if (block.b === 'pre') {
+        out.push('```\n' + block.text + '\n```');
+      } else if (block.b === 'table') {
+        const width = Math.max(...block.rows.map(row => row.length));
+        const pad = (cells) => [...cells, ...Array(Math.max(0, width - cells.length)).fill('')];
+        const head = pad(block.rows[0]).map(mdCell);
+        const lines = [
+          '| ' + head.join(' | ') + ' |',
+          '| ' + head.map(() => '---').join(' | ') + ' |',
+        ];
+        for (const row of block.rows.slice(1)) {
+          lines.push('| ' + pad(row).map(mdCell).join(' | ') + ' |');
+        }
+        out.push(lines.join('\n'));
+      } else if (block.b === 'list') {
+        let number = block.start != null
+          ? block.start
+          : (block.reversed ? block.items.length : 1);
+        const lines = [];
+        for (const item of block.items) {
+          if (block.ordered && item.value != null) number = item.value;
+          // 列表项沿用旧行为：每个直接行内节点之间补一个空格。
+          const text = clean(markdownInline(item.inlines, ' '));
+          if (text) lines.push((block.ordered ? number + '. ' : '- ') + text);
+          if (block.ordered) number += block.reversed ? -1 : 1;
+        }
+        if (lines.length) out.push(lines.join('\n'));
+      }
+    }
+    return out.join('\n\n');
+  };
+
+  const textInline = (nodes) => {
+    const lines = [];
+    let parts = [];
+    const flush = () => {
+      const text = clean(parts.join(' '));
+      if (text) lines.push(text);
+      parts = [];
+    };
+    for (const node of nodes) {
+      if (node.t === 'br') { flush(); continue; }
+      const value = node.t === 'text' ? node.v
+        : node.t === 'link' ? node.text
+        : node.t === 'img' ? node.alt
+        : (node.text || '');
+      if (value) parts.push(value);
+    }
+    flush();
+    return lines;
+  };
+
   const plainText = (root) => {
     // `read --selector "#input"` 应该给出控件的当前值，而不是空字符串。
-    if (root && root.tagName === 'INPUT') return String(root.value == null ? '' : root.value);
-    if (root && root.tagName === 'TEXTAREA') return String(root.value == null ? '' : root.value);
-    if (root && root.tagName === 'SELECT') {
-      return [...root.selectedOptions].map(option => option.value).join(',');
-    }
-    const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|IFRAME|SVG|CANVAS|VIDEO|AUDIO|TEMPLATE|TEXTAREA|INPUT|SELECT|OPTION|NAV|HEADER|FOOTER|ASIDE|FORM)$/;
-    const BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|DIV|DL|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/;
+    const control = controlValue(root);
+    if (control !== null) return control;
     const lines = [];
-    let buffer = '';
-    const flush = () => {
-      const text = clean(buffer);
-      if (text) lines.push(text);
-      buffer = '';
-    };
-    const walk = (parent) => {
-      for (const node of parent.childNodes || []) {
-        if (node.nodeType === 3) {
-          buffer += (buffer ? ' ' : '') + (node.nodeValue || '');
-          continue;
+    for (const block of readBlocks(root)) {
+      if (block.b === 'p') {
+        lines.push(...textInline(block.inlines));
+      } else if (block.b === 'h') {
+        const text = clean(block.text);
+        if (text) lines.push(text);
+      } else if (block.b === 'pre') {
+        const text = clean(block.text);
+        if (text) lines.push(text);
+      } else if (block.b === 'table') {
+        for (const row of block.rows) {
+          for (const cell of row) {
+            const text = clean(cell);
+            if (text) lines.push(text);
+          }
         }
-        if (node.nodeType !== 1) continue;
-        const child = node;
-        const tag = child.tagName;
-        if (!tag || SKIP.test(tag)) continue;
-        if (tag === 'BR') { flush(); continue; }
-        if (!isReadVisible(child)) continue;
-        if (child.shadowRoot) {
-          flush();
-          walk(child.shadowRoot);
-          flush();
-          continue;
-        }
-        if (tag === 'IMG') {
-          const alt = clean(child.getAttribute('alt') || child.getAttribute('aria-label') || child.getAttribute('title') || '');
-          if (alt) buffer += (buffer ? ' ' : '') + alt;
-          continue;
-        }
-        if (!child.innerText) continue;
-        if (BLOCK.test(tag)) {
-          flush();
-          walk(child);
-          flush();
-          continue;
-        }
-        walk(child);
+      } else if (block.b === 'list') {
+        for (const item of block.items) lines.push(...textInline(item.inlines));
       }
-    };
-    if (root && root.shadowRoot) walk(root.shadowRoot);
-    else walk(root);
-    flush();
+    }
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  };
+
+  /** visible：浏览器渲染后的文本；不做正文清洗，默认仍受 read 的 main/selector 选区约束。 */
+  const visibleText = (root) => {
+    const control = controlValue(root);
+    if (control !== null) return control;
+    if (!root) return '';
+    try {
+      return String(root.innerText == null ? '' : root.innerText).trim();
+    } catch (_) {
+      return '';
+    }
   };
 
   /** iframe 内元素的 rect 是相对 iframe viewport 的；标注要换算到顶层截图坐标。 */
@@ -2063,11 +2149,11 @@ function installHelpers() {
   } catch (_) { /* ignore */ }
 
   window.__ema2_helpers = {
-    snapshot, markdown, plainText, mainRoot, find, refOf, refEntries, clean, candidates,
+    snapshot, markdown, plainText, visibleText, mainRoot, find, refOf, refEntries, clean, candidates,
     collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent,
     setValue, isActionableRole, absoluteHref,
   };
-  window.__ema2_helpers_version = 14;
+  window.__ema2_helpers_version = 17;
   return { installed: true };
 }
 
@@ -3907,7 +3993,7 @@ async function runStep(tab, step) {
 
 /** 在 MAIN world 里按 ref / selector / "role:name" 深度查找（含 shadow root / 同源 iframe）。 */
 function deepFindForDebugger(ref, selector, target) {
-  // helper 14 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
+  // helper 17 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
   const helpers = window.__ema2_helpers;
   if (helpers && typeof helpers.find === 'function') {
     const found = helpers.find(ref || null, selector || null, target || null);
@@ -5085,7 +5171,8 @@ async function readTool(args) {
       textLength = picked.textLength || 0;
       bodyLength = picked.bodyLength || 0;
     }
-    const text = modeName === 'html' ? root.innerHTML
+    const text = modeName === 'visible' ? helpers.visibleText(root)
+      : modeName === 'html' ? root.innerHTML
       : modeName === 'text' ? helpers.plainText(root)
       : helpers.markdown(root);
     return {
@@ -5110,6 +5197,9 @@ async function readTool(args) {
   if (cursor > 0) parts.push(`hint=cursor is a character offset for mode=${mode}; use the same mode when continuing`);
   if (data.mainFallback) {
     parts.push(`hint=main extraction too short (${data.textLength || 0} chars); fell back to body. Use --selector or --no-main to control this.`);
+  }
+  if (mode === 'visible' && !slice.total) {
+    parts.push('hint=visible text is empty; the page may render in canvas/PDF/cross-origin iframe; try js or shot --annotate');
   }
   return parts.join('\n');
 }

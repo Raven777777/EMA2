@@ -158,12 +158,16 @@ CLI 参数
 
 ## read 正文清洁
 
-- `text`/`md` 用 DOM 遍历取文本，跳过 script/style/noscript/template/textarea/input/select/option、
+- `text`/`md` 共用一次 DOM 遍历，产出 block/inline 中间结构，再由两个 renderer 输出；
+  两者都跳过 script/style/noscript/template/textarea/input/select/option、
   nav/header/footer/aside/form 等页面壳，以及 `display:none`/`visibility:hidden`/`content-visibility`
-  的隐藏元素；`html` 保持原始输出。
+  的隐藏元素。
+- `html` 保持 `root.innerHTML`；`visible` 直接取 `root.innerText`，不跑清洁遍历，
+  因此会包含导航/侧栏等渲染文本，但仍复用 main/selector/no-main 选区。
 - `mainRoot` 用清洁后的文本和链接密度评分；候选 <200 字符，或 body>2000 字符且候选不到 body 5%
   时回退 `main=body(fallback)`，并输出 `hint=main extraction too short (...)`。
 - `text`/`md` 遍历会进入 open shadow root；closed shadow root 仍不可见。
+  `visible` 的 shadow/iframe 覆盖范围由浏览器 `innerText` 决定，不作为契约。
 - `md` 是有损渲染：标题/列表/表格/代码块保留，链接写成 `[text](绝对URL)`，
   行内 code/strong/em 保留；样式、合并单元格、脚本生成内容会丢。
 - `mainRoot` 先按 `textContent` 长度门槛过滤，最多对 12 个候选跑清洁评分，避免大页面 CPU 峰值。

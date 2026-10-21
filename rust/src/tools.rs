@@ -278,7 +278,7 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
         }
         "read" => {
             tab_id(object)?;
-            enum_arg(object, "mode", &["md", "text", "html"], false)?;
+            enum_arg(object, "mode", &["md", "text", "html", "visible"], false)?;
             string_arg(object, "selector", 2_048, false, true)?;
             bool_arg(object, "main")?;
             budget_arg(object)?;
@@ -943,6 +943,7 @@ mod tests {
     fn read_and_snapshot_bounds() {
         assert!(validate_arguments("read", &json!({})).is_ok());
         assert!(validate_arguments("read", &json!({ "mode": "raw" })).is_err());
+        assert!(validate_arguments("read", &json!({ "mode": "visible" })).is_ok());
         assert!(validate_arguments("read", &json!({ "budget": 100 })).is_err());
         assert!(validate_arguments("read", &json!({ "cursor": -1 })).is_err());
         assert!(validate_arguments("read", &json!({ "main": false })).is_ok());

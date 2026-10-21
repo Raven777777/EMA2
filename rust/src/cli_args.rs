@@ -93,11 +93,11 @@ pub enum Command {
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<f64>,
     },
-    /// 读页面为 md|text|html
+    /// 读页面为 md|text|html|visible
     Read {
         #[arg(long = "tab")]
         tab: Option<u64>,
-        /// 输出格式：md|text|html
+        /// 输出格式：md|text|html|visible（visible=innerText）
         #[arg(long)]
         mode: Option<String>,
         /// 聚焦元素（支持 shadow DOM / 同源 iframe）
@@ -274,7 +274,7 @@ pub enum Command {
     /// 多标签并发 open/read/snapshot/js/wait
     #[command(after_help = "\
 目标工具 flags（与 --tab-ids/--urls 混用）：
-  read      --mode md|text|html  --selector S  --no-main  --budget N  --cursor N
+  read      --mode md|text|html|visible  --selector S  --no-main  --budget N  --cursor N
   snapshot  --filter F  --near REF  --budget N  --cursor N
   js        --code CODE  --budget N  --cursor N  --timeout 10s
             （也可以直接写位置参数 CODE）
@@ -284,7 +284,7 @@ pub enum Command {
 ")]
     Batch {
         /// `<tool>` 之后的所有 token：--tab-ids / --urls / --concurrency / --port
-        /// 以及目标工具自己的 flags（如 read 的 --mode md）。
+        /// 以及目标工具自己的 flags（如 read 的 --mode visible）。
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         tokens: Vec<String>,
     },
@@ -2014,6 +2014,27 @@ click target=\"button:提交\"
 
         assert!(build_wait("bogus", &None, &None, None).is_err());
         assert!(build_wait("text", &None, &None, None).is_err());
+    }
+
+    #[test]
+    fn read_visible_mode_passes_through_with_the_same_root_flags() {
+        let call = build_read(
+            Some(7),
+            &Some("visible".into()),
+            &Some("main".into()),
+            false,
+            Some(4000),
+            Some(120),
+        );
+        assert_eq!(call.tool, "read");
+        assert_eq!(args_of(&call)["mode"], "visible");
+        assert_eq!(args_of(&call)["selector"], "main");
+        assert_eq!(args_of(&call)["tabId"], 7);
+        assert_eq!(args_of(&call)["budget"], 4000);
+        assert_eq!(args_of(&call)["cursor"], 120);
+
+        let call = build_read(None, &Some("visible".into()), &None, true, None, None);
+        assert_eq!(args_of(&call)["main"], false);
     }
 
     #[test]

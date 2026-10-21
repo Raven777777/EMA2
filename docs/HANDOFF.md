@@ -5,9 +5,9 @@
 ## 当前版本
 
 ```text
-exe        2.3.1
-extension  2.3.1
-helper     14
+exe        2.4.0
+extension  2.4.0
+helper     17
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
@@ -96,7 +96,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前 Rust 测试：**70 passed**。
+当前 Rust 测试：**71 passed**。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -137,9 +137,11 @@ cargo test
 ### read
 
 - `text` / `md` 跳过 script/style/noscript/template/textarea/input/select/option、
-  nav/header/footer/aside/form，以及 `display:none` / `visibility:hidden` / `content-visibility` 元素
+  nav/header/footer/aside/form，以及 `display:none` / `visibility:hidden` / `content-visibility` 元素；
+  两者共用一次 block/inline 遍历，只是 renderer 不同
+- `html` 保持 `root.innerHTML`；`visible` 直接取 `root.innerText`，不跑清洁遍历，
+  但同样复用 main/selector/no-main 选区
 - main 太短（<200 字符，或 body>2000 且候选 <body 5%）回退 `main=body(fallback)` 并给 hint
-- `html` 保持原始输出
 - 被截断必须给 `next` 和 cursor hint
 
 ### 其他
@@ -208,7 +210,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 ## 开发陷阱
 
 1. **修改页面 helper 必须提升 `__ema2_helpers_version`**
-   当前是 14；否则已打开页面继续用旧 helper。
+   当前是 15；否则已打开页面继续用旧 helper。
 
 2. **Edge 会按 manifest 版本缓存扩展脚本**
    行为没更新时提升 `extension/manifest.json` 版本，或在 `edge://extensions` 重新加载；
@@ -238,7 +240,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
 4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
-5. `python scripts/verify.py` —— 93 项真机检查，跑不过就别改行为
+5. `python scripts/verify.py` —— 102 项真机检查，跑不过就别改行为
 6. 打开一个真实网站，跑 `open → snapshot → act → read`
 7. 修改行为前先问：这是通用原语，还是网站特例？
 8. 任何动作相关改动，必须真机验证“成功就是真的成功”

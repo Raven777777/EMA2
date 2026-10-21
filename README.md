@@ -116,7 +116,7 @@ ema2 shot --annotate
 | `ema2 init` | 在当前目录写/更新 `AGENTS.md` |
 | `ema2 tabs` | 列出 / 当前 / 新建 / 关闭 / 激活标签页 |
 | `ema2 open` | 打开 URL，回 `status=` / `net_hook=` |
-| `ema2 read` | 读页面为 `md\|text\|html`，支持 selector/budget/cursor |
+| `ema2 read` | 读页面为 `md\|text\|html\|visible`，支持 selector/budget/cursor |
 | `ema2 snapshot` | ref 快照 `[e12@d1] button "X"` |
 | `ema2 act` | click/type/fill/select/press/hover/scroll/submit/back/forward/reload |
 | `ema2 await` | 等上一个 act 动作的导航/页面稳定 |
@@ -201,7 +201,7 @@ cargo fmt --check
 一键验收：
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（93 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（102 项）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 
@@ -227,7 +227,8 @@ python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
   `press` 的 CDP 按键不受此限制，但点击类副作用仍按合成点击处理。
 - **别的扩展的浮层 UI 不可点击**（密码管理器下拉、翻译面板）：EMA2 只能把它召唤出来，
   浮层内容在跨扩展隔离的 iframe / closed shadow root 里。
-- `read --mode md` 是有损渲染（标题/列表/表格/链接保留，样式与合并单元格丢失）。
+- `read --mode md` 是有损渲染（标题/列表/表格/链接保留，样式与合并单元格丢失）；
+  `read --mode visible` 用 `innerText` 读渲染文本，适合复杂 SPA，但会带出导航/侧栏等 UI 文本。
 - `js` 在 debugger 不可用时降级到 MAIN world 注入（输出 `via=scripting`）；
   严格 CSP 站点可能拒绝 eval，此时只能重载 tab 让 debugger 恢复。
 
