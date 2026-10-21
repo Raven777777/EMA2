@@ -78,6 +78,7 @@ EMA2 是**一个单文件 exe + 一个 MV3 扩展**。exe 既能以后台 daemon
 | `extension/background.js` | 11 个工具实现、ref 快照、网络/console hook、webRequest 补齐、debugger 队列、act settle/await 上下文 |
 | `extension/page_guard.js` | 命令租约内按需启用：非阻塞记录 alert/confirm/prompt/print，解除后恢复原生 API |
 | `extension/page_guard_armed.js` | document_start 动态 guard 的第二个脚本，在页面脚本前立即 arm |
+| `extension/page_guard_bridge.js` | ISOLATED world bridge：把 arm 事件转给 SW，租约已释放时通知页面自行 disarm |
 | `extension/popup.html/js` | 端口输入、保存/重连、连接状态 |
 
 ## 单端口分流
@@ -156,11 +157,18 @@ CLI 参数
   `chrome.scripting.registerContentScripts` 动态注册 MAIN world、document_start、
   all-frames 的 `page_guard.js` + `page_guard_armed.js`，覆盖导航后的新文档。
 - 对已经打开的 tab，扩展立即注入并 arm；读取、快照、动作、等待、JS、观测、
-  上传和截图都在租约内执行。
-- 最后一个 lease 结束时注销动态脚本，并向所有可脚本化 tab 广播 `disarm()`。
-  alert/confirm/prompt/print/window.open 以及赋值型 `onbeforeunload` 恢复原生行为。
-- `page_guard.js` 默认 disarmed；从旧 v1 升级时会用其保存的原生引用恢复页面。
-- `ema2_guard_protocol` 标记避免每次 service worker 唤醒都全量清理已升级页面。
+  上传和截图都在租约内执行。`open` 先导航，再 arm 最终文档。
+- 扩展只记录真正被 arm 过的 tab（`ensurePageGuard` + document_start 新文档上报），
+  不再每条命令扫全部标签。
+- 最后一个 lease 结束时**先**注销动态脚本，**再**对记录过的 tab 广播 `disarm()`。
+  每个 tab 的清理有单独时限，整批还有总上限；卡在原生对话框里的渲染进程不能
+  拖死后续命令。释放窗口内仍在加载的新文档由 ISOLATED world bridge 询问租约，
+  已归零就立即自行 `disarm()`。
+- alert/confirm/prompt/print/window.open 以及赋值型 `onbeforeunload` 恢复原生行为。
+- `page_guard.js` 默认 disarmed；从旧 v1/v2 升级时使用原生 descriptor 恢复页面，
+  v1 的 own `onbeforeunload` accessor 不会被当成原生引用。
+- `ema2_guard_protocol` 标记避免每次 service worker 唤醒都全量清理已升级页面；
+  修改 guard 清理协议时与 `page_guard.js` 的 `GUARD_VERSION` 一起提升。
 - guard 注册失败不影响工具调用；页面若主动弹出同步对话框，仍由 watchdog
   返回 `tool_timeout`。
 

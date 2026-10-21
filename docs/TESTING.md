@@ -45,8 +45,8 @@ wait / observe console·network / shot / files upload（含 5 MiB 边界）/ bat
 并静态断言 `extension/background.js` 的每个 `fail('code'` 都写进了 `docs/TOOLS.md`。
 
 guard 回归还覆盖：未执行 EMA2 命令的页面没有 `window.__ema2_guard`；
-`act` 返回后 guard 必须 `armed=0`；`role:name` 能匹配 HTML `name`；
-非活动标签可由 `act --tab` 修改；`batch --reuse session` 复用会话标签；
+`act` 返回后 guard 必须 `armed=0`；`role:name` 能匹配 HTML `name`，且隐藏的同名
+控件不会被优先选中；非活动标签可由 `act --tab` 修改；`batch --reuse session` 复用会话标签；
 `shot --out ./a/../b.png` 回显规范化路径。
 
 ## 真机验收

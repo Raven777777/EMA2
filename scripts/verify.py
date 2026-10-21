@@ -121,6 +121,7 @@ FIXTURE_BUGS = """<!doctype html>
 </head><body>
 <h1>Bug fixture</h1>
 <input id="a" value="abc"><input id="b">
+<input id="hidden-search" name="q" type="search" value="hidden-value" style="display:none">
 <input id="named-search" name="q" type="search" placeholder="global search">
 <input id="num" type="number" value="42">
 <select id="sel"><option value="v1">one</option><option value="v2" selected>two</option></select>
@@ -139,17 +140,28 @@ FIXTURE_BUGS = """<!doctype html>
 </form>
 <div id="ov"></div>
 <script>
-setInterval(function () {
+function ema2ReportGuard(stage) {
   const guard = window.__ema2_guard;
   const params = new URLSearchParams({
-    stage: 'runtime',
+    stage: stage,
     guard: guard ? '1' : '0',
     armed: guard && guard.armed ? '1' : '0',
     native: guard && guard.original && guard.original.alert === window.alert ? '1' : '0',
     at: String(Date.now())
   });
   fetch('/guard-report?' + params.toString()).catch(function () {});
-}, 500);
+}
+(function () {
+  // disarm 由后台在命令释放时调用；事件驱动上报，避免永久轮询污染网络检查。
+  const guard = window.__ema2_guard;
+  if (!guard || typeof guard.disarm !== 'function') return;
+  const disarm = guard.disarm;
+  guard.disarm = function () {
+    const result = disarm.apply(this, arguments);
+    ema2ReportGuard('disarm');
+    return result;
+  };
+})();
 </script>
 </body></html>
 """
@@ -316,10 +328,24 @@ def static_contract_check() -> bool:
     if not agents_ok:
         print("      AGENTS.md must point to `ema2 act --help` and must not mention docs/TOOLS.md")
     manifest = json.loads((ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
-    idle_ok = "content_scripts" not in manifest and "COMMAND_GUARD_FILES" in js
+    idle_ok = "content_scripts" not in manifest and (ROOT / "extension" / "page_guard.js").exists()
     print("PASS  static: page guard is command-scoped" if idle_ok
           else "FAIL  static: manifest still injects page_guard globally")
-    return not missing and agents_ok and idle_ok
+
+    paths_rs = (ROOT / "rust" / "src" / "paths.rs").read_text(encoding="utf-8")
+    version_match = re.search(r'PRODUCT_VERSION: &str = "([^"]+)"', paths_rs)
+    product_version = version_match.group(1) if version_match else ""
+    version_ok = bool(product_version) and manifest.get("version") == product_version
+    print(
+        f"PASS  static: extension version matches PRODUCT_VERSION ({product_version})" if version_ok
+        else f"FAIL  static: extension version {manifest.get('version')} != PRODUCT_VERSION {product_version or '<missing>'}"
+    )
+
+    min_chrome = str(manifest.get("minimum_chrome_version", ""))
+    chrome_ok = min_chrome.isdigit() and int(min_chrome) >= 111
+    print("PASS  static: minimum_chrome_version >= 111" if chrome_ok
+          else "FAIL  static: minimum_chrome_version must be >= 111 for registerContentScripts world=MAIN")
+    return not missing and agents_ok and idle_ok and version_ok and chrome_ok
 
 
 def markdown_link_check() -> bool:
@@ -839,14 +865,20 @@ def main() -> int:
 
         named_search = runner.run("act", "fill", "--target", "searchbox:q", "named-search-value")
         named_search_out = (named_search.stdout or "") + (named_search.stderr or "")
-        named_search_state = runner.run("js", "return document.getElementById('named-search').value")
+        named_search_state = runner.run(
+            "js",
+            "return [document.getElementById('named-search').value,"
+            " document.getElementById('hidden-search').value].join('|')",
+        )
         runner.check(
-            "role target falls back to HTML name",
+            "role target falls back to visible HTML name",
             named_search.returncode == 0 and "ok=fill" in named_search_out
-            and "named-search-value" in (named_search_state.stdout or ""),
+            and "named-search-value|hidden-value" in (named_search_state.stdout or ""),
             named_search_out + (named_search_state.stdout or "") + (named_search_state.stderr or ""),
         )
 
+        server.guard_reports.clear()
+        guard_cutoff = int(time.time() * 1000)
         alert = runner.run("act", "click", "--selector", "#alert")
         alert_out = (alert.stdout or "") + (alert.stderr or "")
         runner.check(
@@ -855,9 +887,21 @@ def main() -> int:
             and alert_out.count("dialog_opened=") == 1,
             alert_out[:1200],
         )
-        server.guard_reports.clear()
-        time.sleep(0.7)
-        disarm_report = server.guard_reports[-1] if server.guard_reports else {}
+        # 事件驱动上报可能晚于 act 返回一拍；只采信 act 开始后采样的报告。
+        guard_deadline = time.time() + 2
+        fresh_reports = []
+        while time.time() < guard_deadline:
+            fresh_reports = [
+                report for report in server.guard_reports
+                if int(report.get("at", "0")) >= guard_cutoff
+            ]
+            if any(report.get("stage") == "disarm" for report in fresh_reports):
+                break
+            time.sleep(0.05)
+        disarm_report = next(
+            (report for report in reversed(fresh_reports) if report.get("stage") == "disarm"),
+            {},
+        )
         runner.check(
             "guard is disarmed when act returns",
             disarm_report.get("guard") == "1" and disarm_report.get("armed") == "0"

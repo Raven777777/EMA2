@@ -9,8 +9,11 @@
  * script，也会由 chrome.scripting.executeScript 注入。
  */
 (function ema2PageGuard() {
+  // 修改 wrappers/restore 逻辑时递增；旧版本页面会在下一次命令注入时被替换。
+  // 同步提升 background.js 的 GUARD_PROTOCOL_VERSION，让升级后的首次启动全量清理。
+  const GUARD_VERSION = 3;
   const prior = window.__ema2_guard;
-  if (prior && prior.version >= 2) return;
+  if (prior && prior.version >= GUARD_VERSION) return;
 
   const MAX_EVENTS = 50;
   // 旧 v1 会永久覆盖页面 API；优先复用它保存的原生引用，避免包装套包装。
@@ -21,11 +24,22 @@
     print: window.print,
     open: window.open,
   };
-  const originalBeforeUnload = Object.getOwnPropertyDescriptor(window, 'onbeforeunload')
-    || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(window), 'onbeforeunload');
+  const legacy = !!(prior && prior.version < 2);
+  const priorArmed = !!(prior && prior.armed);
+  const ownBeforeUnload = Object.getOwnPropertyDescriptor(window, 'onbeforeunload');
+  const prototypeBeforeUnload = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(window), 'onbeforeunload',
+  );
+  // v1 的 own descriptor 是吞掉事件的假 accessor；旧版本 armed 时 own 也可能
+  // 是旧 wrapper。两种情况都不能当作原生引用，直接取原型上的 descriptor。
+  const usePrototypeBeforeUnload = legacy || priorArmed;
+  const originalBeforeUnload = usePrototypeBeforeUnload
+    ? prototypeBeforeUnload
+    : (ownBeforeUnload || prototypeBeforeUnload);
+  const originalBeforeUnloadOwn = !usePrototypeBeforeUnload && !!ownBeforeUnload;
 
   const state = {
-    version: 2,
+    version: GUARD_VERSION,
     armed: false,
     lease: '',
     seq: 0,
@@ -56,13 +70,24 @@
 
   const setOriginalBeforeUnload = (handler) => {
     const value = typeof handler === 'function' ? handler : null;
+    if (!value) {
+      // 先用原生 setter 清掉内部 handler，再删除 own 属性：既不会让
+      // beforeunload 继续生效，也不会留下 window.onbeforeunload=null 的脏状态。
+      try {
+        if (originalBeforeUnload && typeof originalBeforeUnload.set === 'function') {
+          originalBeforeUnload.set.call(window, null);
+        }
+      } catch (_) { /* ignore */ }
+      try { delete window.onbeforeunload; } catch (_) { /* ignore */ }
+      return;
+    }
     if (originalBeforeUnload && typeof originalBeforeUnload.set === 'function') {
       originalBeforeUnload.set.call(window, value);
       return;
     }
     try {
       delete window.onbeforeunload;
-      if (value) window.onbeforeunload = value;
+      window.onbeforeunload = value;
     } catch (_) { /* ignore */ }
   };
 
@@ -102,7 +127,9 @@
   const restoreBeforeUnload = () => {
     const handler = beforeUnloadHandler || readBeforeUnload();
     try {
-      if (originalBeforeUnload) {
+      // 原生 descriptor 在原型上时删除 own 属性即可；只有页面本来就有 own
+      // descriptor 才需要重新定义，避免留下可检测的 DOM 差异。
+      if (originalBeforeUnloadOwn && originalBeforeUnload) {
         Object.defineProperty(window, 'onbeforeunload', originalBeforeUnload);
       } else {
         delete window.onbeforeunload;
@@ -203,7 +230,7 @@
   };
 
   // 从永久覆盖的 v1 升级时，立即恢复原生 API；真正的 arm 由 armed helper 执行。
-  if (prior && prior.version < 2) {
+  if (legacy) {
     try { window.alert = original.alert; } catch (_) { /* ignore */ }
     try { window.confirm = original.confirm; } catch (_) { /* ignore */ }
     try { window.prompt = original.prompt; } catch (_) { /* ignore */ }

@@ -7,7 +7,7 @@
 ```text
 exe        2.4.1.1（Cargo crate metadata 仍为 SemVer 2.4.1）
 extension  2.4.1.1
-helper     18
+helper     19
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
@@ -50,6 +50,7 @@ AI / shell
 | `extension/background.js` | 11 工具实现、ref、hook、webRequest 补全、settle/await、debugger 队列 |
 | `extension/page_guard.js` | 命令租约内非阻塞记录 alert/confirm/prompt/print/window.open；解除后恢复原生 API |
 | `extension/page_guard_armed.js` | document_start 动态 guard 的立即 arm 入口 |
+| `extension/page_guard_bridge.js` | ISOLATED world bridge：上报新文档 arm，租约归零时通知页面 disarm |
 | `extension/popup.*` | 端口配置与连接状态 |
 | `docs/TOOLS.md` | 命令参考、输出协议、错误码（唯一错误码表） |
 | `docs/TESTING.md` | 真机、前台、可见的验收规定与清单（禁止 Node 测试） |
@@ -241,8 +242,9 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 
 9. **page guard 只能存在于命令租约内**
    不要在 manifest 恢复静态 `content_scripts`；否则普通浏览的弹窗会再次被拦截。
-   页面 helper 默认 disarmed，最后一个命令结束时必须注销动态注册并广播 `disarm()`。
-   修改 guard 清理协议时提升 `ema2_guard_protocol`。
+   页面 helper 默认 disarmed，最后一个命令结束时必须先注销动态注册、再清理已 arm 的 tab。
+   修改 wrappers/restore 逻辑时提升 `page_guard.js` 的 `GUARD_VERSION`；修改清理协议时
+   同时提升 background.js 的 `ema2_guard_protocol`。
 
 ## 下一位维护者的第一步
 

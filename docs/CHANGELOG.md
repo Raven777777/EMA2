@@ -1,5 +1,24 @@
 # 变更记录
 
+## 未发布 — guard 生命周期加固
+
+- **释放不再卡死**：每 tab 的 `disarm()` 有单独时限，整批 sweep 有总上限；
+  卡在原生对话框/死循环里的渲染进程不会让后续命令永久排队。
+- **消除释放竞态**：最后租约先注销动态脚本再 disarm；document_start 新文档通过
+  ISOLATED world bridge 查询租约，租约已释放就立即自行恢复原生 API。
+- **升级路径修复**：v1 的 own `onbeforeunload` 假 accessor 不再被当成原生引用；
+  descriptor 在原型上时不再留下自己的 `window.onbeforeunload`。
+- **清理范围收窄**：普通命令只 disarm 真正 arm 过的 tab，不再每条命令扫全浏览器。
+- **生命周期 fail-open**：guard 队列任一步失败只记日志，不会污染后续命令。
+- **目标可见性**：`role:name` 的精确名/HTML name/部分匹配每一层都优先可见控件；
+  helper 升至 19。
+- **版本门槛**：manifest 声明 `minimum_chrome_version: 111`；静态验收检查扩展版本
+  与 `PRODUCT_VERSION` 一致。
+- **reuse 语义**：`open --reuse session` 同一文档不再重载；`batch --reuse session`
+  精确 URL 命中时也续用文档而不重载；文档明确两者的匹配规则差异。
+- **验收**：`cargo test` 74 passed；clippy/fmt 通过；真实前台 Edge 113 checks
+  passed；额外验证 v1→v2 升级后原生 `onbeforeunload` 可重新赋值。
+
 ## v2.4.1.1 — guard 仅命令期启用，补齐目标与默认值
 
 - **普通浏览零干预**：移除 manifest 的全局 `page_guard.js` content script。

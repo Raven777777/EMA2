@@ -42,9 +42,14 @@ const SETTLE_NAV_IDLE_MS = 1500;
 const SETTLE_PAGE_MS = 800;
 const SETTLE_NONE_MS = 100;
 const COMMAND_GUARD_ID = 'ema2-command-guard';
+const COMMAND_GUARD_BRIDGE_ID = 'ema2-command-guard-bridge';
 const COMMAND_GUARD_FILES = ['page_guard.js', 'page_guard_armed.js'];
+const COMMAND_GUARD_BRIDGE_FILES = ['page_guard_bridge.js'];
+const COMMAND_GUARD_DISARM_MS = 800;
+const COMMAND_GUARD_SWEEP_MS = 1500;
+const LEGACY_GUARD_SWEEP_MS = 2500;
 const GUARD_PROTOCOL_KEY = 'ema2_guard_protocol';
-const GUARD_PROTOCOL_VERSION = 2;
+const GUARD_PROTOCOL_VERSION = 3;
 
 let socket = null;
 let connecting = false;
@@ -69,6 +74,8 @@ let sessionWriteChain = Promise.resolve();
 let lastActContext = null;
 let commandGuardLeases = 0;
 let commandGuardLifecycle = Promise.resolve();
+// 只清理真正被 arm 过的 tab；动态 document_start 脚本会在新文档里报告自己。
+const commandGuardTabs = new Set();
 
 class ToolError extends Error {
   constructor(code, message, hint, lines) {
@@ -232,9 +239,15 @@ async function probeRelay(port) {
   }
 }
 
-async function handlePageMessage(message) {
+async function handlePageMessage(message, sender) {
   const port = Number(message.port) || currentPort || DEFAULT_PORT;
   switch (message.type) {
+    case 'ema2/guard-armed': {
+      const tabId = sender && sender.tab && sender.tab.id;
+      // 租约期间的导航文档也纳入清理集合；租约已释放则让页面自己 disarm。
+      if (commandGuardLeases > 0 && Number.isInteger(tabId)) commandGuardTabs.add(tabId);
+      return { ok: true, lease: commandGuardLeases };
+    }
     case 'ema2/state': {
       const relay = await probeRelay(port);
       return {
@@ -745,10 +758,18 @@ async function openTool(args) {
   if (args.tabId !== undefined) {
     // 显式导航用户已有的标签：不改会话登记，scope=session 不会关掉用户的标签。
     tab = await resolveTab(args);
-    const nav = await navigateTab(tab, args.url, wait !== 'none');
-    previousUrl = nav.before;
-    previousMarker = nav.marker;
-    reuse = 'tabId';
+    const currentUrl = String(tab.url || tab.pendingUrl || '');
+    // batch --reuse session 命中精确 URL 时用内部标记续用文档，不重载。
+    if (args.reuseSamePage === true
+        && samePageTarget(currentUrl, args.url) && !samePageHashOnly(currentUrl, args.url)) {
+      previousUrl = currentUrl;
+      reuse = 'session';
+    } else {
+      const nav = await navigateTab(tab, args.url, wait !== 'none');
+      previousUrl = nav.before;
+      previousMarker = nav.marker;
+      reuse = 'tabId';
+    }
   } else if (args.replace === true) {
     tab = await activeTab();
     const nav = await navigateTab(tab, args.url, wait !== 'none');
@@ -759,9 +780,15 @@ async function openTool(args) {
     const live = await lastLiveSessionTab();
     if (live) {
       tab = live;
-      const nav = await navigateTab(tab, args.url, wait !== 'none');
-      previousUrl = nav.before;
-      previousMarker = nav.marker;
+      const currentUrl = String(tab.url || tab.pendingUrl || '');
+      if (samePageTarget(currentUrl, args.url) && !samePageHashOnly(currentUrl, args.url)) {
+        // “复用”同一个文档时不要重载：保留滚动位置/已填表单。
+        previousUrl = currentUrl;
+      } else {
+        const nav = await navigateTab(tab, args.url, wait !== 'none');
+        previousUrl = nav.before;
+        previousMarker = nav.marker;
+      }
       reuse = 'session';
     }
   }
@@ -1068,6 +1095,7 @@ async function ensurePageGuard(tabId) {
       files: COMMAND_GUARD_FILES,
       world: 'MAIN',
     });
+    if (Number.isInteger(tabId)) commandGuardTabs.add(tabId);
     return true;
   } catch (_) {
     return false;
@@ -1075,9 +1103,26 @@ async function ensurePageGuard(tabId) {
 }
 
 async function registerCommandGuard() {
+  // 逐条注销：旧版本只注册过 main id，一次传不存在的 id 可能让整批失败。
+  for (const id of [COMMAND_GUARD_ID, COMMAND_GUARD_BRIDGE_ID]) {
+    try { await chrome.scripting.unregisterContentScripts({ ids: [id] }); } catch (_) { /* not registered */ }
+  }
+  // bridge 先注册：这样任何被 MAIN guard arm 的新文档都已经有监听者。
   try {
-    await chrome.scripting.unregisterContentScripts({ ids: [COMMAND_GUARD_ID] });
-  } catch (_) { /* not registered */ }
+    await chrome.scripting.registerContentScripts([{
+      id: COMMAND_GUARD_BRIDGE_ID,
+      matches: ['<all_urls>'],
+      js: COMMAND_GUARD_BRIDGE_FILES,
+      runAt: 'document_start',
+      allFrames: true,
+      world: 'ISOLATED',
+      persistAcrossSessions: false,
+    }]);
+  } catch (error) {
+    // bridge 只是释放竞态的加固；失败时主 guard 仍然工作。
+    console.warn('[EMA2] command guard bridge registration failed:', error && error.message || error);
+  }
+  let mainOk = false;
   try {
     await chrome.scripting.registerContentScripts([{
       id: COMMAND_GUARD_ID,
@@ -1088,17 +1133,17 @@ async function registerCommandGuard() {
       world: 'MAIN',
       persistAcrossSessions: false,
     }]);
-    return true;
+    mainOk = true;
   } catch (error) {
     console.warn('[EMA2] command guard registration failed:', error && error.message || error);
-    return false;
   }
+  return mainOk;
 }
 
 async function unregisterCommandGuard() {
-  try {
-    await chrome.scripting.unregisterContentScripts({ ids: [COMMAND_GUARD_ID] });
-  } catch (_) { /* not registered */ }
+  for (const id of [COMMAND_GUARD_ID, COMMAND_GUARD_BRIDGE_ID]) {
+    try { await chrome.scripting.unregisterContentScripts({ ids: [id] }); } catch (_) { /* not registered */ }
+  }
 }
 
 async function disarmPageGuard(tabId) {
@@ -1129,54 +1174,104 @@ async function disarmPageGuard(tabId) {
   } catch (_) { /* page became restricted */ }
 }
 
-async function disarmAllPageGuards() {
-  let tabs = [];
-  try { tabs = await chrome.tabs.query({}); } catch (_) { return; }
-  await Promise.all(tabs
-    .filter(tab => Number.isInteger(tab.id) && !isInternalUrl(tab.url))
-    .map(tab => disarmPageGuard(tab.id)));
+async function allScriptableTabIds() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    return tabs
+      .filter(tab => Number.isInteger(tab.id) && !isInternalUrl(tab.url))
+      .map(tab => tab.id);
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
+ * 清理指定 tab。每个 tab 单独限时，整体再设硬上限：一个卡在原生对话框或
+ * 死循环里的渲染进程不能把 release/启动清理拖到命令预算之外。
+ */
+async function disarmPageGuards(tabIds, budget = COMMAND_GUARD_SWEEP_MS) {
+  const ids = [...new Set(tabIds)].filter(id => Number.isInteger(id));
+  for (const id of ids) commandGuardTabs.delete(id);
+  if (!ids.length) return true;
+  const results = await within(
+    Promise.all(ids.map(id => within(
+      disarmPageGuard(id).then(() => true),
+      COMMAND_GUARD_DISARM_MS,
+      false,
+    ))),
+    budget,
+    null,
+  );
+  return Array.isArray(results) && results.every(Boolean);
+}
+
+async function disarmTrackedPageGuards(budget = COMMAND_GUARD_SWEEP_MS) {
+  return disarmPageGuards([...commandGuardTabs], budget);
+}
+
+/**
+ * guard 链只允许成功/失败都继续；任何一步 reject 都不能污染后续命令。
+ * 返回的 Promise 本身永远 resolve（失败只记日志）。
+ */
+function enqueueCommandGuard(step) {
+  const run = () => Promise.resolve().then(step).catch(error => {
+    console.warn('[EMA2] command guard step failed:', error && error.message || error);
+  });
+  commandGuardLifecycle = commandGuardLifecycle.then(run, run);
+  return commandGuardLifecycle;
 }
 
 /**
  * 登记一个命令租约。第一个租约注册 document_start guard，最后一个释放时
- * 注销注册并恢复所有已打开页面的原生对话框 API。
+ * 注销注册并恢复已 arm 文档的原生对话框 API。
  */
 async function acquireCommandGuard() {
-  await (commandGuardLifecycle = commandGuardLifecycle.then(async () => {
-    commandGuardLeases += 1;
-    if (commandGuardLeases === 1) await registerCommandGuard();
-  }));
+  // guard 是优化而不是前置条件：这里失败也必须放行工具调用。
+  try {
+    await enqueueCommandGuard(async () => {
+      commandGuardLeases += 1;
+      if (commandGuardLeases === 1) await registerCommandGuard();
+    });
+  } catch (_) { /* fail open */ }
 }
 
 async function releaseCommandGuard() {
-  await (commandGuardLifecycle = commandGuardLifecycle.then(async () => {
-    if (commandGuardLeases <= 0) return;
-    commandGuardLeases -= 1;
-    if (commandGuardLeases !== 0) return;
-    await disarmAllPageGuards();
-    await unregisterCommandGuard();
-  }));
-}
-
-async function resetCommandGuardLifecycle() {
-  await (commandGuardLifecycle = commandGuardLifecycle.then(async () => {
-    if (commandGuardLeases === 0) {
-      await disarmAllPageGuards();
+  try {
+    await enqueueCommandGuard(async () => {
+      if (commandGuardLeases <= 0) return;
+      commandGuardLeases -= 1;
+      if (commandGuardLeases !== 0) return;
+      // 顺序很重要：先注销动态脚本，再 disarm。反序会在注销窗口里把正在
+      // 加载的新文档 arm 掉，而 sweep 已经结束，guard 会永久残留。
       await unregisterCommandGuard();
-    }
-  }));
+      await disarmTrackedPageGuards();
+    });
+  } catch (_) { /* guard failure must not fail the command */ }
 }
 
 async function cleanupLegacyGuardOnce() {
+  let legacy = true;
   try {
     const stored = await chrome.storage.local.get(GUARD_PROTOCOL_KEY);
-    if (Number(stored && stored[GUARD_PROTOCOL_KEY]) >= GUARD_PROTOCOL_VERSION) return;
-    await resetCommandGuardLifecycle();
-    await chrome.storage.local.set({ [GUARD_PROTOCOL_KEY]: GUARD_PROTOCOL_VERSION });
+    legacy = Number(stored && stored[GUARD_PROTOCOL_KEY]) < GUARD_PROTOCOL_VERSION;
   } catch (_) { /* storage may be unavailable during startup */ }
+
+  let complete = false;
+  await enqueueCommandGuard(async () => {
+    if (commandGuardLeases !== 0) return;
+    await unregisterCommandGuard();
+    // 协议升级要扫所有 tab（清 v1/v2 遗留）；普通 SW 启动只清理已 arm 的 tab。
+    const ids = legacy ? await allScriptableTabIds() : [...commandGuardTabs];
+    complete = await disarmPageGuards(ids, legacy ? LEGACY_GUARD_SWEEP_MS : COMMAND_GUARD_SWEEP_MS);
+  });
+  if (legacy && complete) {
+    try { await chrome.storage.local.set({ [GUARD_PROTOCOL_KEY]: GUARD_PROTOCOL_VERSION }); } catch (_) { /* ignore */ }
+  }
 }
 
 async function guardTargetForTool(name, args) {
+  // open 不在这里：它先导航，再由 openTool 对最终文档 ensurePageGuard。
+  // act 只在这里 arm 一次；actTool 不要在动作前重复注入。
   const guarded = new Set([
     'act', 'wait', 'read', 'snapshot', 'js', 'observe', 'files', 'shot',
   ]);
@@ -1257,7 +1352,7 @@ async function requireValidSelector(tabId, selector) {
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 18) {
+  if (window.__ema2_helpers && window.__ema2_helpers_version === 19) {
     return { installed: false, handle: String(window.__ema2_doc_handle || '') };
   }
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
@@ -1536,12 +1631,17 @@ function installHelpers() {
             candidates.push(el);
           }
         }
-        const exact = candidates.find(el => nameOf(el).toLowerCase() === name);
+        // 每一层都先取可见控件；只有整层都不可见时才回退隐藏控件。
+        const pick = (test) => {
+          const matching = candidates.filter(test);
+          return matching.find(visible) || matching[0] || null;
+        };
+        const exact = pick(el => nameOf(el).toLowerCase() === name);
         if (exact) return exact;
         // role:name 同时接受 HTML name 属性；可访问名称精确匹配仍优先。
-        const named = candidates.find(el => String(el.getAttribute('name') || '').toLowerCase() === name);
+        const named = pick(el => String(el.getAttribute('name') || '').toLowerCase() === name);
         if (named) return named;
-        const partial = candidates.find(el => nameOf(el).toLowerCase().includes(name));
+        const partial = pick(el => nameOf(el).toLowerCase().includes(name));
         if (partial) return partial;
       }
     }
@@ -2303,7 +2403,7 @@ function installHelpers() {
     collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent,
     setValue, isActionableRole, absoluteHref,
   };
-  window.__ema2_helpers_version = 18;
+  window.__ema2_helpers_version = 19;
   return { installed: true };
 }
 
@@ -3621,8 +3721,8 @@ async function actTool(args) {
   const netBaseline = await networkMark(tab.id);
   let lastActionNetBaseline = netBaseline;
   try { await ensureConsoleHook(tab.id); } catch (_) { /* ignore */ }
-  // page_guard 在动作前安装，才能把这次点击触发的 alert/print/window.open 记录下来。
-  await ensurePageGuard(tab.id);
+  // page_guard 已由 withCommandGuard/guardTargetForTool 在动作前安装；
+  // 这里不能重复注入，否则每个 act 都会多一次 all-frames executeScript。
   const guardSeq = await guardMark(tab.id);
   const results = [];
   const newTabIds = [];
@@ -4143,7 +4243,7 @@ async function runStep(tab, step) {
 
 /** 在 MAIN world 里按 ref / selector / "role:name" 深度查找（含 shadow root / 同源 iframe）。 */
 function deepFindForDebugger(ref, selector, target) {
-  // helper 18 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
+  // 新版 helper 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
   const helpers = window.__ema2_helpers;
   if (helpers && typeof helpers.find === 'function') {
     const found = helpers.find(ref || null, selector || null, target || null);
@@ -4177,6 +4277,20 @@ function deepFindForDebugger(ref, selector, target) {
       || (tag === 'INPUT' && !['button', 'submit', 'reset', 'image'].includes(type));
     return clean(el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('alt') || el.getAttribute('title') || safeValue || (userValueControl ? '' : el.innerText) || '').slice(0, 60);
   };
+  const visible = (el) => {
+    if (!el || el.hidden) return false;
+    try {
+      if (typeof el.checkVisibility === 'function') {
+        return el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
+      }
+      if (!el.getClientRects().length) return false;
+      const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+      const style = view.getComputedStyle(el);
+      return style.visibility !== 'hidden' && style.display !== 'none';
+    } catch (_) {
+      return !!el.getClientRects().length;
+    }
+  };
   const INTERACTIVE = 'a[href],button,input,textarea,select,summary,[role],[contenteditable=""],[contenteditable="true"],[tabindex],[onclick]';
   const roots = [];
   const seen = new Set();
@@ -4209,18 +4323,22 @@ function deepFindForDebugger(ref, selector, target) {
     if (match) {
       const role = match[1].toLowerCase();
       const name = match[2].trim().toLowerCase();
-      let partial = null;
-      let named = null;
+      const candidates = [];
       for (const root of roots) {
         for (const el of root.querySelectorAll(INTERACTIVE)) {
-          if (roleOf(el).toLowerCase() !== role) continue;
-          const current = nameOf(el).toLowerCase();
-          if (current === name) return el;
-          if (!named && String(el.getAttribute('name') || '').toLowerCase() === name) named = el;
-          if (!partial && current.includes(name)) partial = el;
+          if (roleOf(el).toLowerCase() === role) candidates.push(el);
         }
       }
+      // 与页面 helper 一致：每一层都优先可见控件，整层不可见才回退隐藏控件。
+      const pick = (test) => {
+        const matching = candidates.filter(test);
+        return matching.find(visible) || matching[0] || null;
+      };
+      const exact = pick(el => nameOf(el).toLowerCase() === name);
+      if (exact) return exact;
+      const named = pick(el => String(el.getAttribute('name') || '').toLowerCase() === name);
       if (named) return named;
+      const partial = pick(el => nameOf(el).toLowerCase().includes(name));
       if (partial) return partial;
     }
   }
@@ -4939,7 +5057,10 @@ async function batchTool(args) {
         try {
           const reusedTabId = reusedByIndex.get(index);
           const openArgs = { ...inner, url };
-          if (reusedTabId !== undefined) openArgs.tabId = reusedTabId;
+          if (reusedTabId !== undefined) {
+            openArgs.tabId = reusedTabId;
+            openArgs.reuseSamePage = true;
+          }
           let openedText;
           try {
             openedText = resultText(await executeTool('open', openArgs));
@@ -4948,6 +5069,7 @@ async function batchTool(args) {
                 || error.code !== 'tab_not_found') throw error;
             reusedByIndex.delete(index);
             delete openArgs.tabId;
+            delete openArgs.reuseSamePage;
             openedText = resultText(await executeTool('open', openArgs));
           }
           const reusedLine = reusedByIndex.has(index) ? `reused=1 tab=${reusedTabId}\n` : '';
@@ -5505,23 +5627,22 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   observedConsoleDocs.delete(tabId);
   observedNetworkDocs.delete(tabId);
   webRequestLog.delete(tabId);
+  commandGuardTabs.delete(tabId);
 });
 ensureWatchdog();
 // 动态 command guard 不应跨 service worker 重生长时间残留。
-unregisterCommandGuard();
+// 统一走 guard 队列，避免启动清理和第一条命令的 register 交叉。
 cleanupLegacyGuardOnce();
 connect();
 chrome.runtime.onStartup.addListener(() => { ensureWatchdog(); connect(); });
 chrome.runtime.onInstalled.addListener(() => {
   ensureWatchdog();
-  resetCommandGuardLifecycle()
-    .then(() => chrome.storage.local.set({ [GUARD_PROTOCOL_KEY]: GUARD_PROTOCOL_VERSION }))
-    .catch(() => {});
+  cleanupLegacyGuardOnce();
   migrateSettings().finally(() => connect());
 });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string' || !message.type.startsWith('ema2/')) return undefined;
-  handlePageMessage(message).then(
+  handlePageMessage(message, sender).then(
     (result) => sendResponse(result),
     (error) => sendResponse({ ok: false, error: String((error && error.message) || error) }),
   );

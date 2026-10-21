@@ -83,7 +83,7 @@ pub enum Command {
         /// 在当前活动标签里导航（不新建）
         #[arg(long)]
         replace: bool,
-        /// 复用本会话最近打开的标签（session）
+        /// 复用本会话最近打开的标签并导航；同一文档不重载（session）
         #[arg(long)]
         reuse: Option<String>,
         /// 等待级别：load|dom|none
@@ -282,7 +282,7 @@ pub enum Command {
     /// 多标签并发 open/read/snapshot/js/wait
     #[command(after_help = "\
 目标工具 flags（与 --tab-ids/--urls 混用）：
-  --reuse session  与 --urls 使用：精确 URL 命中本会话标签时复用，否则新开
+  --reuse session  与 --urls 使用：精确 URL 命中本会话标签时复用文档（不重载），否则新开
   read      --mode md|text|html|visible  --selector S  --no-main  --budget N  --cursor N
   snapshot  --filter F  --near REF  --budget N  --cursor N
   js        --code CODE  --budget N  --cursor N  --timeout 10s

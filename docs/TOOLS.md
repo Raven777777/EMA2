@@ -219,7 +219,9 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 - 输出包含 `focused=1|0`：`0` 表示浏览器窗口不在前台，会附 hint（先 `tabs activate`）。
 - 默认新开标签，并登记进会话。
 - `--replace`：在当前活动标签里导航（不新建），适合「同一个页面连续翻几页」。
-- `--reuse session`：复用本会话**最近**打开的标签；标签已被关掉则退回新建。
+- `--reuse session`：复用本会话**最近**打开的标签并在其中导航；目标与当前文档相同则
+  不重载（保留滚动位置和表单状态）。标签已被关掉则退回新建。注意 `batch --reuse session`
+  的规则不同：它按精确 URL 匹配会话标签，见下文。
 - `--tab ID`：导航指定标签（显式意图，不计入会话）。
 - `--timeout N`（单位：秒）：**整个 open 流程**的硬上限（1..60，默认 15）：打开标签 + 等文档接位 +
   装 hook + 读 timing/focus 都在这段预算内；慢站点/SPA 首屏可以调大。
@@ -571,7 +573,8 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
   `tool=open` 时只打开（并行开多页）。**`open` + `read` 因此一次命令完成**，不再串行两次。
   默认始终新开标签；内层 `--replace`/`--reuse`/`tabId` 会被拒绝。
 - `--reuse session`：仅用于 `--urls`。按规范化后的完整 URL 只匹配本会话由
-  `open`/`tabs new` 打开的标签；命中时复用并回 `reused=1 tab=<id>`，未命中仍新开。
+  `open`/`tabs new` 打开的标签；命中时复用文档（同一 URL 不重载）并回
+  `reused=1 tab=<id>`，未命中仍新开。
   不会复用任意用户标签，也不会改变默认的新开语义。
 - `--tab-ids` 与 `--urls` 互斥；`tool=open` 只能配 `--urls`。
 - 工具 flag 会与每个目标合并后复用子命令 validator：`ema2 batch wait --time 3600 --tab-ids 1,2`
