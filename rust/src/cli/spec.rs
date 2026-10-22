@@ -193,6 +193,28 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
         tab: Option<u64>,
     },
     /// 页面主世界执行 JS
+    #[command(after_help = r##"调用范式:
+  # 1) 两次调用（最省心）：注入会粘住，第二次直接调用
+  ema2 js --file lib.js
+  ema2 js "return __E.digest()"
+
+  # 2) 一次投递（少一次往返）：--file 与内联 code 互斥，整段作为一次 code 传入
+  ema2 js "$(cat lib.js)
+  return __E.digest()"
+
+求值规则:
+  先按表达式编译；能编译就执行一次，否则按 async 函数体执行一次。
+  多行代码必须显式 return，否则得到 undefined 并提示
+  note=ran as an async function body。
+
+注入生命周期:
+  注入的全局活到该标签导航/关闭为止；重装同名全局不会自动替换旧实现，
+  改库后必须在表达式里显式覆盖赋值。
+
+分页:
+  --budget 截断时回 truncated=1；--cursor 是输出字符偏移，
+  续读时源输出必须不变（换 code 或换 budget 都会错位）。
+"##)]
     Js {
         /// JS 表达式或语句体（与 --file 互斥）
         code: Option<String>,
@@ -203,7 +225,7 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
         /// 返回字符预算（默认 8000，范围 200..200000）
         #[arg(long, value_name = "N")]
         budget: Option<u64>,
-        /// 从上次输出的 next 续读
+        /// 从上次输出的 next 续读（字符偏移；换 code 或 budget 会错位）
         #[arg(long)]
         cursor: Option<u64>,
         /// 执行上限秒数（默认 10，0.1..300）；超时会 terminateExecution
@@ -269,8 +291,8 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
   --reuse session  与 --urls 使用：精确 URL 命中本会话标签时复用文档（不重载），否则新开
   read      --mode md|text|html|visible  --selector S  --no-main  --budget N  --cursor N
   snapshot  --filter F  --near REF  --budget N  --cursor N
-  js        --code CODE  --budget N  --cursor N  --timeout 10s
-            （也可以直接写位置参数 CODE）
+  js        --code CODE | --file FILE  --budget N  --cursor N  --timeout 10s
+            （也可以直接写位置参数 CODE；--code/位置参数与 --file 互斥）
   wait      --text S | --text-gone S | --selector S | --time 5s | --timeout 30s | --idle
             （也可以直接写位置参数 TEXT，等价于 --text）
   open      --wait load|dom|none  --timeout 15

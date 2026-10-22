@@ -575,6 +575,20 @@ ema2 js --file script.js [...]
 
 在页面主世界执行（debugger，`awaitPromise`）。字符串原样返回，其余值紧凑 JSON。
 
+- **库 + 调用的两种投递方式**（`--file` 与内联 code 互斥）：
+
+  ```bash
+  # 两次调用：注入会粘住，第二次直接调用
+  ema2 js --file lib.js
+  ema2 js "return __E.digest()"
+
+  # 一次投递：整段作为一个 code 传入，少一次往返
+  ema2 js "$(cat lib.js)
+  return __E.digest()"
+  ```
+
+- **注入即粘住**：注入的全局活到该标签导航/关闭为止；重装同名全局不会自动替换旧实现，
+  改库后必须在表达式里显式覆盖赋值。改完 `lib.js` 却「没反应」，先怀疑页面里还留着旧实现。
 - **既可传表达式也可传语句体**：先用 `Runtime.compileScript` 做 compile-only 探测；
   表达式能编译就只执行一次，否则按 async 函数体执行一次。因此顶层 `return`、`await`、
   `const a = 1; return a` 都能用；运行时抛出的 `SyntaxError` 不会重跑。
@@ -591,6 +605,7 @@ ema2 js --file script.js [...]
   `SyntaxError: ...` 文本（不再只有 `msg=Uncaught`）。
 - `--budget` 截断时回 `truncated=1`；字符串按字符切片，对象/数组会返回合法 JSON 分片信封
   `{"ema2_truncated":true,"total":N,"next":M,"chunk":"..."}`，用 `--cursor <next>` 续读。
+- `--cursor` 是**输出字符偏移**：续读时源输出必须不变，换 code 或换 `--budget` 都会错位。
 - debugger 不可用时的 `via=scripting` 降级路径**无法被 --timeout 中断**；无限循环只能重载 tab。
 
 ## observe
@@ -682,8 +697,10 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
   会在执行前拒绝；urls 模式下 `--wait`/`--timeout` 可以传给 open，内层 `--replace`/`--reuse` 会被拒绝。
 - 内层参数：`read --mode/--selector/--no-main/--budget/--cursor`，
   `snapshot --filter/--near/--budget/--cursor/--values`，
-  `js --code/--budget/--cursor/--timeout`，`wait --text/--text-gone/--selector/--time/--timeout/--idle`。
+  `js --code/--file/--budget/--cursor/--timeout`，`wait --text/--text-gone/--selector/--time/--timeout/--idle`。
   `js` 的位置参数可直接写 CODE，`wait` 的位置参数可直接写 TEXT；完整列表见 `ema2 batch --help`。
+- `batch js --file` 与 `js --file` 对齐：文件在客户端只读一次，再分发给每个标签；
+  `--file` 与 `--code`/位置参数互斥，空文件在执行前报 `invalid_argument`。
 - 预算按 `ceil(目标数/并发) × 单次最长耗时 + open 成本 + 20s`；js 因全局 debugger 串行按有效并发 1 计算。
   `tool=open` 的单次耗时跟随内层 `waitTimeout`（默认 15s），不会再被固定 30s 提前掐断。
 - 估算超过 600s 时在执行前报 `invalid_argument`，请减少目标、提高并发或拆分 batch。

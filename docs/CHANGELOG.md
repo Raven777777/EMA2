@@ -1,5 +1,35 @@
 # 变更记录
 
+## v2.4.2.6 — 扩展成本收敛
+
+不新增命令、不改退出码、不新增错误码；工具仍是 11 个。这一版只处理「写一个扩展要付多少摩擦」，
+并把外围参考实现从被忽略的 `bin/` 迁到可入库的 `examples/jss/`。
+
+### CLI 契约
+
+- **`batch js` 支持 `--file`**：与 `js --file` 对齐，文件在客户端只读一次再分发给每个标签；
+  线上载荷仍是纯 `code`，扩展侧不需要知道来源。`--file` 与 `--code`/位置参数互斥，
+  空文件在发请求前报 `invalid_argument`。
+- **`js --help` 补齐三段语义**：库 + 调用的两种投递方式（两次调用 / 一次投递）、
+  多行必须显式 `return`（否则 `note=ran as an async function body`）、
+  注入即粘住直到导航（重装同名全局不会自动替换）。
+- **`js --help` 的 `--cursor` 标注字符偏移**，与 `read --help` 措辞一致；
+  明确换 code / budget 续读会错位。
+
+### 外围
+
+- **`bin/jss/` → `examples/jss/`**：`bin/` 在 `.gitignore` 内，证据不进库就会丢；
+  路径解析改为 `EMA2_BIN` → `PATH` → 仓库内 `bin/ema2(.exe)`，不再要求「必须在 bin/ 内运行」。
+- `lib.js` v3：返回值改为 `lib=installed v=3`（原为硬编码 `v1`），并回 `replaced=<旧版本>`，
+  改完库但页面仍用旧实现时立刻可见。
+- `serp.js`：`results=` 只数真正写进正文的行，另回 `total=`/`chars=`/`capped=1`；
+  修复 `--budget 2500` 下「头部计数虚高、尾部已被截断」的假象。
+- `search.sh`：查询改为逐字符百分号编码（`+ = % & #` 等不再走样）；`batch.sh` 改用 `batch js --file` 投递。
+
+### 版本
+
+- 对外产品/扩展 `2.4.2.6`；`guardVersion` / `guardProtocolVersion` 5；`helpersVersion` 21；Cargo crate metadata 仍为 SemVer 2.4.2。
+
 ## v2.4.2.5 — 正确性与并发加固
 
 修掉“命令成功但结果是假的”，并补齐并发、关闭与落盘路径的可信度。工具仍是 11 个，

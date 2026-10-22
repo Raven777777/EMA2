@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.4.2.5（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.2.5
+exe        2.4.2.6（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.2.6
 helper     21
 guard      5（guardProtocolVersion 5）
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
@@ -182,7 +182,7 @@ cargo test
 
 ## 已知弱点与下一步优先级
 
-### 残余风险（v2.4.2.5）
+### 残余风险（v2.4.2.6）
 
 下面这些是**设计边界或有意留下的取舍**，不是待修的 P0/P1：
 

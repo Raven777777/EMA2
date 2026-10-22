@@ -65,6 +65,7 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
                             | "--filter"
                             | "--near"
                             | "--code"
+                            | "--file"
                             | "--text"
                             | "--text-gone"
                             | "--time"
@@ -154,6 +155,8 @@ fn numeric_flag(context: &str, flag: &str, value: String) -> Result<Value, Strin
 fn parse_tool_flags(tool: &str, flags: &[String]) -> Result<Value, String> {
     let mut out = json!({});
     let mut cursor = TokenCursor::new(flags);
+    // `batch js` 的 code 只能有一个来源：内联（--code/位置参数）或 --file。
+    let mut js_source: Option<&'static str> = None;
     while let Some(token) = cursor.peek() {
         let (flag, inline) = split_flag(token);
         // 宏而不是闭包：闭包若捕获 &mut cursor，分支里的 cursor.advance() 会冲突。
@@ -201,7 +204,28 @@ fn parse_tool_flags(tool: &str, flags: &[String]) -> Result<Value, String> {
                 _ => return Err(format!("batch: unknown flag {flag:?} for tool {tool}")),
             },
             "js" => match flag {
-                "--code" => out["code"] = json!(value!()),
+                "--code" => {
+                    if js_source == Some("file") {
+                        return Err("batch js: --code and --file are mutually exclusive".into());
+                    }
+                    js_source = Some("code");
+                    out["code"] = json!(value!());
+                }
+                // 与 `js --file` 对齐：文件在客户端只读一次，再分发给每个标签。
+                // 线上载荷仍是纯 code，扩展侧不需要知道来源是文件还是内联。
+                "--file" => {
+                    if js_source == Some("code") {
+                        return Err("batch js: --code and --file are mutually exclusive".into());
+                    }
+                    js_source = Some("file");
+                    let path = value!();
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|error| format!("batch js: cannot read {path}: {error}"))?;
+                    if text.trim().is_empty() {
+                        return Err(format!("batch js: {path} is empty"));
+                    }
+                    out["code"] = json!(text);
+                }
                 "--budget" => out["budget"] = numeric_flag("batch", flag, value!())?,
                 "--cursor" => out["cursor"] = numeric_flag("batch", flag, value!())?,
                 "--timeout" => {
@@ -213,6 +237,12 @@ fn parse_tool_flags(tool: &str, flags: &[String]) -> Result<Value, String> {
                 // 兼容 `batch js --urls u 'return document.title'`：
                 // 位置参数就是 code，不再报 unknown flag。
                 _ if !flag.starts_with('-') => {
+                    if js_source == Some("file") {
+                        return Err(
+                            "batch js: positional code and --file are mutually exclusive".into(),
+                        );
+                    }
+                    js_source = Some("code");
                     out["code"] = json!(flag);
                     cursor.advance();
                 }
@@ -441,6 +471,57 @@ mod tests {
         .expect("expected an error");
         assert!(error.contains("commas are used as separators"), "{error}");
         assert!(error.contains("separate --urls flag"), "{error}");
+    }
+
+    #[test]
+    fn batch_js_accepts_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ema2-batch-js-{}-{}.js",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "return document.title").unwrap();
+        let call = build_batch(&[
+            "js".into(),
+            "--tab-ids".into(),
+            "1".into(),
+            "--file".into(),
+            path.display().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["args"]["code"], "return document.title");
+        assert!(
+            args_of(&call)["args"].get("file").is_none(),
+            "the file path must not leak into the wire payload"
+        );
+
+        // 与 `--code` / 位置参数互斥，且错误要点明是这两个 flag 冲突。
+        let error = build_batch(&[
+            "js".into(),
+            "--tab-ids".into(),
+            "1".into(),
+            "--file".into(),
+            path.display().to_string(),
+            "--code".into(),
+            "return 1".into(),
+        ])
+        .err()
+        .expect("expected an error");
+        assert!(error.contains("mutually exclusive"), "{error}");
+
+        // 空文件必须报错，不能把空 code 发给每个标签。
+        std::fs::write(&path, "  \n").unwrap();
+        assert!(
+            build_batch(&[
+                "js".into(),
+                "--tab-ids".into(),
+                "1".into(),
+                "--file".into(),
+                path.display().to_string(),
+            ])
+            .is_err()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

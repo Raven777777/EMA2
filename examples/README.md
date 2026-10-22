@@ -51,8 +51,21 @@ bin/ema2.exe open https://example.com
 bin/ema2.exe js --file examples/extract.js
 ```
 
-`js` 先按表达式执行；遇到语法错误再按 async 函数体执行，所以文件里可以直接
-`return ...`。
+`js` 先做 compile-only 探测：能按表达式编译就执行一次，否则按 async 函数体执行一次，
+所以文件里可以直接 `return ...`；多行代码必须显式 `return`（见 `ema2 js --help`）。
+
+## jss/ —— 检索扩展的参考实现
+
+```bash
+cd examples/jss
+./search.sh "Rust 2024 edition"       # 搜索并结构化输出
+./run.sh "__E.outline(30)" --tab <ID> # 先看骨架再决定读哪段
+./batch.sh "https://a.example/" "https://b.example/"
+```
+
+`lib.js` 只往页面注入 `window.__E`（`grep/outline/links/main/digest/meta/tables`），
+搜索、并发、摘要都在外围脚本里，核心一行没动。完整说明与实测记录见
+[`jss/README.md`](jss/README.md)；脚本用 `EMA2_BIN` → `PATH` → `bin/ema2(.exe)` 定位 exe。
 
 ## 上传文件
 

@@ -125,6 +125,7 @@ ema2 server stop            # 收尾：关 daemon
 - `batch`：默认并发 2、最大 4；`--tab-ids` 与 `--urls` 互斥；`tool=open` 只能配 `--urls`；
   估算超过 600s 执行前报 `invalid_argument`。
 - 多标签读正文用 `batch read --tab-ids "1,2,3"`，比逐个 `read --tab` 少往返。
+- `batch js` 也接受 `--file`（与 `--code`/位置参数互斥），同一份脚本两处投递方式一致。
 - `js`：既可表达式也可 async 函数体；debugger 不可用降级 `via=scripting`，受 CSP 限制；
   `--timeout` 默认 10s（0.1..300s），超时会 `terminateExecution`，终止该 tab **所有** JS。
 - `observe network`：body 只是 ≤800 字符预览；HAR 是采样，不是完整抓包代理；

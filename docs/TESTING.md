@@ -162,7 +162,7 @@ bin\ema2.exe status          # extension=connected
 ## 开发注意
 
 - 扩展是普通 MV3 service worker。改完 `extension/` 后必须在 `edge://extensions/`
-  点“重新加载”，并确认 `ema2 status` 输出 `version=2.4.2.5`（版本对不上说明还在跑旧脚本）；
+  点“重新加载”，并确认 `ema2 status` 输出 `version=2.4.2.6`（版本对不上说明还在跑旧脚本）；
   如果 Edge 仍用旧脚本，把 `extension/manifest.json` 的 `version` 加一
   （Edge 按 manifest 版本缓存扩展脚本）。
 - 页面 helper 有版本号（`__ema2_helpers_version`）。改 helper 行为时同步加一，

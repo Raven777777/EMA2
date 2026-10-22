@@ -6,7 +6,7 @@
 
 globalThis.EMA2_CONTRACT = Object.freeze({
   "_comment": "Single source of truth for versions and timeout budgets; daemon budgets must outlast extension watchdogs so a clean timeout wins, except for the documented batch 600 s product cap, where the extension watchdog is 580 s.",
-  "productVersion": "2.4.2.5",
+  "productVersion": "2.4.2.6",
   "guardVersion": 5,
   "guardProtocolVersion": 5,
   "helpersVersion": 21,
