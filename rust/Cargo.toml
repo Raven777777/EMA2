@@ -18,6 +18,9 @@ futures-util = { version = "0.3", features = ["sink"] }
 tower-http = { version = "0.6", features = ["limit"] }
 base64 = "0.22"
 
+[build-dependencies]
+winres = "0.1"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

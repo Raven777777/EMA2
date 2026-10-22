@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// 默认端口。扩展 popup 与所有 CLI 命令共用这个值。
 pub const DEFAULT_PORT: u16 = 7744;
 /// 对外产品版本。Cargo/SemVer 不能表达四位版本，因此 crate 版本仍为 2.4.2。
-pub const PRODUCT_VERSION: &str = "2.4.2.6";
+pub const PRODUCT_VERSION: &str = "2.4.2.7";
 
 /// 截图 / HAR 输出目录。
 pub fn output_dir() -> PathBuf {

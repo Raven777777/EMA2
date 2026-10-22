@@ -1,5 +1,32 @@
 # 变更记录
 
+## v2.4.2.7 — exe 图标与 build script 归位
+
+不新增命令、不改退出码、不新增错误码；工具仍是 11 个。这一版只修「分发包里的 exe 在资源管理器里没有图标」。
+
+### 构建
+
+- **`build.rs` 移到包根目录**：Cargo 只识别与 `Cargo.toml` 同级的 `rust/build.rs`。
+  原 `rust/src/build.rs` 既不是 build script、也不在模块树里（`src/cli/mod.rs` 的 `mod build`
+  解析到 `src/cli/build.rs`），`winres` 因此从未执行——旧 exe 的 PE 资源节长度为 0，
+  连 `RT_VERSION` 都没有。
+- **图标移到 `rust/assets/ema2log.ico`**：`set_icon()` 的相对路径基准是 `CARGO_MANIFEST_DIR`
+  （winres 以 `/I<manifest_dir>` 调用 `rc.exe`），不是 `src/`；原写法即使 build script 位置正确
+  也会找不到文件。
+- **`rc.exe` 不再只靠注册表定位**：winres 0.1 用 `reg query HKLM\...\Windows Kits\Installed Roots`
+  找 SDK，注册表不可用时退化成空路径并报 `os error 3`；现在按 PATH →
+  `Windows Kits\10\bin\<ver>\<arch>`（最高版本优先）→ 无版本兜底目录的顺序查找，
+  最后才回落到 winres 自带逻辑。
+- **失败即失败**：`res.compile()` 出错直接 panic，不再产出「构建成功但没有图标」的 exe。
+- `cargo:rerun-if-changed` 只盯 `assets/ema2log.ico` 与 `build.rs`，改图标才会重跑构建脚本。
+
+### 版本
+
+- 对外产品/扩展 `2.4.2.7`；`guardVersion` / `guardProtocolVersion` 5；`helpersVersion` 21；
+  Cargo crate metadata 仍为 SemVer 2.4.2。
+- 扩展 `manifest.json`、`contract/runtime.json`、`PRODUCT_VERSION` 三处同步（`cargo test` 断言一致）；
+  改动后需在 `edge://extensions` 重新加载扩展，否则 `ema2 status` 仍报旧版本。
+
 ## v2.4.2.6 — 扩展成本收敛
 
 不新增命令、不改退出码、不新增错误码；工具仍是 11 个。这一版只处理「写一个扩展要付多少摩擦」，
