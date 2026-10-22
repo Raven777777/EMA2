@@ -136,6 +136,11 @@ function readPageContent(modeName, selectorArg, mainWanted) {
   }
 }
 
+/** 正文地标 selector：未命中时回退到默认 main/body，避免多一次往返。 */
+function isMainLandmarkSelector(selector) {
+  return /^(?:main|article|\[role\s*=\s*['"]?main['"]?\])$/i.test(String(selector || '').trim());
+}
+
 /** challenge / login 是页面状态而不是错误：state= + hint，退出 0。 */
 function readStateOutput(data, kind) {
   const hint = kind === 'challenge'
@@ -157,10 +162,22 @@ async function readTool(args) {
   const cursor = normalizeCursor(args.cursor);
   const useMain = args.main !== false && !selector;
   let data;
+  let selectorFallback = '';
   try {
     data = await runInTab(tab.id, readPageContent, [mode, selector || null, useMain]);
   } catch (error) {
     await failInjection(tab, error, 'reading content');
+  }
+  if (data && data.missing) {
+    if (!isMainLandmarkSelector(selector)) {
+      fail('selector_not_found', `selector not found: ${selector}`, 'call snapshot to see available refs/roles');
+    }
+    selectorFallback = selector;
+    try {
+      data = await runInTab(tab.id, readPageContent, [mode, null, args.main !== false]);
+    } catch (error) {
+      await failInjection(tab, error, 'reading fallback content');
+    }
   }
   if (!data || data.kind === 'helpers_missing') {
     fail('helpers_missing', 'page helpers are not installed', 'reload the tab and retry');
@@ -169,8 +186,8 @@ async function readTool(args) {
     fail('js_exception', `read's page helper threw: ${oneLine(data.message)}`,
       "the page may be hostile or mid-navigation; check the exception, retry after `ema2 await 2s`, then file a bug if it repeats");
   }
-  if (data.missing) {
-    fail('selector_not_found', `selector not found: ${selector}`, 'call snapshot to see available refs/roles');
+  if (selectorFallback) {
+    data.header += `\nselector_fallback=1 selector=${oneLine(selectorFallback)}`;
   }
   if (data.kind === 'pdf') {
     fail('pdf_page', `the document is a PDF (content_type=${data.contentType || 'application/pdf'})`,
@@ -191,9 +208,17 @@ async function readTool(args) {
   const parts = [data.header, slice.text, footer(slice.total, slice.text.length, slice.next)];
   if (slice.next != null) parts.push('truncated=1');
   const hint = truncationHint('read', slice.total, slice.text.length, slice.next, cursor);
-  if (hint) parts.push(`hint=${hint.replace(/^hint=/, '')} (keep --mode ${mode})`);
+  if (hint) {
+    let message = hint.replace(/^hint=/, '');
+    if (!cursor && slice.total <= MAX_OUTPUT_CHARS) {
+      message += `, or --budget ${slice.total} --cursor 0 for all ${slice.total} chars`;
+    }
+    parts.push(`hint=${message} (keep --mode ${mode})`);
+  }
   if (cursor > 0) parts.push(`hint=cursor is a character offset for mode=${mode}; use the same mode when continuing`);
-  if (data.mainFallback) {
+  if (selectorFallback) {
+    parts.push(`hint=selector "${oneLine(selectorFallback)}" not found; used default main/body instead`);
+  } else if (data.mainFallback) {
     parts.push(`hint=main extraction too short (${data.textLength || 0} chars); fell back to body. Use --selector or --no-main to control this.`);
   }
   if (mode === 'visible' && !slice.total) {

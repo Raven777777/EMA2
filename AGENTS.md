@@ -77,8 +77,8 @@ ema2 server stop            # 收尾：关 daemon
 | `ema2 status` | relay / extension / tabs 状态 |
 | `ema2 init` | 在当前目录写/更新本文件 |
 | `ema2 tabs [list\|current\|new\|close\|activate]` | 标签页；`tabs new` **默认激活并聚焦窗口**，`--background` 才后台 |
-| `ema2 open <url> [--tab ID\|--replace\|--reuse session] [--wait load\|dom\|none] [--timeout 15]` | 打开/导航；输出 `id/url/title/status/reuse/net_hook/focused` |
-| `ema2 read [--tab ID] [--mode md\|text\|html\|visible] [--selector X] [--no-main] [--budget N] [--cursor N]` | 读正文；默认 `--main` 开。登录/验证页输出 `state=login_required\|challenge`（exit 0），空页/PDF/HTTP 404 报错（exit 4） |
+| `ema2 open <url> [--tab ID\|--replace\|--reuse session] [--wait load\|dom\|none] [--timeout 15]` | 打开/导航；输出 `id/url/title/status/reuse/net_hook/focused`，有对话框时加 `dialog_opened=` |
+| `ema2 read [--tab ID] [--mode md\|text\|html\|visible] [--selector X] [--no-main] [--budget N] [--cursor N]` | 读正文；默认 `--main` 开。`main`/`article`/`[role=main]` 未命中会回退并标 `selector_fallback=1`；登录/验证页输出 `state=login_required\|challenge`（exit 0），空页/PDF/HTTP 404 报错（exit 4） |
 | `ema2 snapshot [--tab ID] [--filter interactive\|full\|links\|buttons\|form] [--near REF] [--budget N] [--cursor N] [--values]` | ref 快照；`[e12@d1] button "X"`，href 是完整 URL |
 | `ema2 act <action> [ref] [text] [flags] [--tab ID]` / `--steps` / `--script x.ema2` | 单步或脚本；不强制切换活动标签 |
 | `ema2 await [10s] [--tab ID]` | 等**上一个 act 所在标签**的导航/页面稳定；缺省 3s，范围 0–300s |
@@ -96,6 +96,7 @@ ema2 server stop            # 收尾：关 daemon
 - `tabs new`：默认激活并聚焦窗口；`tabs activate` 也会 `windows.update{focused:true}`。
 - `open`：默认新开并登记会话；`--replace` 当前标签导航；`--reuse session` 复用本会话最近标签；
   `--tab ID` 指定标签且不计入会话；三者互斥。`--timeout` 是整个 open 流程硬上限，1..60 默认 15。
+  加载期间的 `alert/confirm/prompt/print` 记为 `dialog_opened=` 并自动关闭，不代表用户确认。
 - `act`：默认最多 settle 3s；`settle=pending` **不是失败**，接 `ema2 await 10s`。
   点链接没导航给 `nav=none`；可导航 `<a>` 无任何变化才自动重试一次，输出 `retried=1`。
   普通按钮最多 800ms；SPA 只改 DOM 时约 1s 后按 `nav=none` 结算。

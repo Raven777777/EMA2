@@ -134,6 +134,8 @@ bin\ema2.exe status          # extension=connected
 | 28 | `ema2 server stop` → `ema2 status` | `relay=stopped`；status 退出 2 |
 | 29 | `ema2 act scroll up/down N` | 方向正确，`down N` 约 N 屏 |
 | 30 | `ema2 read` on shadow DOM | 能看到 open shadow root 正文 |
+| 30a | `ema2 read --selector main`（页面无 main/article 元素） | 退出 0，`selector_fallback=1`，仍能读到默认正文 |
+| 30b | `ema2 read --budget 200`（长文） | `truncated=1`，hint 带全文长度和 `--budget N --cursor 0` |
 | 31 | `ema2 files upload` 5 MiB | 不再被 2MB axum 默认上限截断 |
 | 32 | 运行时 `SyntaxError` | `js_exception` 且副作用只执行一次 |
 | 33 | 命令执行中的 `alert/print` | 非阻塞并回 `dialog_opened=` |

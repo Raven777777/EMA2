@@ -101,7 +101,7 @@ total=2 shown=2 next=none
 | `target_not_found` | ref/selector/target 都找不到 | 用 `snapshot` 的 ref，或 `--target "role:name"` |
 | `not_clickable` | 目标隐藏/空盒/不可聚焦/非交互容器 | 重新 snapshot，点真正可见的控件 |
 | `obscured` | 目标中心点被 overlay/弹窗遮住 | 先关闭遮罩/弹窗，或点实际接收指针的元素 |
-| `selector_not_found` | `read --selector` 没匹配到 | 用 `snapshot` 的 ref 或换 selector |
+| `selector_not_found` | `read --selector` 没匹配到，且不是 `main`/`article`/`[role=main]` | 用 `snapshot` 的 ref 或换 selector；正文地标会自动回退 |
 | `element_disabled` | 目标 disabled | 先启用控件或换目标 |
 | `element_readonly` / `unsupported_control` | 控件不可写/类型不支持 | 用可编辑控件，或 `select` 对应控件 |
 | `not_writable` / `not_select` | 目标不是可写控件/不是 select | 换目标或换动作 |
@@ -222,6 +222,8 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 
 等页面就绪、装网络 hook，返回 `id / url / title / status / reuse / net_hook`（有重定向时加 `redirects=`）。
 
+- 加载期间有对话框时追加 `dialog_opened=<alert|confirm|prompt|print|beforeunload> handled=<dismissed|blocked|suppressed|passed> [msg=...]`（最多 3 条）；
+  被拦截的 `window.open` 追加 `popup_blocked=1 url=...`。
 - 输出包含 `focused=1|0`：`0` 表示浏览器窗口不在前台，会附 hint（先 `tabs activate`）。
 - 默认新开标签，并登记进会话。
 - `--replace`：在当前活动标签里导航（不新建），适合「同一个页面连续翻几页」。
@@ -243,8 +245,9 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 - 超时不会把旧的 hook/timing/focus 探测拖到后面：整个流程共用一个 deadline，
   中继预算也跟着 `waitTimeout` 走（默认 15s，最大 60s）。
 - `open` 执行期间会临时注册 document_start 的 `page_guard.js`；页面加载期间触发的
-  `alert/confirm/prompt/print` 被记录并自动关闭，不会让 open 卡死。命令结束后 guard
-  注销并恢复页面原生 API；不使用 EMA2 时不会注入或覆盖对话框。
+  `alert/confirm/prompt/print` 被记录并自动关闭，不会让 open 卡死。`handled=dismissed/blocked/suppressed`
+  只表示 EMA2 已关闭/拦截，**不代表用户确认了对话框**；命令结束后 guard 注销并恢复页面原生 API，
+  不使用 EMA2 时不会注入或覆盖对话框。
 
 ## read
 
@@ -256,6 +259,8 @@ ema2 read [--tab ID] [--mode md|text|html|visible] [--selector X] [--no-main] [-
 - 正文容器太短（<200 字符，或不到 body 的 5%）时回退 `main=body(fallback)`，并给
   `hint=main extraction too short (...); fell back to body`。
 - `--selector` 优先于 `--main`，支持 shadow DOM / 同源 iframe 内的元素。
+- `--selector main|article|[role=main]` 未命中时自动回退到默认 `main`/`body`，头部加
+  `selector_fallback=1 selector=<原值>` 并给 hint；其他 selector 仍报 `selector_not_found`。
 - `text`/`md` 会跳过 `script/style/noscript/template/textarea/input/select/option`，以及
   `display:none`/`visibility:hidden`/`content-visibility` 的隐藏元素；地标壳的跳过规则见下。
   `html` 仍是原始 HTML。
@@ -317,11 +322,11 @@ read 头部现在总是带 `http=`（主文档响应状态）与 `content_type=`
 - 尾部 `truncated=1` 明确表示还有内容；`--cursor` 是**字符偏移**，换 `--mode` 续读会错位，
   续读时保持同一个 mode（头部会回 `mode=`）。
 - 头部 `url/title[/main][state?] http/? content_type?` 和 `mode=md|text|html|visible`，
-  正文，尾部 `total/shown/next`。
+  正文，尾部 `total/shown/next`；`total` 是全文提取后的字符数，`shown` 是本次返回的字符数。
 - 四种 mode 共用 `--selector` / `--no-main` / 默认 `main` 的选区，以及 budget/cursor；
   换 mode 续读会错位，保持同一个 mode。
-- **被截断时尾部多一行** `hint=truncated: returned 4000 of 12345 chars; call read with --cursor 4000 to continue`：
-  不要把这 4000 字当成全文，按提示传 `--cursor` 续读（长页面的 FAQ/页脚常在后半段）。
+- **被截断时尾部多一行** `hint=truncated: returned 4000 of 12345 chars; call read with cursor=4000 to continue, or --budget 12345 --cursor 0 for all 12345 chars`：
+  首次读取会同时给出全文长度和一次读完的 budget（`total <= 200000` 时）；不要把这 4000 字当成全文。
 
 ## snapshot
 

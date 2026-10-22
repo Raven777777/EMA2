@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.4.2.3（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.2.3
+exe        2.4.2.4（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.2.4
 helper     20
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```

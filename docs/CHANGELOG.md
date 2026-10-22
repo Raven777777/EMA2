@@ -1,5 +1,22 @@
 # 变更记录
 
+## v2.4.2.4 — read 回退与输出提示
+
+减少 `read` 的一次性往返和截断后的多轮续读，并补齐 `open` 的对话框输出文档；不新增命令、
+不改退出码。
+
+- **正文地标回退**：`read --selector main|article|[role=main]` 未命中时，自动按默认
+  `main`/`body` 重读，头部加 `selector_fallback=1 selector=<原值>` 并给简短 hint；
+  其他 selector（如 `#nope`）仍报 `selector_not_found`。
+- **全文预算提示**：首次读取被截断时，cursor hint 后追加
+  `--budget <total> --cursor 0 for all <total> chars`（仅 `total <= 200000`）；
+  后续 cursor 续读不重复提示。`total/shown` 语义不变。
+- **文档**：`open` 输出补充 `dialog_opened=<type> handled=<...> [msg=...]` 与
+  `popup_blocked=1`，明确自动关闭/拦截不代表用户确认；`ema2 init` 模板同步。
+- **验收**：新增真机用例覆盖地标回退和首次截断预算提示；`cargo test` / clippy / fmt /
+  `verify.py` 全部通过。
+- 版本：对外产品/扩展 `2.4.2.4`；Cargo crate metadata 仍为 SemVer `2.4.2`。
+
 ## v2.4.2.3 — act 的可验证终点
 
 把 `act --wait-for` 从“等响应/导航”扩展为“等任意可验证的页面条件”，复用

@@ -588,7 +588,7 @@ def main() -> int:
 
     try:
         version = runner.run("--version")
-        runner.expect_ok("binary exposes product version", version, "2.4.2.3")
+        runner.expect_ok("binary exposes product version", version, "2.4.2.4")
 
         opened = runner.expect_ok("open fixture", runner.run("open", f"{base}/"), "status=200", "net_hook=on", "title=ema2 fixture home")
         tab_match = re.search(r"^id=(\d+)", opened, re.M)
@@ -1017,6 +1017,16 @@ def main() -> int:
             clean_text.returncode == 0 and "Visible Main" in clean_out and "nav-only-text" not in clean_out,
             clean_out[:800],
         )
+        visible_budget = runner.run("read", "--mode", "text", "--no-main", "--budget", "200")
+        visible_budget_out = (visible_budget.stdout or "") + (visible_budget.stderr or "")
+        runner.check(
+            "read first truncation suggests the full budget",
+            visible_budget.returncode == 0
+            and "truncated=1" in visible_budget_out
+            and "--budget" in visible_budget_out
+            and "--cursor 0" in visible_budget_out,
+            visible_budget_out[:1200],
+        )
 
         # ---- P0 read：可见性 / 地标 / 块模型 / 链接 / 噪声 / 页面状态 fixtures ----
         runner.run("open", f"{base}/contents.html")
@@ -1034,6 +1044,18 @@ def main() -> int:
             "read default main also keeps display:contents",
             contents_main.returncode == 0 and "contents paragraph alpha" in (contents_main.stdout or ""),
             (contents_main.stdout or "")[:1200],
+        )
+        main_fallback = runner.run("read", "--selector", "main", "--mode", "text")
+        main_fallback_out = runner.expect_ok(
+            "read main landmark falls back to default content",
+            main_fallback,
+            "selector_fallback=1 selector=main",
+            "contents paragraph alpha",
+        )
+        runner.check(
+            "read main fallback gives a short hint",
+            'hint=selector "main" not found' in main_fallback_out,
+            main_fallback_out[:800],
         )
 
         runner.run("open", f"{base}/landmark.html")
