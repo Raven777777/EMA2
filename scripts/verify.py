@@ -1031,8 +1031,41 @@ def main() -> int:
             runner.run("observe", "--help"), "默认 error",
         )
         runner.expect_ok(
-            "batch --help exposes reuse url|session",
+            "batch --help still works while hidden",
             runner.run("batch", "--help"), "--reuse url|session",
+        )
+        top_help = runner.run("--help")
+        top_out = (top_help.stdout or "") + (top_help.stderr or "")
+        commands_block = re.search(r"Commands:\n(.*?)\n\nOptions:", top_out, re.S)
+        listed = (
+            set(re.findall(r"^  ([a-z]+)\s", commands_block.group(1), re.M))
+            if commands_block else set()
+        )
+        expected_commands = {
+            "server", "status", "init", "tabs", "open", "read", "snapshot",
+            "act", "await", "wait", "js", "observe", "files", "shot",
+        }
+        runner.check(
+            "top-level help lists 14 commands and hides batch",
+            top_help.returncode == 0 and listed == expected_commands,
+            f"listed={sorted(listed)}\n" + top_out[:1200],
+        )
+        tabs_help = runner.run("tabs", "--help")
+        tabs_help_out = (tabs_help.stdout or "") + (tabs_help.stderr or "")
+        runner.check(
+            "tabs help hides new/current but keeps list/close/activate",
+            tabs_help.returncode == 0
+            and all(f"  {name}" in tabs_help_out for name in ("list", "close", "activate"))
+            and "  new" not in tabs_help_out and "  current" not in tabs_help_out,
+            tabs_help_out[:1200],
+        )
+        files_help = runner.run("files", "--help")
+        files_help_out = (files_help.stdout or "") + (files_help.stderr or "")
+        runner.check(
+            "files help hides download-dir but keeps upload",
+            files_help.returncode == 0 and "  upload" in files_help_out
+            and "download-dir" not in files_help_out,
+            files_help_out[:1200],
         )
 
         # SPA 链接只改 DOM 不导航：应 settle=done + nav=none，而不是 pending。
@@ -1176,7 +1209,8 @@ def main() -> int:
         batch = runner.run("batch", "read", "--urls", f"{base}/,{base}/second.html", "--concurrency", "2", timeout=120)
         runner.check(
             "batch reads both tabs",
-            batch.returncode == 0 and batch.stdout.count("url=") >= 2 and "Second Page" in (batch.stdout or ""),
+            batch.returncode == 0 and batch.stdout.count("url=") >= 2 and "Second Page" in (batch.stdout or "")
+            and "deprecated=" not in (batch.stdout or ""),
             (batch.stdout or "") + (batch.stderr or "")[-600:],
         )
         reused_batch = runner.run(
@@ -1692,6 +1726,19 @@ def main() -> int:
             and f"id={new_match.group(1)}" in (current_tab.stdout or ""),
             new_out + (current_tab.stdout or "") + (current_tab.stderr or ""),
         )
+        runner.check(
+            "tabs new appends deprecated= last",
+            new_out.strip().splitlines()[-1] == "deprecated=1 use ema2 open --background",
+            new_out,
+        )
+        current_out = (current_tab.stdout or "") + (current_tab.stderr or "")
+        runner.check(
+            "tabs current appends deprecated= last",
+            current_tab.returncode == 0
+            and current_out.strip().splitlines()[-1]
+            == "deprecated=1 use ema2 status or ema2 tabs list",
+            current_out,
+        )
         if new_match:
             runner.run("tabs", "close", new_match.group(1))
 
@@ -1783,6 +1830,15 @@ def main() -> int:
             runner.run("batch", "open", "--urls", f"{base}/", "--replace"),
             "invalid_argument",
             1,
+        )
+        download_dir = runner.run("files", "download-dir")
+        download_dir_out = (download_dir.stdout or "") + (download_dir.stderr or "")
+        runner.check(
+            "files download-dir still errors with a deprecated line",
+            download_dir.returncode == 4
+            and "error=download_dir_unsupported" in download_dir_out
+            and "deprecated=1 set the directory in edge://settings/downloads" in download_dir_out,
+            download_dir_out[:800],
         )
         # P1-3：ref 与 selector 同时给出时必须由 CLI 拒绝，而不是扩展按 ref 优先。
         runner.expect_error(

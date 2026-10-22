@@ -98,7 +98,8 @@ async function filesTool(args) {
     // Edge 不允许扩展修改下载目录；在触碰浏览器之前就给出稳定错误。
     fail('download_dir_unsupported',
       'Edge does not allow an extension to change the download directory',
-      'set it manually in edge://settings/downloads; files land in the default Downloads folder');
+      'set it manually in edge://settings/downloads; files land in the default Downloads folder',
+      ['deprecated=1 set the directory in edge://settings/downloads']);
   }
   fail('invalid_action', `unknown files action: ${action}`, 'use upload|download-dir');
 }

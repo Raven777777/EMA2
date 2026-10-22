@@ -1,5 +1,40 @@
 # 变更记录
 
+## v2.4.3.11 — 隐藏旧面（运行时兼容）
+
+可见契约缩小，但不破坏旧脚本。顶层 help 从 15 个命令降到 **14** 个；隐藏的四个旧入口
+仍可执行，v2.4.3.21 才删除对应解析器。
+
+### CLI
+
+- `ema2 batch` 从顶层 help 隐藏；`ema2 batch --help` 仍可打开，运行时输出保持字节兼容
+  （除 v2.4.3.1 已加的 `resume=` 行外，不加 `deprecated=`，避免破坏按 `---` 分块的解析器）。
+- `ema2 tabs new` / `ema2 tabs current` 从 `tabs --help` 隐藏；输出**末尾**追加
+  `deprecated=1 use ema2 open --background` / `deprecated=1 use ema2 status or ema2 tabs list`。
+- `ema2 files download-dir` 从 `files --help` 隐藏；仍返回 `download_dir_unsupported`，
+  错误末尾追加 `deprecated=1 set the directory in edge://settings/downloads`。
+- `deprecated=` 一律追加在末尾，不动首行，旧脚本按首行 `id=` 解析不受影响。
+
+### 文档
+
+- `docs/TOOLS.md` 主命令表删除 `batch`，`tabs` 只列 `list/close/activate`，`files` 只列 `upload`；
+  旧语法统一移入 `## Legacy（v2.4.3.11 起隐藏）`，并指向「目标与并发」。
+- `rust/assets/AGENTS.md` 不再出现 `batch` / `tabs new` / `tabs current` / `files download-dir`；
+  根 `AGENTS.md` 由 `ema2 init` 重新生成。
+
+### 测试
+
+- `cargo test` 新增：14 个可见顶层命令、`batch`/`tabs new`/`tabs current`/`files download-dir`
+  被隐藏但仍可解析、子命令 help 仍可打开；命令表漂移测试同步到 14。
+- `scripts/verify.py` 新增：顶层 help 恰好 14 个命令且不含 `batch`；`tabs --help` 不含 `new/current`；
+  `files --help` 不含 `download-dir`；`batch --help` 仍可用；三个旧入口的 `deprecated=` 行；
+  `batch` 输出不含 `deprecated=`。
+
+### 版本
+
+- 对外产品/扩展 `2.4.3.11`；`guardVersion` / `guardProtocolVersion` 5；`helpersVersion` 21；
+  Cargo crate metadata 仍为 SemVer 2.4.2。改了扩展脚本，需在 `edge://extensions` 重新加载。
+
 ## v2.4.3.1 — 命令面语义统一（纯增量）
 
 不删旧语法、不改退出码、不新增工具（仍是 11 个）。这一版只补 EVOLUTION.md 的第一段：

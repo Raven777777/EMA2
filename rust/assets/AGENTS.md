@@ -9,7 +9,7 @@
 ```bash
 ema2 server                 # 每会话先起 daemon，后台立即返回
 ema2 status                 # 期望 relay=running extension=connected
-ema2 open <url>             # 或 tabs new；看 status= / net_hook= / focused=
+ema2 open <url>             # 新开并聚焦；--background 后台；看 status= / net_hook= / focused=
 ema2 snapshot               # 拿 ref，如 e12@d1
 ema2 act click e12@d1       # 操作；默认 settle 3s
 ema2 await 10s              # settle=pending 或需等导航/稳定时
@@ -42,7 +42,7 @@ ema2 server stop            # 收尾：关 daemon
 | `ema2 server [--port N]` / `ema2 server stop` | 启停本机中继 daemon；`server` 后台化立即返回 |
 | `ema2 status` | relay / extension / tabs 状态 |
 | `ema2 init` | 在当前目录写/更新本文件 |
-| `ema2 tabs [list\|current\|new\|close\|activate]` | 标签页；`tabs new` **默认激活并聚焦窗口**，`--background` 才后台 |
+| `ema2 tabs [list\|close\|activate]` | 标签页；`tabs activate` 会把窗口提到前台 |
 | `ema2 open <url> [--tab ID\|--replace\|--reuse last] [--until load\|dom\|none] [--timeout 15s]` / `open --urls "u1,u2" [--background]` | 打开/导航；输出 `id/url/title/status/reuse/net_hook/focused`，有对话框时加 `dialog_opened=` |
 | `ema2 read [--tab ID\|--tabs "1,2"\|--urls "u1,u2"\|--url <u>] [--mode md\|text\|html\|visible] [--selector X] [--no-main] [--budget N] [--cursor N]` | 读正文；默认 `--main` 开。`main`/`article`/`[role=main]` 未命中会回退并标 `selector_fallback=1`；登录/验证页输出 `state=login_required\|challenge`（exit 0），空页/PDF/HTTP 404 报错（exit 4） |
 | `ema2 snapshot [--tab ID\|--tabs\|--urls\|--url] [--filter interactive\|full\|links\|buttons\|form] [--near REF] [--budget N] [--cursor N] [--values]` | ref 快照；`[e12@d1] button "X"`，href 是完整 URL |
@@ -51,15 +51,14 @@ ema2 server stop            # 收尾：关 daemon
 | `ema2 wait <text\|textGone\|selector\|time\|idle> ... [--timeout 30s] [--tab ID\|--tabs\|--urls]` | 等页面条件；**shell 命令，不能写进 .ema2 脚本** |
 | `ema2 js '<code>' [--tab ID\|--tabs\|--urls] [--budget N] [--cursor N] [--timeout 10s]` / `--file f.js` | 页面主世界执行 JS；默认 10s 上限 |
 | `ema2 observe console\|network ... [--since SEQ] [--har x.har]` | console 默认 `--level error`；network 可 `--url-filter`/`--collect`/`--no-bodies` |
-| `ema2 files upload <path...> --ref R` / `--selector S` / `--target T` | 上传本地文件；`files download-dir` 固定报错 |
+| `ema2 files upload <path...> --ref R` / `--selector S` / `--target T` | 上传本地文件 |
 | `ema2 shot [--tab ID] [--inline] [--annotate] [--format png\|jpeg] [--out PATH]` | 截图落盘；`--tab` 自动激活目标标签 |
-| `ema2 batch <open\|read\|snapshot\|js\|wait> --urls "u1,u2"` / `--tab-ids "1,2"` | 旧的多标签语法（执行器仍是同一个）；新写法用各命令的 `--tabs/--urls`，`--reuse url` 仅用于 `--urls` |
 
 ## 默认值 / 副作用 / 语义
 
 - `ref`：形如 `e12@d1`；导航/刷新/换 tab 后旧完整 ref 报 `stale_ref`，重新 `snapshot`。
   手敲可用短 ref `e12`（当前文档）；严格防误点用 snapshot 原样完整 ref。
-- `tabs new`：默认激活并聚焦窗口；`tabs activate` 也会 `windows.update{focused:true}`。
+- `tabs activate`：切 tab 并 `windows.update{focused:true}`，把窗口提到前台。
 - `open`：默认新开、激活、聚焦并登记会话；`--replace` 当前标签导航；`--reuse last` 复用本会话最近标签
   （旧名 `session`）；`--tab ID` 指定标签且不计入会话；三者互斥。`--background` 只在新建标签时生效，
   与上述三者同时给报 `invalid_argument`。`--until` 是返回到什么程度（旧名 `--wait`），
@@ -94,10 +93,8 @@ ema2 server stop            # 收尾：关 daemon
 - 窗口：**必须前台**；`shot --tab` 自动激活目标标签；`open` 输出 `focused=0` 时先 `tabs activate <id>`。
 - `files upload`：单次 ≤20 文件、≤5 MiB；走页面 `DataTransfer`，不依赖 debugger；
   Windows 路径必须 `C:/...` 绝对路径。
-- `batch`：默认并发 2、最大 4；`--tab-ids` 与 `--urls` 互斥；`tool=open` 只能配 `--urls`；
-  估算超过 600s 执行前报 `invalid_argument`。
-- 多标签读正文用 `batch read --tab-ids "1,2,3"`，比逐个 `read --tab` 少往返。
-- `batch js` 也接受 `--file`（与 `--code`/位置参数互斥），同一份脚本两处投递方式一致。
+- 多标签读正文用 `read --tabs "1,2,3"`，比逐个 `read --tab` 少往返。
+- `js --file` 在多目标下只读文件一次，再分发给每个目标；与 `--code`/位置参数互斥。
 - `js`：既可表达式也可 async 函数体；debugger 不可用降级 `via=scripting`，受 CSP 限制；
   `--timeout` 默认 10s（0.1..300s），超时会 `terminateExecution`，终止该 tab **所有** JS。
 - `observe network`：body 只是 ≤800 字符预览；HAR 是采样，不是完整抓包代理；
@@ -121,7 +118,7 @@ Never：
 - 不要对隐藏元素或 overlay 下元素直接 click。
 - 不要混用 server 与命令的 `--port`。
 - 不要把 `wait` 写进脚本；脚本用 `await` / `waitFor`。
-- 不要用 `batch --reuse session` 配 `--tab-ids`；它仅用于 `--urls`。
+- 不要用 `--reuse` 配 `--tabs`；它仅用于 `--urls`。
 
 ## 错误码 -> 动作
 
@@ -135,7 +132,7 @@ Never：
 | `payload_too_large` | 减小上传或拆分调用 |
 | `invalid_argument` / `invalid_arguments` | 看 `ema2 <cmd> --help`；脚本看 `ema2 act --help` |
 | `invalid_action` / `invalid_step` / `too_many_steps` | 用支持的动作；每步写 action；≤20 步，拆多次 |
-| `invalid_tab` / `tab_not_found` / `no_active_tab` | `tabs list`；先 `open` 或 `tabs new` |
+| `invalid_tab` / `tab_not_found` / `no_active_tab` | `tabs list`；先 `open` |
 | `invalid_url` | 用完整 http(s) 地址 |
 | `invalid_path` | Windows 上传路径用 `C:/dir/file` 绝对路径 |
 | `invalid_selector` | CSS 语法错；换 selector 或用 snapshot ref |
@@ -189,7 +186,7 @@ ema2 status
 ## 收尾
 
 ```bash
-ema2 tabs close --session   # 关本会话由 open/tabs new 打开的标签
+ema2 tabs close --session   # 关本会话由 open 打开的标签
 ema2 server stop            # 显式关闭 daemon
 ```
 <!-- ema2:end -->

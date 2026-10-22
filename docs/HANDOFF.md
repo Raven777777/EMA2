@@ -5,11 +5,12 @@
 ## 当前版本
 
 ```text
-exe        2.4.3.1（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.3.1
+exe        2.4.3.11（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.3.11
 helper     21
 guard      5（guardProtocolVersion 5）
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
+可见 CLI  14 个顶层命令（batch 已隐藏，仍可调用）
 ```
 
 `await` 是 CLI 命令，映射到 `wait` 工具，不增加第 12 个工具。
@@ -101,7 +102,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-运行 `cargo test` 查看当前用例数（本版为 **130**）。
+运行 `cargo test` 查看当前用例数（本版为 **131**）。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -180,6 +181,9 @@ cargo test
 - `open/js --timeout`、`wait --timeout`、`observe --collect` 统一接受 `30` / `30s` / `500ms`
 - observe 新名：`--url-filter`（network; 旧 `--filter` 隐藏）、`--collect`（旧 `--wait` 隐藏）、
   `--no-bodies`（旧 `--bodies=false` 保留）
+- v2.4.3.11：`batch`、`tabs new`、`tabs current`、`files download-dir` 从 help 隐藏；
+  `batch` 输出保持字节兼容（无 `deprecated=`），`tabs new/current` 与 `files download-dir`
+  在输出/错误末尾追加 `deprecated=1`；运行时仍可执行，v2.4.3.21 才删解析器
 - `batch` 在 budget/cursor 截断的块后追加 `resume=<tool> --tab <id> --cursor <next>`
 - `batch` 内层参数放在 `args`；内层校验复用子工具 validator
 - `batch --urls --reuse url`（旧名 `session`）只复用精确 URL 命中的会话标签；默认仍新开

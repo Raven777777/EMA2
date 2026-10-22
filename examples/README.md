@@ -44,6 +44,9 @@ bash examples/batch-read.sh https://example.com https://example.org
 ema2 batch read --urls "u1,u2" --mode md --budget 8000
 ```
 
+脚本里的 `batch` 仍可执行（v2.4.3.11 起从 help 隐藏）；新写法是
+`ema2 read --urls "u1,u2" --mode md --budget 8000`。
+
 ## extract.js —— 页面内结构化抽取
 
 ```bash

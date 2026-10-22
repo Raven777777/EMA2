@@ -299,20 +299,22 @@ CLI 读本地文件 → base64 随 `/cmd` 请求下发 → 扩展在页面 MAIN 
 ## 前台语义
 
 扩展不提供 headless：`shot` 用 `captureVisibleTab`，只截窗口里**活动的 tab**；
-`tabs activate` / `tabs new` / `open`（新建标签）都会
-`chrome.windows.update({focused:true})` 把窗口提到前台。
+`tabs activate` / `open`（新建标签）都会
+`chrome.windows.update({focused:true})` 把窗口提到前台（隐藏的 `tabs new` 行为不变）。
 `open` 输出 `focused=1|0`：`0` 表示窗口不在前台，会附 hint。
 测试脚本必须据此断言 `document.hasFocus()`（见 TESTING.md）。
 
 ## batch
 
 - `--urls`：每个 URL 开新标签再执行目标工具；`tool=open` 只并行开页；
-- `--reuse session`：只按规范化完整 URL 复用本会话标签，未命中仍新开；
+- `--reuse url`（旧名 `session`）：只按规范化完整 URL 复用本会话标签，未命中仍新开；
 - `--tab-ids`：对已有标签并发执行；
 - 并发默认 2，最大 4；`js` 因全局 debugger 串行，预算按有效并发 1 计算；
 - 每块 `---` 分隔，单块失败不影响其它块；
 - 内层参数复用子工具 validator，不能绕过 `wait time=300` 等上限；
-  `--urls` 默认新开标签，内层 `--replace`/`--reuse`/`tabId` 会被拒绝。
+  `--urls` 默认新开标签，内层 `--replace`/`--reuse`/`tabId` 会被拒绝；
+- v2.4.3.11 起 `batch` 从 help 隐藏，仅作为 `--tabs/--urls` 的兼容执行器；
+  新写法见 `read/snapshot/js/wait --tabs/--urls` 与 `open --urls`。
 
 ## 输出与退出码
 

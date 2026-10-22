@@ -196,7 +196,7 @@ async function tabsTool(args) {
   }
   if (action === 'current') {
     const tab = await activeTab();
-    return `id=${tab.id}\nwindow=${tab.windowId}\nos=${await currentOs()}\ntitle=${oneLine(tab.title || '')}\nurl=${tab.url || ''}`;
+    return `id=${tab.id}\nwindow=${tab.windowId}\nos=${await currentOs()}\ntitle=${oneLine(tab.title || '')}\nurl=${tab.url || ''}\ndeprecated=1 use ema2 status or ema2 tabs list`;
   }
   if (action === 'new') {
     const url = args.url;
@@ -206,7 +206,7 @@ async function tabsTool(args) {
       try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* ignore */ }
     }
     await rememberSessionTab(tab.id);
-    return `id=${tab.id}\nurl=${tab.pendingUrl || tab.url || url}\nwindow=${tab.windowId}`;
+    return `id=${tab.id}\nurl=${tab.pendingUrl || tab.url || url}\nwindow=${tab.windowId}\ndeprecated=1 use ema2 open --background`;
   }
   if (action === 'close') {
     if (args.scope !== undefined && args.scope !== 'session') {
