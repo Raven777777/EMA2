@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.4.2.1（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.2.1
+exe        2.4.2.2（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.2.2
 helper     20
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
@@ -39,7 +39,7 @@ AI / shell
 | 路径 | 内容 |
 |---|---|
 | `rust/src/main.rs` | CLI 入口、daemon 启停、`status`、`init`、工具调用与退出码 |
-| `rust/src/cli_args.rs` | clap 子命令、参数/脚本/batch 编译 |
+| `rust/src/cli/` | clap 子命令、参数/脚本/batch 编译（spec/build/act/batch/shared） |
 | `rust/src/server.rs` | axum 单端口路由、`/cmd`、`/health`、`/shutdown` |
 | `rust/src/relay.rs` | 扩展 WS、hello/welcome、keepalive |
 | `rust/src/state.rs` | 扩展 generation、pending 请求、锁兜底 |
@@ -47,7 +47,9 @@ AI / shell
 | `rust/src/save.rs` | 截图/HAR 落盘 |
 | `rust/src/client.rs` | 本机 HTTP 客户端 |
 | `rust/src/paths.rs` | 端口、PID/日志、输出目录 |
-| `extension/background.js` | 11 工具实现、ref、hook、webRequest 补全、settle/await、debugger 队列 |
+| `extension/background.js` | 39 行入口，按序 importScripts 全部模块 |
+| `extension/modules/` | 17 个经典脚本模块：工具实现、ref、hook、webRequest、settle/await、debugger 队列 |
+| `contract/runtime.json` | 版本/超时单一来源；`extension/contract.js` 由它生成 |
 | `extension/page_guard.js` | 命令租约内非阻塞记录 alert/confirm/prompt/print/window.open；解除后恢复原生 API |
 | `extension/page_guard_armed.js` | document_start 动态 guard 的立即 arm 入口 |
 | `extension/page_guard_bridge.js` | ISOLATED world bridge：上报新文档 arm，租约归零时通知页面 disarm |
@@ -254,7 +256,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
    不要在 manifest 恢复静态 `content_scripts`；否则普通浏览的弹窗会再次被拦截。
    页面 helper 默认 disarmed，最后一个命令结束时必须先注销动态注册、再清理已 arm 的 tab。
    修改 wrappers/restore 逻辑时提升 `page_guard.js` 的 `GUARD_VERSION`；修改清理协议时
-   同时提升 background.js 的 `ema2_guard_protocol`。
+   同时提升 `contract/runtime.json` 的 `guardProtocolVersion`（core.js 从这里取值）。
 
 10. **`executeScript({func})` 的两个坑（v2.4.2 read 踩过）**
     a. 注入的 func 是**被序列化的单函数**，后台顶层函数不存在于注入环境：

@@ -10,7 +10,7 @@
 //!
 //! 无 MCP、无 token、无授权、无配置文件；默认端口 7744。
 
-mod cli_args;
+mod cli;
 mod client;
 mod paths;
 mod relay;
@@ -30,7 +30,7 @@ use clap::Parser;
 use clap::error::ErrorKind;
 use serde_json::{Value, json};
 
-use cli_args::Cli;
+use cli::Cli;
 
 fn main() {
     // clap 默认把用法错误映射到退出码 2；EMA2 的 2 表示“中继不可用”，
@@ -48,15 +48,15 @@ fn main() {
     };
     let port = cli.port.unwrap_or(paths::DEFAULT_PORT);
     let code = match cli.command {
-        cli_args::Command::Daemon => run_daemon(port),
-        cli_args::Command::Server { action } => match action {
-            Some(cli_args::ServerAction::Stop) => stop_server(port),
+        cli::Command::Daemon => run_daemon(port),
+        cli::Command::Server { action } => match action {
+            Some(cli::ServerAction::Stop) => stop_server(port),
             None => start_server(port),
         },
-        cli_args::Command::Status => status(port),
-        cli_args::Command::Init => init_agents(),
-        cli_args::Command::Tabs(args) => run_built(cli_args::build_tabs(&args), port),
-        cli_args::Command::Open {
+        cli::Command::Status => status(port),
+        cli::Command::Init => init_agents(),
+        cli::Command::Tabs(args) => run_built(cli::build_tabs(&args), port),
+        cli::Command::Open {
             url,
             tab,
             replace,
@@ -64,10 +64,10 @@ fn main() {
             wait,
             timeout,
         } => run_built(
-            cli_args::build_open(&url, tab, replace, &reuse, &wait, timeout),
+            cli::build_open(&url, tab, replace, &reuse, &wait, timeout),
             port,
         ),
-        cli_args::Command::Read {
+        cli::Command::Read {
             tab,
             mode,
             selector,
@@ -75,12 +75,12 @@ fn main() {
             budget,
             cursor,
         } => run_built(
-            Ok(cli_args::build_read(
+            Ok(cli::build_read(
                 tab, &mode, &selector, no_main, budget, cursor,
             )),
             port,
         ),
-        cli_args::Command::Snapshot {
+        cli::Command::Snapshot {
             tab,
             filter,
             near,
@@ -88,22 +88,20 @@ fn main() {
             cursor,
             values,
         } => run_built(
-            Ok(cli_args::build_snapshot(
+            Ok(cli::build_snapshot(
                 tab, &filter, &near, budget, cursor, values,
             )),
             port,
         ),
-        cli_args::Command::Act { tokens } => run_built(cli_args::build_act(&tokens), port),
-        cli_args::Command::Wait {
+        cli::Command::Act { tokens } => run_built(cli::build_act(&tokens), port),
+        cli::Command::Wait {
             kind,
             value,
             timeout,
             tab,
-        } => run_built(cli_args::build_wait(&kind, &value, &timeout, tab), port),
-        cli_args::Command::Await { value, tab } => {
-            run_built(cli_args::build_await(&value, tab), port)
-        }
-        cli_args::Command::Js {
+        } => run_built(cli::build_wait(&kind, &value, &timeout, tab), port),
+        cli::Command::Await { value, tab } => run_built(cli::build_await(&value, tab), port),
+        cli::Command::Js {
             code,
             file,
             tab,
@@ -111,10 +109,10 @@ fn main() {
             cursor,
             timeout,
         } => run_built(
-            cli_args::build_js(code.as_ref(), &file, tab, budget, cursor, timeout),
+            cli::build_js(code.as_ref(), &file, tab, budget, cursor, timeout),
             port,
         ),
-        cli_args::Command::Observe {
+        cli::Command::Observe {
             kind,
             tab,
             since,
@@ -127,7 +125,7 @@ fn main() {
             headers,
             budget,
         } => run_built(
-            cli_args::build_observe(
+            cli::build_observe(
                 &kind,
                 tab,
                 since,
@@ -142,18 +140,15 @@ fn main() {
             ),
             port,
         ),
-        cli_args::Command::Files(args) => run_built(cli_args::build_files(&args), port),
-        cli_args::Command::Shot {
+        cli::Command::Files(args) => run_built(cli::build_files(&args), port),
+        cli::Command::Shot {
             tab,
             inline,
             annotate,
             format,
             out,
-        } => run_built(
-            cli_args::build_shot(tab, inline, annotate, &format, out),
-            port,
-        ),
-        cli_args::Command::Batch { tokens } => run_built(cli_args::build_batch(&tokens), port),
+        } => run_built(cli::build_shot(tab, inline, annotate, &format, out), port),
+        cli::Command::Batch { tokens } => run_built(cli::build_batch(&tokens), port),
     };
     std::process::exit(code);
 }
@@ -551,7 +546,7 @@ fn init_agents() -> i32 {
 
 // ---------------------------------------------------------------- tool calls
 
-fn run_built(call: Result<cli_args::ToolCall, String>, port: u16) -> i32 {
+fn run_built(call: Result<cli::ToolCall, String>, port: u16) -> i32 {
     match call {
         Ok(call) => run_tool(call, port),
         Err(message) => {
@@ -564,7 +559,7 @@ fn run_built(call: Result<cli_args::ToolCall, String>, port: u16) -> i32 {
     }
 }
 
-fn run_tool(call: cli_args::ToolCall, port: u16) -> i32 {
+fn run_tool(call: cli::ToolCall, port: u16) -> i32 {
     let port = call.port.unwrap_or(port);
     let out = call.out.as_ref().map(|path| absolute(path));
     // CLI 侧只做“比 daemon 更宽松”的兜底：具体预算由 tools::timeout_for 决定，

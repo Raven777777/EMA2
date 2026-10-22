@@ -67,15 +67,18 @@ EMA2 是**一个单文件 exe + 一个 MV3 扩展**。exe 既能以后台 daemon
 | 文件 | 职责 |
 |---|---|
 | `rust/src/main.rs` | CLI 入口、daemon 启停、`status`、`init`、工具调用与退出码 |
-| `rust/src/cli_args.rs` | clap 子命令 → `ToolCall`；act 脚本/`--steps`、batch 参数、时长解析 |
+| `rust/src/cli/` | clap 子命令 → `ToolCall`；`spec.rs` 定义语法，`build.rs`/`act.rs`/`batch.rs` 负责编译，`shared.rs` 放时长/令牌等共享解析 |
 | `rust/src/client.rs` | 极简本机 HTTP/1.1 客户端（含 chunked） |
 | `rust/src/server.rs` | axum 路由、Host/Origin 守卫、`/cmd`、`/health`、`/shutdown`、daemon 主循环 |
 | `rust/src/relay.rs` | 扩展 WS 连接循环、hello/welcome、保活 |
 | `rust/src/state.rs` | 扩展连接 generation、pending 请求表、锁中毒兜底 |
-| `rust/src/tools.rs` | 11 个工具白名单 + 参数校验 + 超时预算 |
+| `rust/src/tools.rs` | 11 个工具白名单 + 参数校验 + 超时预算；测试锁定 `contract/runtime.json` |
+| `contract/runtime.json` | 版本与超时的单一来源；`scripts/sync_contract.py` 生成 `extension/contract.js` |
+| `extension/contract.js` | 由 runtime.json 生成，SW 最先加载 |
 | `rust/src/save.rs` | 截图/HAR 落盘，把 base64/JSON 换成 `path=` 行 |
 | `rust/src/paths.rs` | 产品版本、默认端口、输出目录、临时 PID/日志路径 |
-| `extension/background.js` | 11 个工具实现、ref 快照、网络/console hook、按 tab 的 webRequest 补齐、debugger 队列、act settle/await 上下文 |
+| `extension/background.js` | 39 行入口：按依赖顺序 `importScripts` 全部模块 |
+| `extension/modules/` | 17 个经典脚本模块：core/tabs/network/open_wait/page/guard/injected_helpers/actions/hooks/act/files_shot/debugger/har/batch/observe/read_snapshot/dispatch；共享全局作用域是刻意设计，页面注入函数仍自包含 |
 | `extension/page_guard.js` | 命令租约内按需启用：非阻塞记录 alert/confirm/prompt/print，解除后恢复原生 API |
 | `extension/page_guard_armed.js` | document_start 动态 guard 的第二个脚本，在页面脚本前立即 arm |
 | `extension/page_guard_bridge.js` | ISOLATED world bridge：把 arm 事件转给 SW，租约已释放时通知页面自行 disarm |
@@ -130,10 +133,14 @@ CLI 参数
   → CLI 渲染文本（图片 --inline 输出 data URI）
 ```
 
+- 版本与超时基准在 `contract/runtime.json`；扩展侧 `contract.js` 由
+  `python scripts/sync_contract.py` 生成，Rust 常量由 `cargo test` 对比同一份 JSON。
 - 工具超时预算在 `tools.rs`：默认 80s（扩展 watchdog 70s）；wait = timeout+20s；
   open = waitTimeout+20s；act = 60s + 每步最多 3s 的隐式 settle + 脚本 waitFor/await；
   js = --timeout(默认 10s)+20s；shot/files=120s；
   batch 按目标数/并发/内层工具估算，超过 600s 在执行前拒绝。
+- 扩展自己的 watchdog 必须早于 daemon：默认/act/wait/open/js 都是 70s 档；
+  batch 例外地固定 580s，让 daemon 的 600s 产品上限先返回，避免两层同时超时。
 - pending 表按扩展连接 generation 隔离；旧连接的迟到响应不会解决新请求。
 - CLI 中途断开时 `PendingGuard` 清掉 pending 条目。
 

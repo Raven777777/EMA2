@@ -42,7 +42,8 @@ python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 用真实 `ema2` CLI 驱动真实 Edge 打开它，覆盖
 open / snapshot / act（按钮+链接+SPA+scroll）/ read（md 链接·表格·列表·shadow DOM）/ js /
 wait / observe console·network / shot / files upload（含 5 MiB 边界）/ batch / 负例错误码，
-并静态断言 `extension/background.js` 的每个 `fail('code'` 都写进了 `docs/TOOLS.md`。
+并静态断言 `extension/modules/*.js` 的每个 `fail('code'` 都写进了 `docs/TOOLS.md`，
+同时检查 `contract/runtime.json` 与生成的 `extension/contract.js` 是否同步。
 
 guard 回归还覆盖：未执行 EMA2 命令的页面没有 `window.__ema2_guard`；
 `act` 返回后 guard 必须 `armed=0`；`role:name` 能匹配 HTML `name`，且隐藏的同名

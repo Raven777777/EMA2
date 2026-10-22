@@ -27,7 +27,7 @@ const RELAY_MARGIN_SECS: f64 = 20.0;
 const ACT_EXTENSION_GRACE_SECS: f64 = 10.0;
 const MAX_BUDGET: u64 = 200_000;
 const MAX_WAIT_SECS: f64 = 300.0;
-/// read 的模式列表；extension/background.js 的 READ_MODES 必须与它一致。
+/// read 的模式列表；extension/modules/core.js 的 READ_MODES 必须与它一致。
 const READ_MODES: &[&str] = &["md", "text", "html", "visible"];
 
 pub fn contains(name: &str) -> bool {
@@ -916,6 +916,49 @@ fn is_windows_absolute(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 扩展已拆成多个经典脚本；错误码/模式/版本扫描必须覆盖全部模块。
+    const EXTENSION_SOURCES: &[&str] = &[
+        include_str!("../../extension/background.js"),
+        include_str!("../../extension/contract.js"),
+        include_str!("../../extension/modules/core.js"),
+        include_str!("../../extension/modules/tabs.js"),
+        include_str!("../../extension/modules/network.js"),
+        include_str!("../../extension/modules/open_wait.js"),
+        include_str!("../../extension/modules/page.js"),
+        include_str!("../../extension/modules/guard.js"),
+        include_str!("../../extension/modules/injected_helpers.js"),
+        include_str!("../../extension/modules/actions.js"),
+        include_str!("../../extension/modules/hooks.js"),
+        include_str!("../../extension/modules/act.js"),
+        include_str!("../../extension/modules/files_shot.js"),
+        include_str!("../../extension/modules/debugger.js"),
+        include_str!("../../extension/modules/har.js"),
+        include_str!("../../extension/modules/batch.js"),
+        include_str!("../../extension/modules/observe.js"),
+        include_str!("../../extension/modules/read_snapshot.js"),
+        include_str!("../../extension/modules/dispatch.js"),
+    ];
+
+    fn extension_source() -> String {
+        EXTENSION_SOURCES.join("\n")
+    }
+
+    fn number_after(source: &str, marker: &str) -> u32 {
+        let start = source
+            .rfind(marker)
+            .unwrap_or_else(|| panic!("{marker} missing"));
+        let rest = &source[start + marker.len()..];
+        rest[..rest.find(';').expect("missing ;")]
+            .trim()
+            .parse()
+            .expect("version is not a number")
+    }
+
+    fn runtime_contract() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../contract/runtime.json"))
+            .expect("contract/runtime.json must be valid JSON")
+    }
+
     #[test]
     fn registry_is_compact_and_complete() {
         assert_eq!(TOOL_NAMES.len(), 11);
@@ -1638,11 +1681,11 @@ mod tests {
     /// 错误码表是 AI 自我纠正的依据；新增 `fail('code'` 时文档必须同步。
     #[test]
     fn documented_error_codes_cover_extension_codes() {
-        let js = include_str!("../../extension/background.js");
+        let js = extension_source();
         let docs = include_str!("../../docs/TOOLS.md");
         let mut codes: Vec<String> = Vec::new();
         for marker in ["fail('", "code: '"] {
-            let mut rest = js;
+            let mut rest = js.as_str();
             while let Some(index) = rest.find(marker) {
                 rest = &rest[index + marker.len()..];
                 let end = rest.find("'").unwrap_or(0);
@@ -1704,7 +1747,7 @@ mod tests {
     /// read 枚举只定义一次不现实（Rust + JS 各一份），但必须机械地保持同步。
     #[test]
     fn read_modes_match_extension() {
-        let js = include_str!("../../extension/background.js");
+        let js = include_str!("../../extension/modules/core.js");
         let line = js
             .lines()
             .find(|line| line.contains("const READ_MODES = ["))
@@ -1718,7 +1761,8 @@ mod tests {
             .collect();
         assert_eq!(modes, READ_MODES);
         assert!(
-            js.contains("READ_MODES.includes(inner.mode)"),
+            include_str!("../../extension/modules/batch.js")
+                .contains("READ_MODES.includes(inner.mode)"),
             "batch inner read must use the shared READ_MODES list"
         );
     }
@@ -1726,21 +1770,91 @@ mod tests {
     /// GUARD_VERSION 与协议清理版本必须一起提升，否则 SW 重启后可能漏清理。
     #[test]
     fn guard_versions_move_together() {
+        let contract = runtime_contract();
         let page = include_str!("../../extension/page_guard.js");
-        let background = include_str!("../../extension/background.js");
-        let number_after = |source: &str, marker: &str| -> u32 {
-            let start = source
-                .find(marker)
-                .unwrap_or_else(|| panic!("{marker} missing"));
-            let rest = &source[start + marker.len()..];
-            rest[..rest.find(';').expect("missing ;")]
-                .trim()
-                .parse()
-                .expect("version is not a number")
-        };
+        let background = include_str!("../../extension/modules/core.js");
         assert_eq!(
-            number_after(page, "const GUARD_VERSION ="),
-            number_after(background, "const GUARD_PROTOCOL_VERSION =")
+            contract["guardVersion"].as_u64(),
+            Some(number_after(page, "const GUARD_VERSION =") as u64)
         );
+        assert_eq!(
+            contract["guardVersion"], contract["guardProtocolVersion"],
+            "page guard and protocol-cleanup versions must move together"
+        );
+        assert!(
+            background.contains("const GUARD_PROTOCOL_VERSION = CONTRACT.guardProtocolVersion;"),
+            "the protocol version must come from contract/runtime.json"
+        );
+    }
+
+    /// contract/runtime.json 是超时/版本的单一来源；Rust 常量若与它漂移，这里必须失败。
+    #[test]
+    fn runtime_contract_matches_rust_and_extension() {
+        let contract = runtime_contract();
+        let timeouts = &contract["timeouts"];
+        assert_eq!(
+            contract["productVersion"].as_str(),
+            Some(crate::paths::PRODUCT_VERSION)
+        );
+        assert!(
+            include_str!("../../extension/modules/core.js")
+                .contains("const GUARD_PROTOCOL_VERSION = CONTRACT.guardProtocolVersion;"),
+            "core.js must take the guard protocol version from the contract"
+        );
+        assert_eq!(
+            contract["guardVersion"].as_u64(),
+            Some(number_after(
+                include_str!("../../extension/page_guard.js"),
+                "const GUARD_VERSION ="
+            ) as u64)
+        );
+        assert_eq!(
+            contract["helpersVersion"].as_u64(),
+            Some(number_after(
+                include_str!("../../extension/modules/injected_helpers.js"),
+                "window.__ema2_helpers_version ="
+            ) as u64)
+        );
+        assert_eq!(
+            timeouts["defaultSecs"].as_u64(),
+            Some(DEFAULT_TIMEOUT.as_secs())
+        );
+        assert_eq!(timeouts["actSecs"].as_u64(), Some(ACT_TIMEOUT.as_secs()));
+        assert_eq!(
+            timeouts["shotFilesSecs"].as_u64(),
+            Some(LONG_TIMEOUT.as_secs())
+        );
+        assert_eq!(
+            timeouts["waitDefaultSecs"].as_u64(),
+            Some(PAGE_WAIT_TIMEOUT.as_secs())
+        );
+        assert_eq!(
+            timeouts["batchMaxSecs"].as_u64(),
+            Some(MAX_CALL_TIMEOUT.as_secs())
+        );
+        assert_eq!(
+            timeouts["relayMarginSecs"].as_f64(),
+            Some(RELAY_MARGIN_SECS)
+        );
+        assert_eq!(
+            timeouts["actExtensionGraceSecs"].as_f64(),
+            Some(ACT_EXTENSION_GRACE_SECS)
+        );
+        assert_eq!(timeouts["actStepsSettleSecs"].as_f64(), Some(3.0));
+
+        let extension_watchdog = timeouts["toolWatchdogMs"].as_f64().unwrap();
+        assert!(DEFAULT_TIMEOUT.as_secs_f64() > extension_watchdog / 1000.0);
+        assert!(
+            ACT_TIMEOUT.as_secs_f64() + ACT_EXTENSION_GRACE_SECS + RELAY_MARGIN_SECS
+                > extension_watchdog / 1000.0
+        );
+        assert!(LONG_TIMEOUT.as_secs_f64() > extension_watchdog / 1000.0);
+        let batch_extension = timeouts["batchExtensionWatchdogMs"].as_f64().unwrap();
+        assert!(batch_extension < MAX_CALL_TIMEOUT.as_secs_f64() * 1000.0);
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../extension/manifest.json"))
+                .expect("manifest.json must be valid JSON");
+        assert_eq!(manifest["version"], contract["productVersion"]);
     }
 }

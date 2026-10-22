@@ -1,5 +1,31 @@
 # 变更记录
 
+## v2.4.2.2 — 模块化与运行时契约
+
+只做可维护性改造，行为、CLI 语法、协议与超时语义保持不变；唯一有意的行为修正是
+扩展 batch watchdog 从 620s 提前到 580s。
+
+- **扩展拆分（P2）**：6153 行的 `extension/background.js` 变成 39 行入口 +
+  `extension/modules/` 下 17 个经典脚本（core/tabs/network/open_wait/page/guard/
+  injected_helpers/actions/hooks/act/files_shot/debugger/har/batch/observe/
+  read_snapshot/dispatch）。入口用同步 `importScripts` 按依赖顺序加载，共享全局
+  作用域是刻意设计；页面注入函数继续自包含，不引用模块外层变量。
+- **Rust CLI 拆分（P3）**：2678 行的 `rust/src/cli_args.rs` 变成 `rust/src/cli/`
+  下 6 个文件（mod/spec/build/act/batch/shared）；clap 定义逐行未变，
+  新增 `Cli::command().debug_assert()` 测试，act/batch 的令牌循环改用共享 `TokenCursor`。
+- **运行时契约（P1）**：新增 `contract/runtime.json`，集中产品版本、guard/helper
+  版本和 19 个超时值；`scripts/sync_contract.py` 生成经典脚本 `extension/contract.js`
+  并提供 `--check`。核心常量与 `toolWatchdogMs` 从契约取值；Rust 常量由
+  `runtime_contract_matches_rust_and_extension` 测试锁定，漂移即失败。
+- **batch watchdog 对齐**：扩展侧 620000ms → `contract` 的 580000ms，
+  保证 daemon 的 600s 产品上限先返回，避免两层同时超时。
+- **扫描器覆盖拆分**：Rust 测试与 `scripts/verify.py` 从只读 `background.js`
+  改为扫描所有 `extension/modules/*.js` + `contract.js` + 入口；`verify.py`
+  同时检查 `sync_contract.py --check`、模块 import 列表完整性和
+  manifest/PRODUCT_VERSION/contract 三处版本一致。
+- **验收**：`cargo test` 90 passed；clippy/fmt 通过；`verify.py` 仍为 135 项真机检查。
+- 版本：对外产品/扩展 `2.4.2.2`；Cargo crate metadata 仍为 SemVer `2.4.2`。
+
 ## v2.4.2.1 — 数据安全、握手与观测范围修复
 
 - **`ema2 init` 不再覆盖损坏文件（P0）**：只有 `NotFound` 才当成空文件；权限/编码/IO

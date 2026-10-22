@@ -3,8 +3,9 @@
 
 做两件事：
 
-1. 静态契约检查：`extension/background.js` 里每个 `fail('code'` 都必须出现在
-   `docs/TOOLS.md` 的错误码表里（文档漂移会让 AI 无法自我纠正）。
+1. 静态契约检查：`extension/modules/*.js` 里每个 `fail('code'` 都必须出现在
+   `docs/TOOLS.md` 的错误码表里（文档漂移会让 AI 无法自我纠正）；同时检查
+   `contract/runtime.json` 与生成的 `extension/contract.js` 是否同步。
 2. 真实 Edge 冒烟：起一个本机 fixture HTTP 服务，用真实 `ema2` CLI 跑
    open / snapshot / act / read / js / wait / observe / files / shot / batch，
    以及几个必须报错的负例。
@@ -439,13 +440,43 @@ class Runner:
 
 
 def static_contract_check() -> bool:
-    js = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+    extension = ROOT / "extension"
+    entry_path = extension / "background.js"
+    contract_js_path = extension / "contract.js"
+    module_paths = sorted((extension / "modules").glob("*.js"))
+    sources = [entry_path, contract_js_path, *module_paths]
+    js = "\n".join(path.read_text(encoding="utf-8") for path in sources)
     docs = (ROOT / "docs" / "TOOLS.md").read_text(encoding="utf-8")
     codes = sorted(set(re.findall(r"fail\('([a-z_]+)'", js)) | set(re.findall(r"code: '([a-z_]+)'", js)))
     missing = [code for code in codes if f"`{code}`" not in docs]
     print(f"PASS  static: {len(codes)} error codes documented" if not missing else "FAIL  static: error codes")
     if missing:
         print("      缺少文档:", ", ".join(missing))
+
+    entry = entry_path.read_text(encoding="utf-8")
+    imported = set(re.findall(r"'((?:modules/)?[A-Za-z0-9_./-]+\.js)'", entry))
+    expected = {"contract.js"} | {f"modules/{path.name}" for path in module_paths}
+    modules_ok = imported == expected
+    if modules_ok:
+        print(f"PASS  static: background.js imports all {len(module_paths)} extension modules")
+    else:
+        print("FAIL  static: background.js module list is incomplete")
+        if expected - imported:
+            print("      missing imports:", ", ".join(sorted(expected - imported)))
+        if imported - expected:
+            print("      stale imports:", ", ".join(sorted(imported - expected)))
+
+    sync = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "sync_contract.py"), "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    sync_ok = sync.returncode == 0
+    print("PASS  static: extension/contract.js is current" if sync_ok
+          else "FAIL  static: extension/contract.js is stale")
+    if not sync_ok:
+        print("      ", (sync.stdout or sync.stderr).strip()[:800])
 
     agents = (ROOT / "rust" / "assets" / "AGENTS.md").read_text(encoding="utf-8")
     agents_ok = "docs/TOOLS.md" not in agents and "ema2 act --help" in agents
@@ -460,17 +491,19 @@ def static_contract_check() -> bool:
     paths_rs = (ROOT / "rust" / "src" / "paths.rs").read_text(encoding="utf-8")
     version_match = re.search(r'PRODUCT_VERSION: &str = "([^"]+)"', paths_rs)
     product_version = version_match.group(1) if version_match else ""
-    version_ok = bool(product_version) and manifest.get("version") == product_version
+    contract = json.loads((ROOT / "contract" / "runtime.json").read_text(encoding="utf-8"))
+    contract_version_ok = contract.get("productVersion") == product_version
+    version_ok = bool(product_version) and manifest.get("version") == product_version and contract_version_ok
     print(
         f"PASS  static: extension version matches PRODUCT_VERSION ({product_version})" if version_ok
-        else f"FAIL  static: extension version {manifest.get('version')} != PRODUCT_VERSION {product_version or '<missing>'}"
+        else f"FAIL  static: extension version {manifest.get('version')} / contract {contract.get('productVersion')} != PRODUCT_VERSION {product_version or '<missing>'}"
     )
 
     min_chrome = str(manifest.get("minimum_chrome_version", ""))
     chrome_ok = min_chrome.isdigit() and int(min_chrome) >= 111
     print("PASS  static: minimum_chrome_version >= 111" if chrome_ok
           else "FAIL  static: minimum_chrome_version must be >= 111 for registerContentScripts world=MAIN")
-    return not missing and agents_ok and idle_ok and version_ok and chrome_ok
+    return not missing and agents_ok and idle_ok and version_ok and chrome_ok and modules_ok and sync_ok and contract_version_ok
 
 
 def markdown_link_check() -> bool:
@@ -555,7 +588,7 @@ def main() -> int:
 
     try:
         version = runner.run("--version")
-        runner.expect_ok("binary exposes product version", version, "2.4.2.1")
+        runner.expect_ok("binary exposes product version", version, "2.4.2.2")
 
         opened = runner.expect_ok("open fixture", runner.run("open", f"{base}/"), "status=200", "net_hook=on", "title=ema2 fixture home")
         tab_match = re.search(r"^id=(\d+)", opened, re.M)

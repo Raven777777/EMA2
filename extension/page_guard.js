@@ -2,7 +2,7 @@
  * EMA2 page guard · 只在 EMA2 命令租约期间改变页面对话框行为。
  *
  * 默认状态是 disarmed：页面保留原生 alert/confirm/prompt/print/window.open。
- * 命令执行前由 page_guard_armed.js 或 background.js 调用 guard.arm()，
+ * 命令执行前由 page_guard_armed.js 或 modules/guard.js 调用 guard.arm()，
  * 把同步阻塞的对话框变成非阻塞记录；命令结束后由后台派发 `ema2-guard-disarm`
  * 文档事件恢复原生 API。
  *
@@ -11,7 +11,7 @@
  */
 (function ema2PageGuard() {
   // 修改 wrappers/restore 逻辑时递增；旧版本页面会在下一次命令注入时被替换。
-  // 同步提升 background.js 的 GUARD_PROTOCOL_VERSION，让升级后的首次启动全量清理。
+  // 同步提升 contract/runtime.json 的 guardProtocolVersion，让升级后的首次启动全量清理。
   const GUARD_VERSION = 4;
   const prior = window.__ema2_guard;
   if (prior && prior.version >= GUARD_VERSION) return;

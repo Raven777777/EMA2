@@ -60,7 +60,7 @@ total=2 shown=2 next=none
 ## 错误码
 
 > 这张表是 AI 自我纠正的主要依据：新增 `fail('code'` 时必须同步这里，
-> `cargo test` 里有一条测试会扫描 `extension/background.js` 并断言每个 code 都出现在本文中。
+> `cargo test` 里有一条测试会扫描 `extension/modules/*.js` 并断言每个 code 都出现在本文中。
 
 | code | 含义 | 建议 |
 |---|---|---|
