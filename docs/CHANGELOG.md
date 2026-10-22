@@ -28,7 +28,7 @@ v2.4.3.11 隐藏的旧面在这一版从 CLI 解析器里彻底删除；扩展�
 - `docs/TOOLS.md` 删除「Legacy」整节；主表与「目标与并发」只描述新语法，
   并说明内部执行器仍叫 `batch`。
 - `docs/ARCHITECTURE.md` 的 batch 章节改为「/cmd 执行器」。
-- 演进方案迁入 `docs/archive/EVOLUTION.md`，三个阶段的规划全部标为已实施。
+- 演进方案迁入 `docs/archive/v2.4.3.21-evaluation.md`，三个阶段的规划全部标为已实施。
 - `examples/batch-read.sh` 改用 `read --urls`；`examples/jss/batch.sh` 改用
   `open --urls` + `js --tabs --file`；相关 README 同步。
 
