@@ -43,8 +43,9 @@ docs/
 
 ## 维护脚本
 
-- `scripts/reloadextension.ahk`：AutoHotkey v2 脚本，激活 Edge、打开 `edge://extensions`
-  并点击 EMA2 的“重新加载”。用法见仓库根目录 [`../AGENTS.md`](../AGENTS.md)。
+- `scripts/reloadextension.py`：pywinauto/UIA 脚本，找到 Edge 窗口并最大化，
+  打开 `edge://extensions`，按扩展卡片里的 `Type=Button` + `Name=重新加载` 精确点击。
+  用法见仓库根目录 [`../AGENTS.md`](../AGENTS.md)。
 
 ## 验证文档是否过期
 

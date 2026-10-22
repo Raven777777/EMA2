@@ -16,15 +16,18 @@ python scripts/verify.py     # 真实、前台可见的 Edge 验收（禁止无�
 - 新的错误码必须写进 `docs/TOOLS.md`（`cargo test` 会检查）。
 - 过时文档进 `docs/archive/`，不要留在 `docs/` 根下。
 
-### 重新加载扩展（AutoHotkey）
+### 重新加载扩展（pywinauto）
 
 ```bash
-"C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe" scripts\reloadextension.ahk
+pip install pywinauto
+python scripts\reloadextension.py
 ```
 
-- 需要 AutoHotkey v2 和已加载 EMA2 扩展的 Edge。
-- 脚本会激活/启动 Edge，打开 `edge://extensions`，点击 `(600,815)` 处的“重新加载”；
-  窗口缩放/布局不同时改 `scripts/reloadextension.ahk` 顶部的 `clickX` / `clickY`。
+- 需要已加载 EMA2 扩展的 Edge；Edge 没开时脚本会自动启动它。
+- 脚本用 UI Automation 找 msedge.exe 窗口，先恢复并最大化（等价 Win+Up），
+  再把 `edge://extensions` 填进地址栏；随后在 EMA2 卡片里按
+  `Type=Button` + `Name=重新加载` 精确查找并点击，不依赖固定坐标，
+  窗口缩放/主题/布局变化不受影响。
 - 完成后 `ema2 status` 应显示 `extension=connected version=<新版本>`；daemon 没起先 `ema2 server`。
 
 下面是给 AI 的最短操作手册（`ema2 init` 生成区块）：
