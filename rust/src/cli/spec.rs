@@ -113,6 +113,8 @@ pub enum Command {
   ema2 act fill e15 "hello world"
   ema2 act press e15 Enter
   ema2 act click e12 --wait-for "url=api/save status=200 timeout=5s"
+  ema2 act click e12 --wait-for "text=\"评论已提交\" timeout=5s"
+  ema2 act click e12 --wait-for "selector=\"#comment-18\" timeout=5s"
   ema2 act click e12 --tab 42
 
 多步:
@@ -137,19 +139,23 @@ pub enum Command {
   reload
   await 10s
   waitFor url=api/save status=200 timeout=5s
+  waitFor text="保存成功" timeout=5s
+  waitFor selector="#comment-18" timeout=5s
 
 脚本规则:
 - 只允许 11 个 act 动作 + await + waitFor；最多 20 步。
 - 不能写 open/read/snapshot/wait/js/tabs 等 CLI 命令；这些在 shell 里单独调用。
 - ref 裸写；selector= / target= 是命名参数，不能和裸 ref 同时用。
-- waitFor 只接受 url= / status= / timeout=，等响应或导航，不是页面条件等待。
-  单纯等待用 await 1s；等文本/选择器请在脚本外运行 ema2 wait。
+- waitFor 接受 url= / status= / timeout=（等响应或导航），
+  或 text= / textGone= / selector=（等页面条件，和 ema2 wait 语义一致）。
+  一次 waitFor 只写一个页面条件；页面条件不能和 url=/status= 混用。
+  单纯等待用 await 1s。
 - --selector/--target/--key/--delta-y/--submit 只用于单步；
   脚本里用 selector= / target= / press / submit。
 
 常见错误:
   open https://...      → 先 ema2 open，再 ema2 act --script
-  wait text "Done"      → 脚本用 await / waitFor；页面条件用 ema2 wait
+  wait text "Done"      → 脚本用 waitFor text="Done"；或 shell 用 ema2 wait
   waitFor time 1s       → 用 await 1s
 
 完整语法/示例: ema2 act --help（本页）"##)]
@@ -165,7 +171,8 @@ pub enum Command {
 脚本里用:
   await 10s                             等上一个 act 的导航/页面稳定
   waitFor url=... status=... timeout=5s 等响应或导航
-等文本/选择器条件请在脚本前后单独运行 ema2 wait。")]
+  waitFor text=... timeout=5s           等页面文本/选择器条件
+act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
     Wait {
         /// text|textGone|selector|time|idle
         kind: String,
@@ -376,6 +383,8 @@ mod tests {
             "fill e15 \"hello\"",
             "await 10s",
             "waitFor url=api/save status=200 timeout=5s",
+            "waitFor text=\"保存成功\" timeout=5s",
+            "waitFor selector=\"#comment-18\" timeout=5s",
             "不能写 open/read/snapshot/wait/js/tabs",
             "waitFor time 1s",
         ] {

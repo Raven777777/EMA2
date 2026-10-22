@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.4.2.2（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.2.2
+exe        2.4.2.3（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.2.3
 helper     20
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
@@ -136,6 +136,9 @@ cargo test
 - `open` 和新的 act 会清掉旧 lastAct 上下文
 - `open --timeout` 超时返回 `load=pending`，中继预算跟随 `waitTimeout`
 - 脚本里的 `waitFor` 是独立步骤，在原行执行；失败时保留已完成步骤
+- `waitFor` 支持页面条件 `text=` / `textGone=` / `selector=`（与 `ema2 wait` 同义），
+  命中输出 `expect=ok condition=... ms=...`，超时 `wait_timeout` 带最后 URL/文本；
+  一次只能有一个页面条件，且不能和 `url=`/`status=` 混用
 - `--selector/--target/--key/--delta-y/--submit` 只用于单步；`--steps/--script` 里用对应脚本写法
 - 副作用动作（click/type/fill/press/scroll/submit/back/forward/reload）的 `executeScript` 不自动重试
 
@@ -188,8 +191,9 @@ v2.2.1 起：
 - `javascript:` / `download` / `#` 链接不重试
 - 普通按钮**不**自动重试（避免点赞/提交执行两次）
 
-还没做：按钮类动作的“预期效果”校验（比如表单提交失败仍停在本页）。
-先靠 `--wait-for "url=... status=..."` 覆盖，不要为了按钮加启发式。
+还没做：按钮类动作的内置“预期效果”判断（比如表单提交失败仍停在本页）。
+调用方现在可用 `--wait-for "text=... timeout=5s"` / `selector=...` 声明终点；
+核心只验证条件，不内置业务判断，也不要为了按钮加启发式。
 
 ### P2：动态页面可读时机
 

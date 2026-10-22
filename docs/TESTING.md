@@ -109,6 +109,8 @@ bin\ema2.exe status          # extension=connected
 | 9g | 点击一个不导航的 `<a href="#">` | `nav=none` + hint；`<a>` 只重试一次 |
 | 10 | `ema2 act click e6 --wait-for "url=api/save status=200 timeout=5s"` | `response=200 GET http://.../api/save` |
 | 10a | `ema2 act fill --target "searchbox:q" ...` | 无 label、`name=q` 的 searchbox 被命中 |
+| 10b | `ema2 act click ... --wait-for "text=\"fetched\" timeout=3s"` | `expect=ok condition=text:"fetched" ms=...` |
+| 10c | `ema2 act click ... --wait-for "selector=\"#never\" timeout=1s"` | `error=wait_timeout`，`expect=timeout`，保留 `step1 ok=click`，带最后 URL/文本 |
 | 11 | `ema2 wait text/selector/time/idle` | `ok=... elapsed=...s` |
 | 12 | `ema2 js '1+1'` / `ema2 js 'return 6*7'` / `--file` | `2` / `42` / 文件结果 |
 | 12a | 弹过密码管理器浮层的 tab 里 `ema2 js` | 结果 + `via=scripting`，不因 `debugger_attach_failed` 丢失 |
@@ -124,7 +126,7 @@ bin\ema2.exe status          # extension=connected
 | 21a | `ema2 batch read --urls "u1" --reuse session` | 复用本会话精确 URL 标签并回 `reused=1` |
 | 22 | `ema2 batch open --urls "u1,u2"` | 并行开页，各自 `id=` |
 | 23 | `ema2 act --steps 'fill e2 "a"; type e2 "b"'` | 两步；type 在 caret 处插入 |
-| 24 | `ema2 act --script flow.ema2` | 逐行执行，`waitFor` 在所在行执行；失败保留已完成 steps |
+| 24 | `ema2 act --script flow.ema2` | 逐行执行，`waitFor`（响应或 text/selector）在所在行执行；失败保留已完成 steps |
 | 25 | `ema2 open url --replace` / `--reuse session` / `--tab ID` | `reuse=replace/session/tabId` |
 | 25a | `ema2 open url --timeout 30` | 慢页面也能等到文档接位；超时输出 `load=pending` |
 | 26 | `ema2 tabs close --session` | 只关本会话 `open`/`tabs new` 的标签 |

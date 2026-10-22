@@ -375,16 +375,20 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
     Ok(call)
 }
 
-/// `--wait-for "url=api/save status=200 timeout=5s"` → waitFor 对象。
+/// `--wait-for "url=api/save status=200 timeout=5s"` 或
+/// `--wait-for "text=保存成功 timeout=5s"` → waitFor 对象。
+///
+/// 网络/导航条件（url/status）和页面条件（text/textGone/selector）是两种语义：
+/// 前者可以 url+status 组合，后者与 `ema2 wait` 一样只接受一个条件。
 fn parse_wait_for(input: &str) -> Result<Value, String> {
     let tokens = tokenize_line(input)?;
     let mut out = json!({});
     for token in tokens {
         let Some((key, value)) = token.split_once('=') else {
             let hint = if token == "time" || token.starts_with("time") {
-                "use `await 1s` for a plain delay; use `ema2 wait` outside the script for page text/selector waits"
+                "use `await 1s` for a plain delay; waitFor accepts url=/status=/text=/textGone=/selector="
             } else {
-                "waitFor only accepts url= / status= / timeout=; use `await 1s` for a plain delay"
+                "waitFor accepts url= / status= / text= / textGone= / selector= / timeout=; use `await 1s` for a plain delay"
             };
             return Err(format!(
                 "act waitFor: expected key=value, got {token:?}; {hint}"
@@ -398,6 +402,12 @@ fn parse_wait_for(input: &str) -> Result<Value, String> {
                     .map_err(|_| format!("act waitFor: invalid status {value:?}"))?;
                 out["status"] = json!(status);
             }
+            "text" | "textGone" | "selector" => {
+                if value.trim().is_empty() {
+                    return Err(format!("act waitFor: {key}= must not be empty"));
+                }
+                out[key] = json!(value);
+            }
             "timeout" => {
                 let seconds =
                     parse_duration_secs(value).map_err(|error| format!("act waitFor: {error}"))?;
@@ -405,14 +415,32 @@ fn parse_wait_for(input: &str) -> Result<Value, String> {
             }
             _ => {
                 return Err(format!(
-                    "act waitFor: unknown key {key:?}; only url= / status= / timeout= are supported (for text/selector use `ema2 wait` outside the script)"
+                    "act waitFor: unknown key {key:?}; only url= / status= / text= / textGone= / selector= / timeout= are supported"
                 ));
             }
         }
     }
-    if out.get("url").is_none() && out.get("status").is_none() {
+    let page_keys: Vec<&str> = ["text", "textGone", "selector"]
+        .into_iter()
+        .filter(|key| out.get(*key).is_some())
+        .collect();
+    let has_url = out.get("url").is_some();
+    let has_status = out.get("status").is_some();
+    if page_keys.len() > 1 {
+        return Err(format!(
+            "act waitFor: use only one of text= / textGone= / selector= (got {})",
+            page_keys.join(", ")
+        ));
+    }
+    if !page_keys.is_empty() && (has_url || has_status) {
         return Err(
-            "act waitFor: needs at least url= or status=; timeout alone is not a wait (use `await 1s`)"
+            "act waitFor: page conditions (text=/textGone=/selector=) cannot be combined with url=/status=; use one condition per waitFor"
+                .into(),
+        );
+    }
+    if page_keys.is_empty() && !has_url && !has_status {
+        return Err(
+            "act waitFor: needs at least one of url= / status= / text= / textGone= / selector=; timeout alone is not a wait (use `await 1s`)"
                 .into(),
         );
     }
@@ -772,6 +800,67 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn act_wait_for_page_conditions() {
+        let call = build_act(&[
+            "click".into(),
+            "e12".into(),
+            "--wait-for".into(),
+            "text=评论已提交 timeout=5s".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["waitFor"]["text"], "评论已提交");
+        assert_eq!(args_of(&call)["waitFor"]["timeout"], 5.0);
+
+        let call = build_act(&[
+            "click".into(),
+            "e12".into(),
+            "--wait-for".into(),
+            "selector=#comment-18 timeout=5s".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["waitFor"]["selector"], "#comment-18");
+
+        let call = build_act(&[
+            "click".into(),
+            "e12".into(),
+            "--wait-for".into(),
+            "textGone=\"正在提交\" timeout=2s".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["waitFor"]["textGone"], "正在提交");
+
+        // 页面条件和网络条件语义不同，不能混在一次 waitFor 里。
+        for input in [
+            "text=done selector=#done",
+            "text=done url=api/save",
+            "textGone=loading status=200",
+            "text=",
+            "timeout=5s",
+        ] {
+            let error = build_act(&[
+                "click".into(),
+                "e1".into(),
+                "--wait-for".into(),
+                input.into(),
+            ])
+            .err()
+            .expect("invalid waitFor must fail");
+            assert!(error.contains("waitFor"), "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn act_script_wait_for_page_condition() {
+        let parsed =
+            parse_act_script("click e1\nwaitFor text=\"保存成功\" timeout=3s\nclick e2\n").unwrap();
+        let steps = parsed["steps"].as_array().unwrap();
+        assert_eq!(steps[1]["action"], "waitFor");
+        assert_eq!(steps[1]["text"], "保存成功");
+        assert_eq!(steps[1]["timeout"], 3.0);
+        assert_eq!(steps[2]["action"], "click");
     }
 
     #[test]

@@ -161,6 +161,10 @@ CLI 参数
   脚本停止，避免在旧页面继续点击。
 - `act` 的工具超时预算会叠加脚本中的 await + 每步 settle，超过 600s 在执行前拒绝。
 - 脚本里的 `waitFor` 是独立步骤，在所在行执行；失败时已完成的 `stepN` 会随错误返回。
+- `waitFor` 并行支持两类后置条件：`url`/`status` 等网络/导航，以及
+  `text`/`textGone`/`selector` 页面条件。页面条件复用 `wait` 的判定；成功追加
+  `expect=ok condition=... ms=...`，超时为 `wait_timeout` 并带最后 URL/文本。
+  页面条件是单一条件，不能和 `url`/`status` 混用；核心不判断业务成功与否。
 
 ## command guard 生命周期
 

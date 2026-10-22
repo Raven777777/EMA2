@@ -112,7 +112,7 @@ total=2 shown=2 next=none
 | `helpers_missing` | 页面 helper 未安装（注入丢失） | 重试 `snapshot`/`read`；持续失败则重载页面 |
 | `no_form` | submit 目标不在 form 内 | 用 click 提交按钮，或 press Enter |
 | `no_pending_action` | `await` 没有可等待的 act 上下文 | 先 `act`；或改用 `wait text/selector/time/idle` |
-| `wait_timeout` | `wait`/`await` 条件超时 | 检查条件或提高 timeout |
+| `wait_timeout` | `wait` / `await` / `act waitFor` 页面条件超时 | 看最后 URL/文本，检查条件或提高 timeout |
 | `response_timeout` | `act waitFor` 未等到响应/导航 | 看 `observation_gap`；在 `--wait-for` 里加 `timeout=5s`（≤30s） |
 | `tool_timeout` | 扩展侧 RPC 超过硬上限（页面卡在对话框/长任务/注入不返回） | 关闭对话框、重载 tab，或缩小单次操作 |
 | `screenshot_too_large` / `screenshot_decode_failed` / `screenshot_empty` / `screenshot_not_saved` | 截图编码/落盘失败 | 检查输出目录、窗口可见性，或改用 `--inline` |
@@ -421,11 +421,18 @@ ema2 act --script run.ema2 [--tab ID]          # 脚本文件，指定目标标�
   被 overlay 遮住报 `obscured`，不再穿透遮罩点到下面的链接。
 - 目标未渲染时自动重试 3 次（约 1s）；`stale_ref` 不重试。
 - 位置参数必须完整：`type e15 hello world` 会报 `invalid_argument`，不会静默只输入 `hello`；含空格请加引号。
-- `waitFor`：动作后等匹配响应**或页面导航**；响应命中回 `response=<status> <method> <absolute-url> <ms>`，
-  导航命中回 `nav=<url>`（只给 `url=` 时才算导航；带 `status=` 只匹配响应）。
-  跨导航时自动从新文档起点匹配；hook 安装前的历史请求只给 `observation_gap=status_unavailable`。
-  超时提示里的写法就是 CLI 参数：`timeout=5s`（最大 30s），不是 `waitFor.timeout` 字段。
-  单步用 `ema2 act click e12 --wait-for "url=api/save status=200 timeout=5s"`（动作后等待）。
+- `waitFor` 有两种条件，动作 settle 后验证：
+  - **响应/导航**：`url=` + 可选 `status=`；命中回 `response=<status> <method> <absolute-url> <ms>`，
+    导航命中回 `nav=<url>`（只给 `url=` 时才算导航；带 `status=` 只匹配响应）。
+    跨导航时自动从新文档起点匹配；hook 安装前的历史请求只给 `observation_gap=status_unavailable`。
+  - **页面条件**：`text=` / `textGone=` / `selector=`，与 `ema2 wait` 语义一致；命中回
+    `expect=ok condition=text:"评论已提交" ms=820`（`selector` / `textGone` 同样带引号）。
+    超时返回 `error=wait_timeout`，消息以 `expect=timeout` 开头并带最后看到的 URL/文本。
+  一次 `waitFor` 只写一个页面条件，页面条件不能和 `url=`/`status=` 混用；`timeout=5s`（最大 30s）
+  是可选兜底，不是 `waitFor.timeout` 字段。含空格的条件值在双引号内写，例如
+  `--wait-for "text=\"保存成功\" timeout=5s"`。
+  单步示例：`ema2 act click e12 --wait-for "url=api/save status=200 timeout=5s"`、
+  `ema2 act click e12 --wait-for "text=\"评论已提交\" timeout=5s"`。
   脚本里的 `waitFor` 是**独立步骤**，在它所在行执行；不再挪到整次调用末尾。
   `waitFor` 失败时已经执行过的 `stepN` 会保留在错误输出下面，避免 AI 重试整条脚本。
 
@@ -452,6 +459,8 @@ await 10s
 # waitFor 是独立步骤，在所在行执行
 click e12
 waitFor url=api/save status=200 timeout=5s
+waitFor text="保存成功" timeout=5s
+waitFor selector="#comment-18" timeout=5s
 
 # await 等上一个动作的导航/页面稳定
 click e12
@@ -469,9 +478,10 @@ click e30
    **脚本里不能写 `open/read/snapshot/wait/js/tabs` 等 CLI 命令**；这些在 shell 里单独调用。
 2. `ref` 裸写；`selector=` / `target=` 是命名参数（与裸写互斥）。
 3. 含空格的值用双引号包裹，引号内支持 `\"` 转义。
-4. `waitFor` 是独立步骤，在所在行执行（通常放在触发请求的动作之后）；只接受
-   `url=` / `status=` / `timeout=`，`timeout=` 接受 `500ms` / `5s`。它不是页面条件等待；
-   单纯等待用 `await 1s`，等文本/选择器用 shell 的 `ema2 wait`。
+4. `waitFor` 是独立步骤，在所在行执行（通常放在触发动作之后）；接受
+   `url=` / `status=`（响应/导航）或 `text=` / `textGone=` / `selector=`（页面条件），
+   一次只写一个页面条件，且不能和 `url=`/`status=` 混用。`timeout=` 接受 `500ms` / `5s`
+   （最大 30s）。单纯等待用 `await 1s`。
 5. `await 10s` 等上一个动作的导航/页面稳定；如果上一步 `settle=pending` 且下一步不是 `await`，脚本会停止而不是在旧页面继续执行。
 6. 脚本语法/示例/常见错误以 `ema2 act --help` 为准。
 
@@ -518,8 +528,15 @@ ema2 wait idle [--timeout 30s]
 ```
 
 这是 shell 命令，**不能写进 `.ema2` 脚本**；脚本里用 `await` / `waitFor`。
+`text` / `textGone` / `selector` 也是 `act --wait-for` 的页面条件语法：
+
+```bash
+ema2 act click e12 --wait-for "text=\"评论已提交\" timeout=5s"
+ema2 act click e12 --wait-for "selector=\"#comment-18\" timeout=5s"
+```
 
 返回 `ok=<条件> elapsed=...s`；`time`/`timeout` 都在 0–300s。
+`act --wait-for` 的页面条件成功时返回 `expect=ok condition=... ms=...`，超时为 `expect=timeout`。
 
 ## js
 

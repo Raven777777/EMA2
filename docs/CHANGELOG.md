@@ -1,5 +1,24 @@
 # 变更记录
 
+## v2.4.2.3 — act 的可验证终点
+
+把 `act --wait-for` 从“等响应/导航”扩展为“等任意可验证的页面条件”，复用
+`ema2 wait` 的 `text` / `textGone` / `selector` 语义。不新增命令、状态或默认等待；
+已有 `url=` / `status=` 行为不变。
+
+- **页面条件**：`ema2 act click e12 --wait-for "text=\"评论已提交\" timeout=5s"`
+  或 `selector="#comment-18"` / `textGone=...`；动作 settle 后轮询条件，命中追加
+  `expect=ok condition=text:"评论已提交" ms=820`。
+- **明确失败**：超时返回 `error=wait_timeout`，消息以 `expect=timeout` 开头，并带最后
+  看到的 URL 与页面文本（截断），不再只报 `settle=done`。
+- **组合边界**：一次 `waitFor` 只接受一个页面条件，且页面条件不能与 `url=`/`status=`
+  混用；`timeout=` 仍为可选兜底（最大 30s）。脚本里的 `waitFor` 同步支持这些前缀。
+- **解析与校验**：CLI 放行 `text=` / `textGone=` / `selector=`；Rust 参数校验与扩展
+  共用同一条件语义，非法组合在动作执行前拒绝。
+- **验收**：`cargo test` 92 passed；真机 `verify.py` 138 项通过，覆盖页面条件成功、
+  脚本内独立步骤、超时错误保留已完成步骤。
+- 版本：对外产品/扩展 `2.4.2.3`；Cargo crate metadata 仍为 SemVer `2.4.2`。
+
 ## v2.4.2.2 — 模块化与运行时契约
 
 只做可维护性改造，行为、CLI 语法、协议与超时语义保持不变；唯一有意的行为修正是

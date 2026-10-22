@@ -588,7 +588,7 @@ def main() -> int:
 
     try:
         version = runner.run("--version")
-        runner.expect_ok("binary exposes product version", version, "2.4.2.2")
+        runner.expect_ok("binary exposes product version", version, "2.4.2.3")
 
         opened = runner.expect_ok("open fixture", runner.run("open", f"{base}/"), "status=200", "net_hook=on", "title=ema2 fixture home")
         tab_match = re.search(r"^id=(\d+)", opened, re.M)
@@ -715,6 +715,39 @@ def main() -> int:
             wait_output[:1200],
         )
 
+        wait_text = runner.run(
+            "act", "click", "--selector", "#btn",
+            "--wait-for", "text=clicked timeout=2s",
+        )
+        wait_text_out = (wait_text.stdout or "") + (wait_text.stderr or "")
+        runner.check(
+            "act waitFor text condition",
+            wait_text.returncode == 0 and 'expect=ok condition=text:"clicked" ms=' in wait_text_out,
+            wait_text_out[:1200],
+        )
+        wait_selector = runner.run(
+            "act", "click", "--selector", "#btn",
+            "--wait-for", "selector=#out timeout=2s",
+        )
+        wait_selector_out = (wait_selector.stdout or "") + (wait_selector.stderr or "")
+        runner.check(
+            "act waitFor selector condition",
+            wait_selector.returncode == 0 and 'expect=ok condition=selector:"#out" ms=' in wait_selector_out,
+            wait_selector_out[:1200],
+        )
+        wait_cond_fail = runner.run(
+            "act", "click", "--selector", "#btn",
+            "--wait-for", "text=never-appears timeout=1s",
+        )
+        wait_cond_fail_out = (wait_cond_fail.stdout or "") + (wait_cond_fail.stderr or "")
+        runner.check(
+            "act waitFor page timeout is explicit",
+            wait_cond_fail.returncode == 4 and "error=wait_timeout" in wait_cond_fail_out
+            and "expect=timeout" in wait_cond_fail_out and "step1 ok=click" in wait_cond_fail_out
+            and "url=http" in wait_cond_fail_out and "text=" in wait_cond_fail_out,
+            wait_cond_fail_out[:1600],
+        )
+
         md = runner.expect_ok("read md", runner.run("read", "--mode", "md", "--no-main"), "Fixture Home")
         runner.check(
             "read header carries http and content_type",
@@ -796,7 +829,8 @@ def main() -> int:
         # 多步脚本里的 waitFor 必须在它所在行执行，而不是等所有步骤结束。
         wait_script = tmp / "wait.ema2"
         wait_script.write_text(
-            'click selector="#fetch"\nwaitFor url=api status=200 timeout=3s\nclick selector="#go"\n',
+            'click selector="#fetch"\nwaitFor url=api status=200 timeout=3s\n'
+            'waitFor text=fetched timeout=3s\nclick selector="#go"\n',
             encoding="utf-8",
         )
         runner.run("open", f"{base}/wait.html")
@@ -804,7 +838,9 @@ def main() -> int:
         wait_act_out = (wait_act.stdout or "") + (wait_act.stderr or "")
         runner.check(
             "multi-step waitFor runs in place",
-            wait_act.returncode == 0 and "response=200" in wait_act_out and "url=" in wait_act_out and "second.html" in wait_act_out,
+            wait_act.returncode == 0 and "response=200" in wait_act_out
+            and 'condition=text:"fetched"' in wait_act_out
+            and "url=" in wait_act_out and "second.html" in wait_act_out,
             wait_act_out[:1600],
         )
 

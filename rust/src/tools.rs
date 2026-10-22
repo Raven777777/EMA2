@@ -340,17 +340,7 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 let Some(wait_for) = wait_for.as_object() else {
                     return Err("waitFor must be an object".into());
                 };
-                string_arg(wait_for, "url", 2_048, false, true)?;
-                if let Some(status) = number_arg(wait_for, "status", false)?
-                    && !(100.0..=599.0).contains(&status)
-                {
-                    return Err("waitFor.status must be between 100 and 599".into());
-                }
-                if let Some(timeout) = number_arg(wait_for, "timeout", false)?
-                    && !(0.0..=30.0).contains(&timeout)
-                {
-                    return Err("waitFor.timeout must be between 0 and 30 seconds".into());
-                }
+                validate_wait_for(wait_for)?;
             }
         }
         "wait" => {
@@ -594,6 +584,42 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// act 的 waitFor（顶层钩子与脚本步骤共用）：网络/导航条件或单个页面条件。
+fn validate_wait_for(wait_for: &Map<String, Value>) -> Result<(), String> {
+    let url = string_arg(wait_for, "url", 2_048, false, true)?;
+    let text = string_arg(wait_for, "text", 100_000, false, false)?;
+    let text_gone = string_arg(wait_for, "textGone", 100_000, false, false)?;
+    let selector = string_arg(wait_for, "selector", 2_048, false, false)?;
+    let status = number_arg(wait_for, "status", false)?;
+    if let Some(status) = status
+        && !(100.0..=599.0).contains(&status)
+    {
+        return Err("waitFor.status must be between 100 and 599".into());
+    }
+    if let Some(timeout) = number_arg(wait_for, "timeout", false)?
+        && !(0.0..=30.0).contains(&timeout)
+    {
+        return Err("waitFor.timeout must be between 0 and 30 seconds".into());
+    }
+    let page_conditions = [text, text_gone, selector]
+        .iter()
+        .filter(|flag| **flag)
+        .count();
+    if page_conditions > 1 {
+        return Err("waitFor takes only one of text, textGone, selector".into());
+    }
+    if page_conditions == 1 && (url || status.is_some()) {
+        return Err(
+            "waitFor cannot combine text/textGone/selector with url/status; use one condition"
+                .into(),
+        );
+    }
+    if page_conditions == 0 && !url && status.is_none() {
+        return Err("waitFor needs url=, status=, text=, textGone=, or selector=".into());
+    }
+    Ok(())
+}
+
 fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
     enum_arg(
         object,
@@ -669,22 +695,7 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
         return Ok(());
     }
     if action == "waitFor" {
-        let url = string_arg(object, "url", 2_048, false, true)?;
-        let status = number_arg(object, "status", false)?;
-        if let Some(status) = status
-            && !(100.0..=599.0).contains(&status)
-        {
-            return Err("waitFor.status must be between 100 and 599".into());
-        }
-        if let Some(timeout) = number_arg(object, "timeout", false)?
-            && !(0.0..=30.0).contains(&timeout)
-        {
-            return Err("waitFor.timeout must be between 0 and 30 seconds".into());
-        }
-        if !url && status.is_none() {
-            return Err("waitFor needs url= or status=".into());
-        }
-        return Ok(());
+        return validate_wait_for(object);
     }
     if action == "fill"
         && object
@@ -1101,6 +1112,40 @@ mod tests {
             )
             .is_err()
         );
+        for wait_for in [
+            json!({ "text": "评论已提交", "timeout": 5 }),
+            json!({ "textGone": "正在提交", "timeout": 5 }),
+            json!({ "selector": "#comment-18", "timeout": 5 }),
+        ] {
+            assert!(
+                validate_arguments(
+                    "act",
+                    &json!({ "action": "click", "ref": "e1", "waitFor": wait_for })
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "action": "click", "waitFor": { "text": "done", "selector": "#done" } })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "action": "click", "waitFor": { "text": "done", "url": "api/save" } })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "action": "click", "waitFor": { "text": "  " } })
+            )
+            .is_err()
+        );
         assert!(
             validate_arguments(
                 "act",
@@ -1127,7 +1172,28 @@ mod tests {
             )
             .is_ok()
         );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "steps": [{ "action": "waitFor", "text": "saved", "timeout": 3 }] })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "steps": [{ "action": "waitFor", "selector": "#done" }] })
+            )
+            .is_ok()
+        );
         assert!(validate_arguments("act", &json!({ "steps": [{ "action": "waitFor" }] })).is_err());
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "steps": [{ "action": "waitFor", "text": "a", "selector": "#a" }] })
+            )
+            .is_err()
+        );
         assert!(
             validate_arguments(
                 "act",

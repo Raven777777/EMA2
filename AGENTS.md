@@ -99,7 +99,11 @@ ema2 server stop            # 收尾：关 daemon
 - `act`：默认最多 settle 3s；`settle=pending` **不是失败**，接 `ema2 await 10s`。
   点链接没导航给 `nav=none`；可导航 `<a>` 无任何变化才自动重试一次，输出 `retried=1`。
   普通按钮最多 800ms；SPA 只改 DOM 时约 1s 后按 `nav=none` 结算。
-- `.ema2` 脚本：只允许 11 个 act 动作 + `await 10s` + `waitFor url=... status=... timeout=5s`；
+- `act --wait-for`：动作 settle 后验证后置条件。`url=`/`status=` 等响应/导航；
+  `text=`/`textGone=`/`selector=` 等页面条件（与 `ema2 wait` 同义，一次一个）。
+  成功多一行 `expect=ok condition=... ms=...`；超时 `wait_timeout` + `expect=timeout`。
+- `.ema2` 脚本：只允许 11 个 act 动作 + `await 10s` + `waitFor url=... status=... timeout=5s`
+  或 `waitFor text=... timeout=5s`；
   **不能写** `open/read/snapshot/wait/js/tabs`。最多 **20 步**。pending 且下一步不是 await 时脚本停止。
 - 输入：`fill` 覆盖整值；`type` 按 caret/selection 插入（选中会替换），优先 CDP 可信输入；
   `select` 位置参数是 option 的 `value`；`<select multiple>` 用逗号分隔。
@@ -175,7 +179,7 @@ Never：
 | `helpers_missing` | 重试 `snapshot`/`read`；持续失败重载页面 |
 | `no_form` | 用 click 提交按钮，或 press Enter |
 | `no_pending_action` | 先 `act`；或改用 `wait text/selector/time/idle` |
-| `wait_timeout` | 检查条件或提高 timeout |
+| `wait_timeout` | 看最后 URL/文本，检查条件或提高 timeout |
 | `response_timeout` | 看 `observation_gap`；`--wait-for` 加 `timeout=5s`（≤30s） |
 | `tool_timeout` | 关对话框/重载 tab，或缩小单次操作 |
 | `screenshot_too_large` / `screenshot_decode_failed` / `screenshot_empty` / `screenshot_not_saved` | 检查输出目录/窗口可见性，或 `--inline` |

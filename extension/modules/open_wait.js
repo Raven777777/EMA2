@@ -288,6 +288,35 @@ async function waitForReady(tabId, state, timeoutMs) {
   return false;
 }
 
+/**
+ * 从 wait/waitFor 参数里取出页面条件。顺序与旧 waitTool 一致：
+ * selector 优先，其次 textGone，最后 text；Rust 侧保证最多只有一个。
+ */
+function pageWaitCondition(spec) {
+  if (spec && spec.selector !== undefined) return { key: 'selector', value: String(spec.selector) };
+  if (spec && spec.textGone !== undefined) return { key: 'textGone', value: String(spec.textGone) };
+  if (spec && spec.text !== undefined) return { key: 'text', value: String(spec.text) };
+  return null;
+}
+
+function pageWaitLabel(condition) {
+  return `${condition.key}=${condition.value}`;
+}
+
+function pageWaitQuotedLabel(condition) {
+  return `${condition.key}:${JSON.stringify(condition.value)}`;
+}
+
+async function pageWaitMatched(tabId, condition) {
+  if (condition.key === 'selector') {
+    return await runInTab(tabId, (selector) => !!(window.__ema2_helpers && window.__ema2_helpers.find(null, selector, null)), [condition.value]);
+  }
+  if (condition.key === 'textGone') {
+    return await runInTab(tabId, (text) => !(document.body ? document.body.innerText : '').includes(text), [condition.value]);
+  }
+  return await runInTab(tabId, (text) => (document.body ? document.body.innerText : '').includes(text), [condition.value]);
+}
+
 async function waitTool(args) {
   if (args.await) return awaitPendingAction(args);
   const tab = await resolveTab(args);
@@ -310,31 +339,23 @@ async function waitTool(args) {
     if (!ready) fail('wait_timeout', `page did not become idle in ${timeoutMs / 1000}s`, 'retry, or wait for a specific selector/text');
     return `ok=idle elapsed=${((Date.now() - start) / 1000).toFixed(1)}s`;
   }
-  if (args.selector !== undefined) {
+  const condition = pageWaitCondition(args);
+  if (condition && condition.key === 'selector') {
     await ensureHelpers(tab.id);
     // 非法 CSS 应立即返回 invalid_selector，而不是等到 timeout 后报 wait_timeout。
-    await requireValidSelector(tab.id, args.selector);
+    await requireValidSelector(tab.id, condition.value);
   }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     let matched = false;
     try {
-      if (args.selector !== undefined) {
-        matched = await runInTab(tab.id, (selector) => !!(window.__ema2_helpers && window.__ema2_helpers.find(null, selector, null)), [args.selector]);
-      } else if (args.textGone !== undefined) {
-        matched = await runInTab(tab.id, (text) => !(document.body ? document.body.innerText : '').includes(text), [args.textGone]);
-      } else if (args.text !== undefined) {
-        matched = await runInTab(tab.id, (text) => (document.body ? document.body.innerText : '').includes(text), [args.text]);
-      }
+      if (condition) matched = await pageWaitMatched(tab.id, condition);
     } catch (_) { matched = false; }
     if (matched) {
-      const what = args.selector !== undefined ? `selector=${args.selector}`
-        : args.textGone !== undefined ? `textGone=${args.textGone}` : `text=${args.text}`;
-      return `ok=${what} elapsed=${((Date.now() - start) / 1000).toFixed(1)}s`;
+      return `ok=${pageWaitLabel(condition)} elapsed=${((Date.now() - start) / 1000).toFixed(1)}s`;
     }
     await sleep(250);
   }
-  const what = args.selector !== undefined ? `selector=${args.selector}`
-    : args.textGone !== undefined ? `textGone=${args.textGone}` : `text=${args.text}`;
+  const what = condition ? pageWaitLabel(condition) : 'condition';
   fail('wait_timeout', `timeout after ${timeoutMs / 1000}s: ${what}`, 'call snapshot to see current state, or raise timeout');
 }

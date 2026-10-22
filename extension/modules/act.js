@@ -599,8 +599,53 @@ async function actTool(args) {
 }
 
 
-/** 等某个响应或页面导航出现（url 子串 + 可选状态码），命中返回一行摘要。 */
+/** 等页面条件（text / textGone / selector）成立；超时带最后 URL/文本。 */
+async function waitForPageCondition(tabId, spec, condition) {
+  const timeoutMs = Math.max(0, Math.min(300000, Math.round((typeof spec.timeout === 'number' ? spec.timeout : 10) * 1000)));
+  const label = pageWaitQuotedLabel(condition);
+  const startedAt = Date.now();
+  if (condition.key === 'selector') {
+    await ensureHelpers(tabId);
+    // 非法 CSS 立即报 invalid_selector，而不是空等到 timeout。
+    await requireValidSelector(tabId, condition.value);
+  }
+  let lastUrl = '';
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const tabInfo = await chrome.tabs.get(tabId);
+      if (tabInfo && tabInfo.url) lastUrl = tabInfo.url;
+    } catch (_) {
+      fail('tab_not_found', `tab ${tabId} was closed while waiting for ${label}`,
+        'inspect tabs with `ema2 tabs list`');
+    }
+    let matched = false;
+    try {
+      matched = await pageWaitMatched(tabId, condition);
+    } catch (_) { matched = false; }
+    if (matched) {
+      return `expect=ok condition=${label} ms=${Date.now() - startedAt}`;
+    }
+    await sleep(120);
+  }
+  let text = '';
+  try {
+    text = await runInTab(tabId, () => document.body ? document.body.innerText : '', []);
+  } catch (_) { /* navigating or tab closed */ }
+  if (!lastUrl) {
+    try { lastUrl = (await chrome.tabs.get(tabId)).url || ''; } catch (_) { /* tab closed */ }
+  }
+  const seenText = shortText(text, 160);
+  fail('wait_timeout',
+    `expect=timeout condition=${label} ms=${Date.now() - startedAt}`
+      + (lastUrl ? ` url=${lastUrl}` : '')
+      + (seenText ? ` text=${JSON.stringify(seenText)}` : ''),
+    'call `ema2 snapshot` or `ema2 read` to inspect the page, or raise timeout= (max 30s)');
+}
+
+/** 等某个响应/页面导航，或 text/textGone/selector 页面条件，命中返回一行摘要。 */
 async function waitForResponse(tabId, spec, baselineOverride) {
+  const condition = pageWaitCondition(spec);
+  if (condition) return waitForPageCondition(tabId, spec, condition);
   await ensureNetworkHook(tabId);
   const wantUrl = spec.url ? String(spec.url).toLowerCase() : '';
   const wantStatus = typeof spec.status === 'number' ? spec.status : null;
