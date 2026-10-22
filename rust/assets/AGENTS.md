@@ -31,7 +31,7 @@ ema2 server stop            # 收尾：关 daemon
 - 错误：stderr 首行 `error=<code> msg=... hint=...`，按错误码表处理。
 - 退出码：`0` 成功 / `1` 参数错 / `2` 中继不可用 / `3` 扩展未连 / `4` 工具执行错。
 - 端口：默认 **7744**；`--port N` 时 server 与所有命令必须一致。
-- 时间：`--timeout` 单位秒；`wait/await/waitFor` 可写 `5s` / `500ms`。
+- 时间：所有时长参数接受 `30` / `30s` / `500ms`（裸数字是秒）；`wait/await/waitFor` 同样可写时长串。
 - `budget`：返回文本字符预算，默认 4000（js 8000 / observe 3000），范围 200–200000；`cursor` 用上次 `next` 的数字续读。
 - 列表尾部固定 `total/shown/next`；`next=none` 表示读完，否则把 `next` 的数字传给 `--cursor`/`--since`。
 
@@ -43,26 +43,32 @@ ema2 server stop            # 收尾：关 daemon
 | `ema2 status` | relay / extension / tabs 状态 |
 | `ema2 init` | 在当前目录写/更新本文件 |
 | `ema2 tabs [list\|current\|new\|close\|activate]` | 标签页；`tabs new` **默认激活并聚焦窗口**，`--background` 才后台 |
-| `ema2 open <url> [--tab ID\|--replace\|--reuse session] [--wait load\|dom\|none] [--timeout 15]` | 打开/导航；输出 `id/url/title/status/reuse/net_hook/focused`，有对话框时加 `dialog_opened=` |
-| `ema2 read [--tab ID] [--mode md\|text\|html\|visible] [--selector X] [--no-main] [--budget N] [--cursor N]` | 读正文；默认 `--main` 开。`main`/`article`/`[role=main]` 未命中会回退并标 `selector_fallback=1`；登录/验证页输出 `state=login_required\|challenge`（exit 0），空页/PDF/HTTP 404 报错（exit 4） |
-| `ema2 snapshot [--tab ID] [--filter interactive\|full\|links\|buttons\|form] [--near REF] [--budget N] [--cursor N] [--values]` | ref 快照；`[e12@d1] button "X"`，href 是完整 URL |
+| `ema2 open <url> [--tab ID\|--replace\|--reuse last] [--until load\|dom\|none] [--timeout 15s]` / `open --urls "u1,u2" [--background]` | 打开/导航；输出 `id/url/title/status/reuse/net_hook/focused`，有对话框时加 `dialog_opened=` |
+| `ema2 read [--tab ID\|--tabs "1,2"\|--urls "u1,u2"\|--url <u>] [--mode md\|text\|html\|visible] [--selector X] [--no-main] [--budget N] [--cursor N]` | 读正文；默认 `--main` 开。`main`/`article`/`[role=main]` 未命中会回退并标 `selector_fallback=1`；登录/验证页输出 `state=login_required\|challenge`（exit 0），空页/PDF/HTTP 404 报错（exit 4） |
+| `ema2 snapshot [--tab ID\|--tabs\|--urls\|--url] [--filter interactive\|full\|links\|buttons\|form] [--near REF] [--budget N] [--cursor N] [--values]` | ref 快照；`[e12@d1] button "X"`，href 是完整 URL |
 | `ema2 act <action> [ref] [text] [flags] [--tab ID]` / `--steps` / `--script x.ema2` | 单步或脚本；不强制切换活动标签 |
 | `ema2 await [10s] [--tab ID]` | 等**上一个 act 所在标签**的导航/页面稳定；缺省 3s，范围 0–300s |
-| `ema2 wait <text\|textGone\|selector\|time\|idle> ... [--timeout 30s] [--tab ID]` | 等页面条件；**shell 命令，不能写进 .ema2 脚本** |
-| `ema2 js '<code>' [--tab ID] [--budget N] [--cursor N] [--timeout 10]` / `--file f.js` | 页面主世界执行 JS；默认 10s 上限 |
-| `ema2 observe console\|network ... [--since SEQ] [--har x.har]` | console 默认 `--level error`；network 可 `--body-filter`/`--bodies=false` |
+| `ema2 wait <text\|textGone\|selector\|time\|idle> ... [--timeout 30s] [--tab ID\|--tabs\|--urls]` | 等页面条件；**shell 命令，不能写进 .ema2 脚本** |
+| `ema2 js '<code>' [--tab ID\|--tabs\|--urls] [--budget N] [--cursor N] [--timeout 10s]` / `--file f.js` | 页面主世界执行 JS；默认 10s 上限 |
+| `ema2 observe console\|network ... [--since SEQ] [--har x.har]` | console 默认 `--level error`；network 可 `--url-filter`/`--collect`/`--no-bodies` |
 | `ema2 files upload <path...> --ref R` / `--selector S` / `--target T` | 上传本地文件；`files download-dir` 固定报错 |
 | `ema2 shot [--tab ID] [--inline] [--annotate] [--format png\|jpeg] [--out PATH]` | 截图落盘；`--tab` 自动激活目标标签 |
-| `ema2 batch <open\|read\|snapshot\|js\|wait> --urls "u1,u2"` / `--tab-ids "1,2"` | 多标签并发；默认新开，`--reuse session` 仅用于 `--urls` |
+| `ema2 batch <open\|read\|snapshot\|js\|wait> --urls "u1,u2"` / `--tab-ids "1,2"` | 旧的多标签语法（执行器仍是同一个）；新写法用各命令的 `--tabs/--urls`，`--reuse url` 仅用于 `--urls` |
 
 ## 默认值 / 副作用 / 语义
 
 - `ref`：形如 `e12@d1`；导航/刷新/换 tab 后旧完整 ref 报 `stale_ref`，重新 `snapshot`。
   手敲可用短 ref `e12`（当前文档）；严格防误点用 snapshot 原样完整 ref。
 - `tabs new`：默认激活并聚焦窗口；`tabs activate` 也会 `windows.update{focused:true}`。
-- `open`：默认新开并登记会话；`--replace` 当前标签导航；`--reuse session` 复用本会话最近标签；
-  `--tab ID` 指定标签且不计入会话；三者互斥。`--timeout` 是整个 open 流程硬上限，1..60 默认 15。
+- `open`：默认新开、激活、聚焦并登记会话；`--replace` 当前标签导航；`--reuse last` 复用本会话最近标签
+  （旧名 `session`）；`--tab ID` 指定标签且不计入会话；三者互斥。`--background` 只在新建标签时生效，
+  与上述三者同时给报 `invalid_argument`。`--until` 是返回到什么程度（旧名 `--wait`），
+  `--timeout` 是整个 open 流程硬上限，1..60 默认 15，可写 `20` / `20s` / `1500ms`。
   加载期间的 `alert/confirm/prompt/print` 记为 `dialog_opened=` 并自动关闭，不代表用户确认。
+- 多目标：`read/snapshot/js/wait --tabs "1,2" | --urls "u1,u2" | --url <u>`，`open --urls`；
+  与 `--tab` 互斥，`--concurrency 1..4`（默认 2），`--reuse url` 只用于 `--urls`。
+  输出按 `---` 分块（块头 `tab=` / `url=`），截断块带 `resume=<tool> --tab <id> --cursor <next>`。
+- 时长：所有时长参数接受 `30` / `30s` / `500ms`（`m`/`h` 也合法）；`wait/await` 范围 0–300s。
 - `act`：默认最多 settle 3s；`settle=pending` **不是失败**，接 `ema2 await 10s`。
   点链接没导航给 `nav=none`；可导航 `<a>` 无任何变化才自动重试一次，输出 `retried=1`。
   普通按钮最多 800ms；SPA 只改 DOM 时约 1s 后按 `nav=none` 结算。

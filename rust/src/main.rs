@@ -58,16 +58,32 @@ fn main() {
         cli::Command::Tabs(args) => run_built(cli::build_tabs(&args), port),
         cli::Command::Open {
             url,
+            urls,
+            concurrency,
             tab,
             replace,
             reuse,
+            until,
             wait,
             timeout,
+            background,
         } => run_built(
-            cli::build_open(&url, tab, replace, &reuse, &wait, timeout),
+            cli::build_open(
+                &url,
+                &urls,
+                concurrency,
+                tab,
+                replace,
+                &reuse,
+                &until,
+                &wait,
+                &timeout,
+                background,
+            ),
             port,
         ),
         cli::Command::Read {
+            fanout,
             tab,
             mode,
             selector,
@@ -75,12 +91,11 @@ fn main() {
             budget,
             cursor,
         } => run_built(
-            Ok(cli::build_read(
-                tab, &mode, &selector, no_main, budget, cursor,
-            )),
+            cli::build_read(&fanout, tab, &mode, &selector, no_main, budget, cursor),
             port,
         ),
         cli::Command::Snapshot {
+            fanout,
             tab,
             filter,
             near,
@@ -88,9 +103,7 @@ fn main() {
             cursor,
             values,
         } => run_built(
-            Ok(cli::build_snapshot(
-                tab, &filter, &near, budget, cursor, values,
-            )),
+            cli::build_snapshot(&fanout, tab, &filter, &near, budget, cursor, values),
             port,
         ),
         cli::Command::Act { tokens } => {
@@ -115,13 +128,15 @@ fn main() {
             }
         }
         cli::Command::Wait {
+            fanout,
             kind,
             value,
             timeout,
             tab,
-        } => run_built(cli::build_wait(&kind, &value, &timeout, tab), port),
+        } => run_built(cli::build_wait(&fanout, &kind, &value, &timeout, tab), port),
         cli::Command::Await { value, tab } => run_built(cli::build_await(&value, tab), port),
         cli::Command::Js {
+            fanout,
             code,
             file,
             tab,
@@ -129,7 +144,7 @@ fn main() {
             cursor,
             timeout,
         } => run_built(
-            cli::build_js(code.as_ref(), &file, tab, budget, cursor, timeout),
+            cli::build_js(&fanout, code.as_ref(), &file, tab, budget, cursor, &timeout),
             port,
         ),
         cli::Command::Observe {
@@ -137,9 +152,12 @@ fn main() {
             tab,
             since,
             level,
+            url_filter,
             filter,
+            collect,
             wait,
             body_filter,
+            no_bodies,
             bodies,
             har,
             headers,
@@ -150,9 +168,12 @@ fn main() {
                 tab,
                 since,
                 &level,
+                &url_filter,
                 &filter,
+                &collect,
                 &wait,
                 &body_filter,
+                no_bodies,
                 bodies,
                 har,
                 &headers,

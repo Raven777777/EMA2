@@ -548,7 +548,13 @@ def static_contract_check() -> bool:
     js = "\n".join(path.read_text(encoding="utf-8") for path in sources)
     docs = (ROOT / "docs" / "TOOLS.md").read_text(encoding="utf-8")
     contract = json.loads((ROOT / "contract" / "runtime.json").read_text(encoding="utf-8"))
-    codes = sorted(set(re.findall(r"fail\('([a-z_]+)'", js)) | set(re.findall(r"code: '([a-z_]+)'", js)))
+    # 第三组是直接写在输出文本里的兜底码（formatError / batch 块），
+    # 只扫 fail('/code: ' 会漏掉 v2.4.3.1 之前的 error=internal。
+    codes = sorted(
+        set(re.findall(r"fail\('([a-z_]+)'", js))
+        | set(re.findall(r"code: '([a-z_]+)'", js))
+        | set(re.findall(r"error=([a-z_]+)", js))
+    )
     missing = [code for code in codes if f"`{code}`" not in docs]
     print(f"PASS  static: {len(codes)} error codes documented" if not missing else "FAIL  static: error codes")
     if missing:
@@ -1025,8 +1031,8 @@ def main() -> int:
             runner.run("observe", "--help"), "默认 error",
         )
         runner.expect_ok(
-            "batch --help exposes reuse session",
-            runner.run("batch", "--help"), "--reuse session",
+            "batch --help exposes reuse url|session",
+            runner.run("batch", "--help"), "--reuse url|session",
         )
 
         # SPA 链接只改 DOM 不导航：应 settle=done + nav=none，而不是 pending。
@@ -1184,6 +1190,98 @@ def main() -> int:
             and "Fixture Home" in reused_out,
             reused_out[-1000:],
         )
+
+        # ---- v2.4.3.1: fan-out on the normal commands, background open, error page ----
+        url_read = runner.run(
+            "read", "--url", f"{base}/second.html", "--mode", "text", "--no-main", timeout=120
+        )
+        url_read_out = (url_read.stdout or "") + (url_read.stderr or "")
+        runner.check(
+            "read --url opens and reads one target",
+            url_read.returncode == 0 and "Second Page" in url_read_out
+            and re.search(r"^tab=\d+$", url_read_out, re.M) is not None,
+            url_read_out[:1200],
+        )
+
+        urls_read = runner.run(
+            "read", "--urls", f"{base}/,{base}/second.html", "--mode", "text", "--no-main",
+            "--concurrency", "2", timeout=120,
+        )
+        urls_read_out = (urls_read.stdout or "") + (urls_read.stderr or "")
+        runner.check(
+            "read --urls fans out with a tab= header per block",
+            urls_read.returncode == 0
+            and urls_read_out.count("url=") >= 2
+            and len(re.findall(r"^tab=\d+$", urls_read_out, re.M)) >= 2
+            and "Fixture Home" in urls_read_out and "Second Page" in urls_read_out,
+            urls_read_out[:1600],
+        )
+
+        fanout_tab_ids = re.findall(r"^tab=(\d+)$", urls_read_out, re.M)
+        if len(fanout_tab_ids) >= 2:
+            tabs_read = runner.run(
+                "read", "--tabs", ",".join(fanout_tab_ids[:2]),
+                "--mode", "text", "--no-main", timeout=120,
+            )
+            tabs_read_out = (tabs_read.stdout or "") + (tabs_read.stderr or "")
+            runner.check(
+                "read --tabs reads existing tabs without opening new ones",
+                tabs_read.returncode == 0
+                and len(re.findall(r"^tab=\d+$", tabs_read_out, re.M)) >= 2
+                and "Fixture Home" in tabs_read_out and "Second Page" in tabs_read_out,
+                tabs_read_out[:1600],
+            )
+        else:
+            runner.check(
+                "read --tabs reads existing tabs without opening new ones",
+                False,
+                urls_read_out[:800],
+            )
+
+        resume_read = runner.run(
+            "read", "--url", f"{base}/", "--mode", "html", "--no-main", "--budget", "200",
+            timeout=120,
+        )
+        resume_out = (resume_read.stdout or "") + (resume_read.stderr or "")
+        runner.check(
+            "truncated fan-out block carries resume=",
+            resume_read.returncode == 0 and "truncated=1" in resume_out
+            and re.search(r"^resume=read --tab \d+ --cursor \d+$", resume_out, re.M) is not None,
+            resume_out[:1600],
+        )
+
+        before_bg = runner.run("tabs", "current")
+        before_bg_id = re.search(r"^id=(\d+)", before_bg.stdout or "", re.M)
+        background_open = runner.run(
+            "open", f"{base}/second.html", "--background", "--until", "dom", timeout=120
+        )
+        after_bg = runner.run("tabs", "current")
+        after_bg_id = re.search(r"^id=(\d+)", after_bg.stdout or "", re.M)
+        background_out = (background_open.stdout or "") + (background_open.stderr or "")
+        runner.check(
+            "open --background keeps the active tab and reports focused=0",
+            background_open.returncode == 0 and "focused=0" in background_out
+            and before_bg_id is not None and after_bg_id is not None
+            and before_bg_id.group(1) == after_bg_id.group(1),
+            background_out + (before_bg.stdout or "") + (after_bg.stdout or ""),
+        )
+
+        dead_url = f"http://127.0.0.1:{free_port()}/"
+        dead_open = runner.run("open", dead_url, "--until", "none", timeout=60)
+        dead_match = re.search(r"^id=(\d+)", dead_open.stdout or "", re.M)
+        if dead_match:
+            runner.expect_error(
+                "browser error page maps to page_error",
+                runner.run("read", "--tab", dead_match.group(1), timeout=60),
+                "page_error",
+                4,
+            )
+        else:
+            runner.check(
+                "browser error page maps to page_error",
+                False,
+                (dead_open.stdout or "") + (dead_open.stderr or ""),
+            )
 
         # ---- read --mode visible ----
         runner.run("open", f"{base}/visible.html")

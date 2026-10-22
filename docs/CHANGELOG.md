@@ -1,5 +1,54 @@
 # 变更记录
 
+## v2.4.3.1 — 命令面语义统一（纯增量）
+
+不删旧语法、不改退出码、不新增工具（仍是 11 个）。这一版只补 EVOLUTION.md 的第一段：
+把同一能力从「换个命令重新学一套 flag」收敛成 `--tabs/--urls`，把同名不同义的等待/过滤
+拆成一名一义，并修掉 `internal` 这个无法自我纠正的兜底码。
+
+### CLI
+
+- **多目标 fan-out**：`read` / `snapshot` / `js` / `wait` 新增 `--tabs "1,2"`、`--urls "u1,u2"`、
+  `--url <u>`、`--concurrency 1..4`、`--reuse url|session`；`open` 新增 `--urls`。
+  带多目标时 CLI 把已有 builder 的产物包成一次 `batch` 调用，不再有“另一套命令语法”。
+  `--urls` 的逗号切分改为「后面还有 http(s) 才算列表」，使文档里的「带逗号的 URL 单独传」真正可用。
+- **`open --background`**：只在新建标签时生效；后台打开不切活动标签、不聚焦窗口（`focused=0`）。
+- **`open --until load|dom|none`**：`--wait` 变为隐藏别名；两者不能同时给。
+- **时长统一**：`open --timeout` 与 `js --timeout` 从 `f64` 改为时长串解析，
+  `20` / `20s` / `500ms` 等价（范围不变：open 1..60s，js 0.1..300s）。
+- **observe 改名**：`--url-filter`（network URL 过滤，旧 `--filter` 隐藏）；
+  `--collect`（旧 `--wait` 隐藏）表示采集窗口；`--no-bodies`（旧 `--bodies=false` 保留）。
+- **`--reuse` 拆分**：`open --reuse last`（旧名 `session`）复用最近会话标签；
+  `--urls ... --reuse url`（旧名 `session`）按精确 URL 复用。两处不再共用一个含义模糊的词。
+- `--tabs` / `--urls` / `--url` 互斥，且都与 `--tab` 互斥；目标数 1..8；
+  `--concurrency` / `--reuse` 缺少多目标时直接报 `invalid_argument`，不再静默忽略。
+
+### 扩展
+
+- **`formatError` 归一浏览器异常**：`Frame with ID 0 is showing error page` → `page_error`、
+  `No tab with id` → `tab_not_found`、`Cannot access a chrome:// URL` → `internal_page`、
+  debugger attach/detach → `debugger_busy`、`Cannot find context with specified id` / `Target closed`
+  → `page_changed`；只改 `code`/`hint`，`msg=` 保留原文，映射不到才落到 `internal`。
+- **batch 截断块追加 `resume=<tool> --tab <id> --cursor <next>`**：续读不再需要猜 next 属于哪个标签。
+- `open` 接受 `reuse:last` 与 `background`；/cmd 直调也会校验 `background` 与 tab/replace/reuse 互斥。
+- `batch` 接受 `reuse:url|session`；urls 模式复用标签时不再把 `background` 传给已有标签。
+
+### 文档与测试
+
+- `docs/TOOLS.md` 新增「目标与并发」「等待语义」「时长」三节，错误码表补 `internal`；
+  `rust/assets/AGENTS.md` 同步；根 `AGENTS.md` 由 `ema2 init` 重新生成。
+- `cargo test` 新增：fan-out 编译/互斥/上限、`--timeout` 时长串、`open --background`、
+  observe 新旧名；错误码漂移测试扩到 `error=<code>` 字面量；
+  新增 clap 可见子命令与 `docs/TOOLS.md` / `AGENTS.md` 命令表的漂移测试。
+- `scripts/verify.py` 新增真机用例：`read --url`、`read --urls` 分块与 `tab=`、
+  `open --background` 不切换活动标签、浏览器错误页 → `error=page_error`、截断块的 `resume=` 行。
+
+### 版本
+
+- 对外产品/扩展 `2.4.3.1`；`guardVersion` / `guardProtocolVersion` 5；`helpersVersion` 21；
+  Cargo crate metadata 仍为 SemVer 2.4.2。未改页面 helper，不需要 `helpersVersion++`；
+  但改了扩展脚本，需在 `edge://extensions` 重新加载。
+
 ## v2.4.2.7 — exe 图标与 build script 归位
 
 不新增命令、不改退出码、不新增错误码；工具仍是 11 个。这一版只修「分发包里的 exe 在资源管理器里没有图标」。

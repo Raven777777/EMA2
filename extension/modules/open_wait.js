@@ -49,7 +49,7 @@ async function openTool(args) {
     previousUrl = nav.before;
     previousMarker = nav.marker;
     reuse = 'replace';
-  } else if (args.reuse === 'session') {
+  } else if (args.reuse === 'session' || args.reuse === 'last') {
     const live = await lastLiveSessionTab();
     if (live) {
       tab = live;
@@ -66,10 +66,15 @@ async function openTool(args) {
     }
   }
   if (!tab) {
-    tab = await chrome.tabs.create({ url: args.url, active: true });
+    // --background：新标签在后台创建，不切换活动标签、不聚焦窗口；
+    // 后续 read/snapshot 仍可用 --tab 操作它。
+    const background = args.background === true;
+    tab = await chrome.tabs.create({ url: args.url, active: !background });
     await rememberSessionTab(tab.id);
-    // 新标签必须让用户看得见：窗口提到前台（测试也依赖前台语义）。
-    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* ignore */ }
+    // 前景标签必须让用户看得见：窗口提到前台（测试也依赖前台语义）。
+    if (!background) {
+      try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* ignore */ }
+    }
   }
   // 只清本次导航的 tab 槽：lastAct 已按 tab 分槽，不能因为 open 把其它标签
   // 正在进行的 act 上下文一起抹掉（否则并发 await 会找不到上下文）。

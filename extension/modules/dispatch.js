@@ -68,16 +68,22 @@ async function dispatchTool(name, args, context) {
       const url = requireStringArg(args, 'url', 8192, false);
       if (!url) fail('missing_url', 'url is required', 'pass an http(s) url');
       if (!/^https?:\/\//i.test(url)) fail('invalid_url', 'url must use http or https', 'fix the url');
-      if (args.reuse !== undefined && args.reuse !== 'session') {
-        fail('invalid_argument', 'reuse must be session', 'use reuse:"session" or replace:true');
+      if (args.reuse !== undefined && args.reuse !== 'session' && args.reuse !== 'last') {
+        fail('invalid_argument', 'reuse must be last|session', 'use reuse:"last" or replace:true');
       }
       if (args.replace !== undefined && typeof args.replace !== 'boolean') {
         fail('invalid_argument', 'replace must be a boolean', 'use replace:true to navigate the current tab');
       }
+      if (args.background !== undefined && typeof args.background !== 'boolean') {
+        fail('invalid_argument', 'background must be a boolean', 'use background:true to open without switching tabs');
+      }
       const modes = [args.tabId !== undefined, args.replace === true, args.reuse !== undefined]
         .filter(Boolean).length;
       if (modes > 1) {
-        fail('invalid_argument', 'use only one of tabId, replace:true, reuse:"session"', 'pick one navigation target');
+        fail('invalid_argument', 'use only one of tabId, replace:true, reuse:"last"', 'pick one navigation target');
+      }
+      if (args.background === true && modes > 0) {
+        fail('invalid_argument', 'background only applies when opening a new tab', 'drop background or the navigation target');
       }
       const openArgs = { ...args, url };
       return withCommandGuard('open', openArgs, () => openTool(openArgs), context);

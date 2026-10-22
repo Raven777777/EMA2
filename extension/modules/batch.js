@@ -47,6 +47,14 @@ function validateBatchInner(toolName, inner) {
   }
 }
 
+function resumeLine(toolName, tabId, text) {
+  // 截断块的 next 属于哪个 tab 不能再靠猜：直接给一条可执行的续读命令。
+  if (toolName === 'wait') return '';
+  // footer 是 `total=... shown=... next=<n>`，next 不在行首。
+  const match = /^total=\d+ shown=\d+ next=(\d+)\s*$/m.exec(text);
+  return match ? `\nresume=${toolName} --tab ${tabId} --cursor ${match[1]}` : '';
+}
+
 /**
  * 在多个标签页上并发执行 read/snapshot/js/wait/open，返回每页一块结果。
  * 传 `urls` 时先打开（新标签）再执行目标工具——「打开→读取」因此只需一次调用。
@@ -62,11 +70,11 @@ async function batchTool(args, context) {
   if (urls.length && tabIds.length) {
     fail('invalid_argument', 'batch takes either tabIds or urls, not both', 'use urls to open new tabs, or tabIds for tabs you already have');
   }
-  if (args.reuse !== undefined && args.reuse !== 'session') {
-    fail('invalid_argument', 'batch reuse must be session', 'use --reuse session with --urls');
+  if (args.reuse !== undefined && args.reuse !== 'session' && args.reuse !== 'url') {
+    fail('invalid_argument', 'batch reuse must be url|session', 'use --reuse url with --urls');
   }
-  if (args.reuse === 'session' && !urls.length) {
-    fail('invalid_argument', 'batch --reuse session only applies to --urls', 'use --tab-ids for existing tabs');
+  if (args.reuse !== undefined && !urls.length) {
+    fail('invalid_argument', 'batch --reuse only applies to --urls', 'use --tabs for existing tabs');
   }
   const targets = urls.length ? urls : tabIds;
   if (!targets.length || targets.length > MAX_BATCH_TABS) {
@@ -93,7 +101,7 @@ async function batchTool(args, context) {
     fail('invalid_argument', 'batch args must be an object', 'run `ema2 batch --help`; for scripts run `ema2 act --help`');
   }
   if (urls.length) {
-    // 复合模式的内层参数属于目标工具；open 自身只接受 wait/replace/reuse。
+    // 复合模式的内层参数属于目标工具；open 自身只接受 wait/background。
     validateBatchInner(toolName, inner);
     if (inner.replace !== undefined || inner.reuse !== undefined || inner.tabId !== undefined) {
       fail('invalid_argument', 'urls mode always opens new tabs; replace/reuse/tabId are not allowed', 'remove those flags or use tabIds mode');
@@ -104,8 +112,8 @@ async function batchTool(args, context) {
     if (inner.replace !== undefined && typeof inner.replace !== 'boolean') {
       fail('invalid_argument', 'replace must be a boolean', 'fix the inner arguments');
     }
-    if (inner.reuse !== undefined && inner.reuse !== 'session') {
-      fail('invalid_argument', 'reuse must be session', 'fix the inner arguments');
+    if (inner.background !== undefined && typeof inner.background !== 'boolean') {
+      fail('invalid_argument', 'background must be a boolean', 'fix the inner arguments');
     }
   } else {
     validateBatchInner(toolName, inner);
@@ -116,7 +124,7 @@ async function batchTool(args, context) {
   }
   const concurrency = requested;
   const reusedByIndex = new Map();
-  if (args.reuse === 'session' && urls.length) {
+  if (args.reuse !== undefined && urls.length) {
     await loadSessionTabs();
     const liveTabs = await chrome.tabs.query({});
     const liveById = new Map(liveTabs.map(tab => [tab.id, tab]));
@@ -151,6 +159,9 @@ async function batchTool(args, context) {
           if (reusedTabId !== undefined) {
             openArgs.tabId = reusedTabId;
             openArgs.reuseSamePage = true;
+            // 复用已有标签不是「新建」，background 在这里没有意义，
+            // 而且会触发 tools 的 background+tabId 互斥校验。
+            delete openArgs.background;
           }
           let openedText;
           try {
@@ -161,6 +172,7 @@ async function batchTool(args, context) {
             reusedByIndex.delete(index);
             delete openArgs.tabId;
             delete openArgs.reuseSamePage;
+            if (inner.background !== undefined) openArgs.background = inner.background;
             openedText = resultText(await executeTool('open', openArgs, context));
           }
           const reusedLine = reusedByIndex.has(index) ? `reused=1 tab=${reusedTabId}\n` : '';
@@ -177,7 +189,9 @@ async function batchTool(args, context) {
               delete innerArgs.replace;
               delete innerArgs.reuse;
               const value = await executeTool(toolName, innerArgs, context);
-              results[index] = `url=${url}\n${reusedLine}tab=${tabId}\n` + resultText(value);
+              const text = resultText(value);
+              results[index] = `url=${url}\n${reusedLine}tab=${tabId}\n` + text
+                + resumeLine(toolName, tabId, text);
             }
           }
         } catch (error) {
@@ -188,7 +202,8 @@ async function batchTool(args, context) {
       const tabId = tabIds[index];
       try {
         const value = await executeTool(toolName, { ...inner, tabId }, context);
-        results[index] = `tab=${tabId}\n` + resultText(value);
+        const text = resultText(value);
+        results[index] = `tab=${tabId}\n` + text + resumeLine(toolName, tabId, text);
       } catch (error) {
         results[index] = `tab=${tabId}\n` + formatError(error);
       }

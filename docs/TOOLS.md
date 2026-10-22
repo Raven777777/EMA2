@@ -25,19 +25,81 @@
 | `ema2 observe` | console 增量 / network（真实状态码+响应体，HAR） |
 | `ema2 files` | 上传本地文件；`download-dir` 固定报错 |
 | `ema2 shot` | 截图（落盘 / inline / annotate） |
-| `ema2 batch` | 多标签并发 open/read/snapshot/js/wait |
+| `ema2 batch` | 多标签并发执行器（历史入口；新写法用各命令的 `--tabs/--urls`） |
 
 ## 全局约定
 
 - **必须先 `ema2 server`**。命令发现 7744 不通时报 `relay_not_running`，不自动启动。
 - `--port N`：覆盖默认 7744。server 与所有客户端命令都要用同一个端口。
 - `--tab ID`：多数命令支持，缺省操作当前活动标签页。`open` 会返回目标标签页的 `id`。
+- **单目标用 `--tab`，多目标用 `--tabs/--urls`**（read/snapshot/js/wait，open 用 `--urls`）；
+  两组互斥，细节见[目标与并发](#目标与并发)。
 - **输出是行式紧凑文本，不是 JSON**。HAR 导出是唯一例外（对外标准格式）。
 - **退出码**：`0` 成功 / `1` 参数错 / `2` 中继不可用 / `3` 扩展未连 / `4` 工具执行错。
 - **错误**：stderr 首行 `error=<code> msg=... hint=...`，`<code>` 见错误码表。
 - `budget`：返回文本的字符预算，范围 200–200000；默认值按工具不同：
   read / snapshot / tabs / wait 为 4000，js 为 8000，observe 为 3000。
 - `cursor`：把上次返回的 `next`（数字）传给 `--cursor` 继续读。
+- **时间参数统一接受 `30` / `30s` / `500ms`**（`m`/`h` 也合法），见[时长](#时长)。
+
+## 目标与并发
+
+同一能力不再需要换到 `batch` 语法；五个命令直接接受多目标参数：
+
+```bash
+ema2 read --tabs "1,2" --mode md
+ema2 snapshot --urls "https://a.example/,https://b.example/" --filter links
+ema2 js --urls "https://a.example/" --file extract.js --concurrency 2
+ema2 wait --tabs "1,2" text "Done"
+ema2 open --urls "https://a.example/,https://b.example/" --background
+```
+
+规则：
+
+- `--tabs "1,2"`：对已有标签并发执行，每块头部 `tab=<id>`。
+- `--urls "u1,u2"`：先为每个 URL 新开标签，再执行目标工具；每块头部 `url=<请求 URL>` + `tab=<id>`。
+  URL 的标签登记进会话，收尾统一 `ema2 tabs close --session`。
+- `--url <u>`：`read/snapshot/js/wait` 的单数形式，等价于 `--urls "<u>"`。
+- `--tabs` / `--urls` / `--url` 三者互斥，且都与单目标 `--tab` 互斥；同时给报 `invalid_argument`。
+- `--concurrency 1..4`（默认 2）；只能和多目标参数一起用。`js` 因全局 debugger 串行，有效并发仍为 1。
+- `--reuse url|session`（仅 `--urls`/`open --urls`）：按规范化完整 URL 匹配本会话标签，
+  命中则不重载并回 `reused=1 tab=<id>`。`session` 是旧别名。
+- 目标数 1..8；`--urls` 可重复传入。逗号是列表分隔符；URL 本身带逗号时把它单独放一个
+  `--urls` 值（该值里逗号后面没有下一个 http(s) URL，就不会被拆）。
+- 输出沿用 batch 契约：块之间 `---`，单块失败不影响其它块。单目标仍用 `--tab`，不改变输出形状。
+- 被截断的块会追加一行 `resume=<tool> --tab <id> --cursor <next>`（`wait` 没有 cursor，不追加），
+  直接把这一行改写成命令即可续读。
+
+`batch` 仍然可用（v2.4.3.11 前不会隐藏），但它是同一能力的旧语法；新脚本请用 `--tabs/--urls`。
+
+## 等待语义
+
+「等」按触发条件分成四类，同名不同义的问题在 v2.4.3.1 收口：
+
+| 场景 | 写法 | 说明 |
+|---|---|---|
+| 动作结算 | `await [10s]` | 只跟随上一个 `act` 所在标签；是 settle 入口，**不是 sleep** |
+| 页面条件 | `wait text\|textGone\|selector\|time\|idle` | 独立 shell 命令，不能写进 `.ema2` |
+| 动作后置条件 | `act ... --wait-for "text=..."` | 本次动作的响应/文本/选择器 |
+| 脚本内 | `await` / `waitFor` | `.ema2` 只有这两个等待原语 |
+| 打开返回时机 | `open --until load\|dom\|none` | 旧 `--wait` 是隐藏别名 |
+| 采集窗口 | `observe --collect 5s` | 旧 `--wait` 是隐藏别名 |
+
+`open` 之后没有 lastAct，`await` 会报 `no_pending_action`；需要额外等待时用 `wait idle` / `wait time`。
+
+## 时长
+
+所有时长类参数接受同一种写法：裸数字是秒，也接受 `ms` / `s` / `m` / `h`。
+
+```bash
+ema2 open https://example.com/ --timeout 20s
+ema2 js 'return 1' --timeout 500ms
+ema2 wait text "Done" --timeout 30s
+ema2 observe network --collect 5s
+```
+
+范围不变：`open --timeout` 1–60s，`js --timeout` 0.1–300s，`wait/await` 0–300s，
+`observe --collect` 0–10s。
 
 ## 输出协议
 
@@ -61,8 +123,8 @@ total=2 shown=2 next=none
 
 ## 错误码
 
-> 这张表是 AI 自我纠正的主要依据：新增 `fail('code'` 时必须同步这里，
-> `cargo test` 里有一条测试会扫描 `extension/modules/*.js` 并断言每个 code 都出现在本文中。
+> 这张表是 AI 自我纠正的主要依据：新增 `fail('code'`、`code: '` 或 `error=<code>` 字面量时
+> 必须同步这里，`cargo test` 里有一条测试会扫描 `extension/modules/*.js` 并断言每个 code 都出现在本文中。
 
 | code | 含义 | 建议 |
 |---|---|---|
@@ -135,6 +197,19 @@ total=2 shown=2 next=none
 | `page_error` | 目标页面 HTTP 状态 ≥400（404/403/5xx 等） | 核对 url；拿不到正文就换页面 |
 | `pdf_page` | 目标是 PDF 文档，read 无法抽文本 | 打开 html 版本；或让用户保存后用文件工具读 |
 | `download_dir_unsupported` | Edge 不允许扩展改下载目录 | 文件会进默认下载目录 |
+| `internal` | 扩展侧未归一的兜底异常（最后手段） | 看 `msg=` 原文；重试，持续出现则重载扩展 |
+
+Chromium 的原始异常文本在 `formatError` 单点归一，不再直接落到 `internal`：
+
+| 原始文本 | 归一为 |
+|---|---|
+| `Frame with ID 0 is showing error page` | `page_error` |
+| `No tab with id` | `tab_not_found` |
+| `Cannot access a chrome:// URL` / `edge://` | `internal_page` |
+| `Debugger is not attached` / `Detached while handling command` | `debugger_busy` |
+| `Cannot find context with specified id` / `Target closed` | `page_changed` |
+
+映射只改 `code` / `hint`，`msg=` 保留原始异常文本；映射不到才落到 `internal`。
 
 ## 服务管理
 
@@ -212,6 +287,8 @@ ema2 tabs activate <id>
 - `current` → `id/window/os/title/url`。
 - `new` → `id/url/window`（登记进会话）；**默认激活并聚焦窗口**，`--background` 才在后台新建。
   这样 `tabs new` 后直接 `snapshot/act`（不带 `--tab`）不会误操作旧标签；`--active` 保留为兼容写法。
+  新建并等页面就绪的写法请优先用 `ema2 open <url>` / `ema2 open <url> --background`：
+  它会额外返回 `status=` / `net_hook=` / `focused=`。
 - `activate` → `active=<id> focused=1|0`：除了切 tab，还会 `chrome.windows.update{focused:true}`
   把窗口提到前台（截图/输入/密码管理器浮层都依赖前台）。
 - `close`：
@@ -224,7 +301,9 @@ ema2 tabs activate <id>
 ## open
 
 ```bash
-ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] [--timeout 15]
+ema2 open <url> [--tab ID | --replace | --reuse last] [--until load|dom|none] [--timeout 15]
+ema2 open <url> [--background] [--until load|dom|none] [--timeout 15]
+ema2 open --urls "u1,u2" [--background] [--concurrency 2] [--reuse url] [--until load|dom|none]
 ```
 
 等页面就绪、装网络 hook，返回 `id / url / title / status / reuse / net_hook`（有重定向时加 `redirects=`）。
@@ -232,17 +311,23 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 - 加载期间有对话框时追加 `dialog_opened=<alert|confirm|prompt|print|beforeunload> handled=<dismissed|blocked|suppressed|passed> [msg=...]`（最多 3 条）；
   被拦截的 `window.open` 追加 `popup_blocked=1 url=...`。
 - 输出包含 `focused=1|0`：`0` 表示浏览器窗口不在前台，会附 hint（先 `tabs activate`）。
-- 默认新开标签，并登记进会话。
+- 默认新开标签、激活并聚焦窗口，并登记进会话。
+- `--background`：只在新建标签时生效；后台打开不切活动标签、不聚焦窗口，输出 `focused=0`。
+  之后用 `--tab` / `tabs activate` 操作它。与 `--tab` / `--replace` / `--reuse` 同时给报 `invalid_argument`。
 - `--replace`：在当前活动标签里导航（不新建），适合「同一个页面连续翻几页」。
-- `--reuse session`：复用本会话**最近**打开的标签并在其中导航；目标与当前文档相同则
-  不重载（保留滚动位置和表单状态）。标签已被关掉则退回新建。注意 `batch --reuse session`
-  的规则不同：它按精确 URL 匹配会话标签，见下文。
+- `--reuse last`：复用本会话**最近**打开的标签并在其中导航；目标与当前文档相同则
+  不重载（保留滚动位置和表单状态）。标签已被关掉则退回新建。旧写法 `--reuse session`
+  仍可用。注意 `--urls ... --reuse url` 的规则不同：它按精确 URL 匹配会话标签。
 - `--tab ID`：导航指定标签（显式意图，不计入会话）。
-- `--timeout N`（单位：秒）：**整个 open 流程**的硬上限（1..60，默认 15）：打开标签 + 等文档接位 +
-  装 hook + 读 timing/focus 都在这段预算内；慢站点/SPA 首屏可以调大。
-- 三者互斥，同时给报 `invalid_argument`。
+- `--urls "u1,u2"`：批量打开，每个 URL 一个新标签（不要求位置参数 URL）；
+  输出按 `---` 分块，每块是普通 `open` 输出。`--reuse url`（旧名 `session`）只复用
+  精确 URL 命中的会话标签；`--concurrency` 控制并发（1..4，默认 2）。
+- `--until load|dom|none`：返回到什么程度（文档接位级别）。旧 `--wait` 是隐藏别名，两者不能同时给。
+- `--timeout`：**整个 open 流程**的硬上限（1..60，默认 15），接受 `20` / `20s` / `1500ms`：
+  打开标签 + 等文档接位 + 装 hook + 读 timing/focus 都在这段预算内；慢站点/SPA 首屏可以调大。
+- `--tab` / `--replace` / `--reuse last` 三者互斥，同时给报 `invalid_argument`。
 - `status=` 来自 `PerformanceNavigationTiming.responseStatus` 的真实主文档状态：
-  `status=404` 这类错误页会额外给 `hint=http 404 ...`；`--wait none` 时是 `status=pending`。
+  `status=404` 这类错误页会额外给 `hint=http 404 ...`；`--until none` 时是 `status=pending`。
 - 返回前会确认**目标文档已经接位**（`location.href` + `readyState` 双条件），
   正常返回时 `url`/`title` 属于新页面；重定向到别的地址同样算到达。超时时明确输出
   `load=pending timeout=Ns timed_out=1`，并在截止前再做一次探测：如果页面刚好完成，
@@ -260,8 +345,13 @@ ema2 open <url> [--tab ID | --replace | --reuse session] [--wait load|dom|none] 
 
 ```bash
 ema2 read [--tab ID] [--mode md|text|html|visible] [--selector X] [--no-main] [--budget N] [--cursor N]
+ema2 read --tabs "1,2" [...]                    # 多已有标签，块头 tab=
+ema2 read --urls "u1,u2" [...]                   # 每 URL 新开标签再读，块头 url= + tab=
+ema2 read --url <u> [...]                        # --urls 的单数形式
 ```
 
+- `--tabs` / `--urls` / `--url` 的互斥规则、并发与 `resume=` 行见[目标与并发](#目标与并发)。
+  多目标输出按 `---` 分块，单块失败不影响其它块。
 - `--main` 默认开：按清洁后文本量/链接密度选正文容器，头部回 `main=<selector>`。
 - 正文容器太短（<200 字符，或不到 body 的 5%）时回退 `main=body(fallback)`，并给
   `hint=main extraction too short (...); fell back to body`。
@@ -340,6 +430,7 @@ read 头部现在总是带 `http=`（主文档响应状态）与 `content_type=`
 ```bash
 ema2 snapshot [--tab ID] [--filter interactive|full|links|buttons|form] \
               [--near REF] [--budget N] [--cursor N] [--values]
+ema2 snapshot --tabs "1,2" / --urls "u1,u2" / --url <u>   # 多目标
 ```
 
 返回可引用的交互元素：`[e12@d1] button "提交"`——`d1` 是**本文档的短句柄**，由扩展分配，
@@ -553,7 +644,11 @@ ema2 wait textGone "<s>" [...]
 ema2 wait selector "<css>" [...]
 ema2 wait time 5s
 ema2 wait idle [--timeout 30s]
+ema2 wait --tabs "1,2" text "<s>"        # 多标签并发
+ema2 wait --urls "u1,u2" text "<s>"       # 多 URL 新开标签后并发等
 ```
+
+多目标规则见[目标与并发](#目标与并发)；`--url` 是 `--urls` 的单数形式。
 
 这是 shell 命令，**不能写进 `.ema2` 脚本**；脚本里用 `await` / `waitFor`。
 `text` / `textGone` / `selector` 也是 `act --wait-for` 的页面条件语法：
@@ -569,8 +664,9 @@ ema2 act click e12 --wait-for "selector=\"#comment-18\" timeout=5s"
 ## js
 
 ```bash
-ema2 js '<code>' [--tab ID] [--budget N] [--cursor N] [--timeout 10]  # 秒
+ema2 js '<code>' [--tab ID] [--budget N] [--cursor N] [--timeout 10s]  # 秒或时长串
 ema2 js --file script.js [...]
+ema2 js --tabs "1,2" '<code>' / --urls "u1,u2" --file lib.js --concurrency 2
 ```
 
 在页面主世界执行（debugger，`awaitPromise`）。字符串原样返回，其余值紧凑 JSON。
@@ -597,8 +693,8 @@ ema2 js --file script.js [...]
 - `debugger.attach` 被拒时先按 page target 的 `targetId` 重挂；仍失败则退到 MAIN world 注入，
   输出末尾多一行 `via=scripting`。降级路径的 `eval` 受页面 CSP 限制，严格 CSP 站点会返回
   `js_exception`；看到 `via=scripting` 说明本次没走 debugger。
-- 全局 debugger 队列串行执行；默认执行上限 **10s**（`--timeout` 可改，0.1..300s），
-  超时返回 `script_timeout` 并 `Runtime.terminateExecution` + detach，后续调用可继续。
+- 全局 debugger 队列串行执行；默认执行上限 **10s**（`--timeout` 可改，接受 `10` / `10s` / `500ms`，
+  范围 0.1..300s），超时返回 `script_timeout` 并 `Runtime.terminateExecution` + detach，后续调用可继续。
   注意 `terminateExecution` 终止的是该 tab 里**所有** JS 执行（不只是本次表达式），
   页面自身的定时器/长任务也会被打断；能用 `wait` 或更短的表达式时不要依赖超时兜底。
 - 返回 DOM 节点时给节点描述/outerHTML 前缀，不再变成 `{}`；语法错误保留完整的
@@ -611,11 +707,15 @@ ema2 js --file script.js [...]
 ## observe
 
 ```bash
-ema2 observe console [--tab ID] [--since SEQ] [--level log|warn|error] [--filter SUBSTR] [--wait 10s]
-ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter RE] [--bodies=false] [--har PATH] [--headers redact|all]
+ema2 observe console [--tab ID] [--since SEQ] [--level log|warn|error] [--collect 10s]
+ema2 observe network [--tab ID] [--since SEQ] [--url-filter SUBSTR] [--body-filter RE] [--no-bodies] [--har PATH] [--headers redact|all]
 ```
 
-- console：增量日志；首次安装 hook（`open`/`act` 也会自动装）。`--wait` 会先安装 hook 再等待，等待期间的新日志也会被记录；
+- `--url-filter`（旧名 `--filter` 已隐藏）是 network 的 URL 子串过滤；`--filter` 从此只表示
+  `snapshot` 的元素类型过滤。console 仍可用隐藏的旧写法 `--filter` 过滤日志文本。
+- `--collect 5s`（旧名 `--wait` 已隐藏）是采集窗口：先装 hook，再等这段时间，≤10s。
+- `--no-bodies`（等价于旧的 `--bodies=false`）关闭响应体预览。
+- console：增量日志；首次安装 hook（`open`/`act` 也会自动装）。`--collect` 会先安装 hook 再等待，等待期间的新日志也会被记录；
   `--har` 只适用于 network（console 传 `--har` 会报 `invalid_argument`）。
 - `--level` 是最低级别阈值，默认 `error`；`warn` 包含 warn/error，`log` 包含所有已采集级别。
   输出尾部明确带 `level=<阈值>`，避免把“没有输出”误认为“没有产生日志”。
@@ -624,9 +724,9 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
   status、headers、MIME，命令结束立即注销，不常驻观察其它标签。记录按 `startedAt` 排序匹配。
   - 列表行输出**完整绝对 URL**（跨域请求不再只剩 path）；`-1` 只用于确实拿不到状态的条目。
   - 预览在后台读取 `response.clone()`，最多 8KB/1.5s，不阻塞页面；事件流/二进制跳过。
-  - `--bodies=false` 真正关闭新响应的 body clone/读取。
-  - `--filter`：URL 子串；`--body-filter`：响应体正则。
-  - `--wait`：等异步请求（≤10s）；`--since` 用上次 `next` 的数字。
+  - `--no-bodies` 真正关闭新响应的 body clone/读取。
+  - `--url-filter`：URL 子串；`--body-filter`：响应体正则。
+  - `--collect`：等异步请求（≤10s）；`--since` 用上次 `next` 的数字。
   - 分页 `next` 只推进到已交付记录；环形缓冲溢出回 `dropped=`，导航回绕回 `reset=1`。
   - 响应体仍在读取（`preview=pending`）的条目不会被丢弃：记录行照常输出并带 `streaming=1`，
     尾部回 `pending=<n> seqs=<seq,...>`；需要补读时用 `--since <first seq - 1>`。
@@ -675,9 +775,12 @@ ema2 shot [--tab ID] [--inline] [--annotate] [--format png|jpeg] [--out PATH]
 
 ## batch
 
+> v2.4.3.1 起，首选语法是各命令自己的 `--tabs/--urls`（见[目标与并发](#目标与并发)）。
+> `batch` 仍是同一执行器的旧入口，运行时行为不变，将在 v2.4.3.11 起从 help 隐藏。
+
 ```bash
 ema2 batch <tool> [tool flags...] --urls "u1,u2"
-ema2 batch <tool> [tool flags...] --urls "u1,u2" --reuse session
+ema2 batch <tool> [tool flags...] --urls "u1,u2" --reuse url
 ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
 ```
 
@@ -687,8 +790,9 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
 - `--urls`：先为每个 URL 打开新标签，再在该标签上执行目标工具，每块头部 `url=<url>` + `tab=<id>`；
   `tool=open` 时只打开（并行开多页）。**`open` + `read` 因此一次命令完成**，不再串行两次。
   默认始终新开标签；内层 `--replace`/`--reuse`/`tabId` 会被拒绝。
-  `--urls` 可重复传入（`--urls u1 --urls u2`），逗号仍是分隔符；URL 本身带逗号时只能分多次传。
-- `--reuse session`：仅用于 `--urls`。按规范化后的完整 URL 只匹配本会话由
+  `--urls` 可重复传入（`--urls u1 --urls u2`），逗号仍是分隔符；URL 本身带逗号时
+  把它单独放一个 `--urls` 值。
+- `--reuse url`（旧名 `session`）：仅用于 `--urls`。按规范化后的完整 URL 只匹配本会话由
   `open`/`tabs new` 打开的标签；命中时复用文档（同一 URL 不重载）并回
   `reused=1 tab=<id>`，未命中仍新开。
   不会复用任意用户标签，也不会改变默认的新开语义。
@@ -701,6 +805,8 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
   `js` 的位置参数可直接写 CODE，`wait` 的位置参数可直接写 TEXT；完整列表见 `ema2 batch --help`。
 - `batch js --file` 与 `js --file` 对齐：文件在客户端只读一次，再分发给每个标签；
   `--file` 与 `--code`/位置参数互斥，空文件在执行前报 `invalid_argument`。
+- 被 budget/cursor 截断的块追加一行 `resume=<tool> --tab <id> --cursor <next>`
+  （`wait` 没有 cursor，不追加）；续读时直接照抄成命令，不必猜 next 属于哪个标签。
 - 预算按 `ceil(目标数/并发) × 单次最长耗时 + open 成本 + 20s`；js 因全局 debugger 串行按有效并发 1 计算。
   `tool=open` 的单次耗时跟随内层 `waitTimeout`（默认 15s），不会再被固定 30s 提前掐断。
 - 估算超过 600s 时在执行前报 `invalid_argument`，请减少目标、提高并发或拆分 batch。
@@ -713,7 +819,7 @@ ema2 server
 ema2 status
 
 # 读取 / 抓数据（单次命令就能拿到主内容）
-ema2 batch read --urls "https://a.com,https://b.com"
+ema2 read --urls "https://a.com,https://b.com"
 # 或者串行：open → wait selector → read → 需要时把输出里的 next 数字传给 --cursor（如 --cursor 4000）
 
 # 同一页面连续翻页：不要每次开新标签
@@ -732,7 +838,7 @@ ema2 observe network --since 0 --body-filter "error"
 # 续读时把上一次输出里的 next 数字传给 --since（如 --since 12）
 
 # 多标签
-ema2 open urlA → ema2 open urlB → ema2 batch read --tab-ids "a,b"
+ema2 open urlA → ema2 open urlB → ema2 read --tabs "a,b"
 # 收尾：关掉本次会话开的标签
 ema2 tabs close --session
 

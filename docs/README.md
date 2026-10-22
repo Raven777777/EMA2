@@ -11,6 +11,12 @@
 | 5 | [HANDOFF.md](HANDOFF.md) | 接手项目、看当前版本与已知弱点 |
 | 6 | [CHANGELOG.md](CHANGELOG.md) | 查某个行为是哪一版改的 |
 
+## 规划
+
+| 文档 | 内容 |
+|---|---|
+| [EVOLUTION.md](EVOLUTION.md) | 命令面演进（v2.4.3.1 已实施；v2.4.3.11 → v2.4.3.21 仍为提案） |
+
 ## 目录
 
 ```text
@@ -22,6 +28,7 @@ docs/
 ├── TESTING.md         ← 真机验收规定与清单
 ├── HANDOFF.md         ← 交接：版本、契约、已知弱点、下一步
 ├── CHANGELOG.md       ← 版本历史（唯一版本号来源）
+├── EVOLUTION.md       ← 命令面演进（v2.4.3.1 已实施，后续为提案）
 ├── archive/           ← 已归档的历史规划/评测，仅追溯
 └── img/               ← README 用图
 ```

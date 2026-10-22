@@ -3,7 +3,9 @@
 use serde_json::{Value, json};
 
 use super::ToolCall;
-use super::shared::{TokenCursor, parse_duration_secs, parse_port, split_flag};
+use super::shared::{
+    TokenCursor, parse_duration_secs, parse_port, parse_tab_ids, parse_url_list, split_flag,
+};
 
 /// `ema2 batch` 的全部 token（`<tool>` 之后）都由这里解析：
 /// 顶层识别 `--tab-ids/--urls/--concurrency/--port`，其余交给目标工具的
@@ -100,41 +102,17 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
     let inner = parse_tool_flags(tool, &flags)?;
     let mut arguments = json!({ "tool": tool, "args": inner });
     if let Some(ids) = tab_ids {
-        let parsed = parse_id_list(&ids)?;
-        if parsed.is_empty() || parsed.len() > 8 {
-            return Err("batch: --tab-ids must contain 1..8 ids".into());
-        }
-        arguments["tabIds"] = json!(parsed);
+        arguments["tabIds"] = json!(parse_tab_ids("batch", "--tab-ids", &[ids])?);
     }
     if !urls.is_empty() {
-        let mut parsed: Vec<&str> = Vec::new();
-        for list in &urls {
-            for part in list
-                .split(',')
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            {
-                let lower = part.to_ascii_lowercase();
-                if !lower.starts_with("http://") && !lower.starts_with("https://") {
-                    return Err(format!(
-                        "batch: --urls entry {part:?} is not http(s); commas are used as separators — pass a URL that contains a comma with a separate --urls flag"
-                    ));
-                }
-                parsed.push(part);
-            }
-        }
-        if parsed.is_empty() || parsed.len() > 8 {
-            return Err("batch: --urls must contain 1..8 urls".into());
-        }
-        arguments["urls"] = json!(parsed);
+        arguments["urls"] = json!(parse_url_list("batch", "--urls", &urls)?);
     }
     if let Some(reuse) = reuse {
-        if reuse != "session" {
-            return Err(format!(
-                "batch: --reuse only accepts \"session\", got {reuse:?}"
-            ));
+        // v2.4.3.1：规范名是 url（按精确 URL 匹配），session 仍是隐藏别名。
+        if !matches!(reuse.as_str(), "session" | "url") {
+            return Err(format!("batch: --reuse must be url|session, got {reuse:?}"));
         }
-        arguments["reuse"] = json!("session");
+        arguments["reuse"] = json!(reuse);
     }
     if let Some(concurrency) = concurrency {
         arguments["concurrency"] = json!(concurrency);
@@ -276,18 +254,6 @@ fn parse_tool_flags(tool: &str, flags: &[String]) -> Result<Value, String> {
     Ok(out)
 }
 
-fn parse_id_list(input: &str) -> Result<Vec<u64>, String> {
-    input
-        .split(',')
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(|text| {
-            text.parse::<u64>()
-                .map_err(|_| format!("invalid tab id {text:?} in --tab-ids"))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +283,16 @@ mod tests {
         assert_eq!(args_of(&call)["args"]["mode"], "md");
         assert_eq!(args_of(&call)["args"]["budget"], 8000);
         assert_eq!(args_of(&call)["reuse"], "session");
+
+        let call = build_batch(&[
+            "read".into(),
+            "--urls".into(),
+            "https://a.example/".into(),
+            "--reuse".into(),
+            "url".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["reuse"], "url");
         assert!(
             args_of(&call).get("mode").is_none(),
             "inner flags must live under args"

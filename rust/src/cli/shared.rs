@@ -117,6 +117,100 @@ impl<'a> TokenCursor<'a> {
     }
 }
 
+/// 多目标上限：与 `batch` 的 MAX_BATCH_TABS 一致（扩展侧也会再校验一次）。
+pub(super) const MAX_TARGETS: usize = 8;
+
+/// `--tabs "1,2"`（可重复）→ 1..8 个 tab id。
+pub(super) fn parse_tab_ids(
+    context: &str,
+    flag: &str,
+    values: &[String],
+) -> Result<Vec<u64>, String> {
+    let mut ids = Vec::new();
+    for list in values {
+        for part in list
+            .split(',')
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            let id = part
+                .parse::<u64>()
+                .map_err(|_| format!("{context}: {flag} has an invalid tab id {part:?}"))?;
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() || ids.len() > MAX_TARGETS {
+        return Err(format!(
+            "{context}: {flag} must contain 1..{MAX_TARGETS} ids"
+        ));
+    }
+    Ok(ids)
+}
+
+/// 单数 `--url`：不按逗号切分（URL 自带逗号是合法的）。
+pub(super) fn parse_url_value(context: &str, flag: &str, value: &str) -> Result<String, String> {
+    let part = value.trim();
+    if !is_http_url(part) {
+        return Err(format!(
+            "{context}: {flag} must be an http(s) url, got {part:?}"
+        ));
+    }
+    Ok(part.to_owned())
+}
+
+/// 一个 `--urls` 值的切分规则：
+///
+/// 逗号是多个 URL 的分隔符，但 URL 自己也可能带逗号。判断依据是
+/// “第一个逗号之后是否还有一个 http(s) URL”：有就按列表拆，没有就把整串当一个 URL。
+/// 这样 `"u1,u2"` 仍拆开，`"https://x/?q=1,2"` 不会被截断；
+/// 混合形态（`"u1,https://x/?q=1,2"`）仍会拆并报出明确的逗号提示。
+fn is_http_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn split_url_list(value: &str) -> Vec<&str> {
+    let parts: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    let has_http_tail = parts.iter().skip(1).any(|part| is_http_url(part));
+    if parts.len() > 1 && has_http_tail {
+        parts
+    } else {
+        vec![value.trim()]
+    }
+}
+
+/// `--urls "u1,u2"`（可重复）→ 1..8 个 http(s) URL。
+///
+/// 逗号是分隔符，所以列表里的 URL 自带逗号时要单独传一个 `--urls`；
+/// 错误文案必须点明这一点，否则用户只会看到「不是 http(s)」而不知道逗号被拆了。
+pub(super) fn parse_url_list(
+    context: &str,
+    flag: &str,
+    values: &[String],
+) -> Result<Vec<String>, String> {
+    let mut urls = Vec::new();
+    for list in values {
+        for part in split_url_list(list) {
+            if !is_http_url(part) {
+                return Err(format!(
+                    "{context}: {flag} entry {part:?} is not http(s); commas are used as separators — pass a URL that contains a comma with a separate {flag} flag"
+                ));
+            }
+            urls.push(part.to_owned());
+        }
+    }
+    if urls.is_empty() || urls.len() > MAX_TARGETS {
+        return Err(format!(
+            "{context}: {flag} must contain 1..{MAX_TARGETS} urls"
+        ));
+    }
+    Ok(urls)
+}
+
 /// 上传载荷上限：daemon 的 /cmd body 上限是 8MB，base64 会膨胀 4/3。
 pub(super) const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024;
 
@@ -150,7 +244,7 @@ pub(super) fn guess_mime(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_duration_secs, parse_port};
+    use super::{parse_duration_secs, parse_port, parse_url_list};
 
     #[test]
     fn duration_parsing() {
@@ -162,6 +256,28 @@ mod tests {
         assert!(parse_duration_secs("abc").is_err());
         assert!(parse_duration_secs("").is_err());
         assert!(parse_duration_secs("5x").is_err());
+    }
+
+    #[test]
+    fn url_list_splitting_keeps_commas_inside_a_single_url() {
+        let urls = parse_url_list("t", "--urls", &["https://a/,https://b/".into()]).unwrap();
+        assert_eq!(urls, vec!["https://a/", "https://b/"]);
+
+        let urls = parse_url_list("t", "--urls", &["https://a/?q=1,2".into()]).unwrap();
+        assert_eq!(urls, vec!["https://a/?q=1,2"]);
+
+        let urls = parse_url_list(
+            "t",
+            "--urls",
+            &["https://a/".into(), "https://b/?q=1,2".into()],
+        )
+        .unwrap();
+        assert_eq!(urls, vec!["https://a/", "https://b/?q=1,2"]);
+
+        // 混合形态（列表 + 带逗号的 URL）仍按列表拆，并给出逗号提示。
+        let error =
+            parse_url_list("t", "--urls", &["https://a/,https://b/?q=1,2".into()]).unwrap_err();
+        assert!(error.contains("commas are used as separators"), "{error}");
     }
 
     #[test]

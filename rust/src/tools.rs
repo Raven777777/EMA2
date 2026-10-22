@@ -271,7 +271,8 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 return Err("waitTimeout must be between 1 and 60 seconds".into());
             }
             bool_arg(object, "replace")?;
-            enum_arg(object, "reuse", &["session"], false)?;
+            enum_arg(object, "reuse", &["session", "last"], false)?;
+            bool_arg(object, "background")?;
             let replace = object
                 .get("replace")
                 .is_some_and(|v| matches!(v, Value::Bool(true)));
@@ -282,7 +283,13 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 .filter(|flag| **flag)
                 .count();
             if picks > 1 {
-                return Err("use only one of tabId, replace=true, reuse=session".into());
+                return Err("use only one of tabId, replace=true, reuse=last".into());
+            }
+            let background = object
+                .get("background")
+                .is_some_and(|v| matches!(v, Value::Bool(true)));
+            if background && picks > 0 {
+                return Err("background only applies when opening a new tab".into());
             }
         }
         "read" => {
@@ -507,9 +514,9 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 .and_then(Value::as_str)
                 .expect("required above");
             let has_urls = urls_arg(object)?;
-            enum_arg(object, "reuse", &["session"], false)?;
+            enum_arg(object, "reuse", &["session", "url"], false)?;
             if object.get("reuse").is_some_and(|value| !value.is_null()) && !has_urls {
-                return Err("reuse=session only applies to urls[]".into());
+                return Err("reuse=url only applies to urls[]".into());
             }
             let has_tabs = object
                 .get("tabIds")
@@ -1465,6 +1472,29 @@ mod tests {
             validate_arguments("open", &json!({ "url": "https://x.y", "reuse": "session" }))
                 .is_ok()
         );
+        // v2.4.3.1：规范名是 last，session 仍是隐藏别名。
+        assert!(
+            validate_arguments("open", &json!({ "url": "https://x.y", "reuse": "last" })).is_ok()
+        );
+        // --background 只对新建标签生效。
+        assert!(
+            validate_arguments("open", &json!({ "url": "https://x.y", "background": true }))
+                .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "open",
+                &json!({ "url": "https://x.y", "background": true, "tabId": 3 })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "open",
+                &json!({ "url": "https://x.y", "background": true, "replace": true })
+            )
+            .is_err()
+        );
         // tabId / replace / reuse 三者互斥：同时给会让「哪个 tab 被导航」变得不可预测。
         assert!(
             validate_arguments(
@@ -1610,6 +1640,14 @@ mod tests {
             validate_arguments(
                 "batch",
                 &json!({ "tool": "read", "urls": ["https://a.example/"], "reuse": "session" })
+            )
+            .is_ok()
+        );
+        // v2.4.3.1：规范名是 url，session 仍是隐藏别名。
+        assert!(
+            validate_arguments(
+                "batch",
+                &json!({ "tool": "read", "urls": ["https://a.example/"], "reuse": "url" })
             )
             .is_ok()
         );
@@ -1788,7 +1826,9 @@ mod tests {
             Duration::from_secs(162)
         );
     }
-    /// 错误码表是 AI 自我纠正的依据；新增 `fail('code'` 时文档必须同步。
+    /// 错误码表是 AI 自我纠正的依据；新增 `fail('code'` / `code: '` / `error=<code>`
+    /// 时文档必须同步。`error=` 字面量是 v2.4.3.1 补上的盲区：
+    /// `formatError` 的兜底码与 batch 块内错误原来扫不到。
     #[test]
     fn documented_error_codes_cover_extension_codes() {
         let js = extension_source();
@@ -1807,6 +1847,27 @@ mod tests {
                 }
             }
         }
+        // `error=<code>` 直接写在输出文本里的码（formatError 兜底、batch 块）。
+        let mut error_literals = 0usize;
+        let mut rest = js.as_str();
+        while let Some(index) = rest.find("error=") {
+            rest = &rest[index + "error=".len()..];
+            let end = rest
+                .find(|ch: char| !(ch.is_ascii_lowercase() || ch == '_'))
+                .unwrap_or(rest.len());
+            let code = &rest[..end];
+            if code.is_empty() {
+                continue;
+            }
+            error_literals += 1;
+            if !codes.iter().any(|known| known == code) {
+                codes.push(code.to_owned());
+            }
+        }
+        assert!(
+            error_literals > 0,
+            "expected to find error=<code> literals in the extension"
+        );
         assert!(
             codes.len() > 20,
             "expected to find fail('code') calls, found {codes:?}"

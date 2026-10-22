@@ -399,13 +399,48 @@ function normalizeArgs(value) {
   return out;
 }
 
+/**
+ * Chromium 的原始异常文本 → 可自我纠正的错误码。
+ * 只改 code 与 hint，msg 保留原文；映射不到才落到 internal。
+ */
+const BROWSER_ERROR_PATTERNS = [
+  {
+    pattern: /frame with id \d+ is showing error page/i,
+    code: 'page_error',
+    hint: 'the tab is on the browser error page; open a reachable http(s) url or check the network',
+  },
+  {
+    pattern: /no tab with id/i,
+    code: 'tab_not_found',
+    hint: 'call `ema2 tabs list` to get live tab ids',
+  },
+  {
+    pattern: /cannot access (?:a )?(?:chrome|edge|about|devtools|view-source):/i,
+    code: 'internal_page',
+    hint: 'switch to a normal http(s) page',
+  },
+  {
+    pattern: /(?:debugger is not attached|detached while handling command|another debugger is already attached)/i,
+    code: 'debugger_busy',
+    hint: 'close DevTools/other debugger users for this tab, reload it, then retry',
+  },
+  {
+    pattern: /(?:cannot find context with specified id|target closed|inspected target navigated or closed)/i,
+    code: 'page_changed',
+    hint: 'the page navigated; call snapshot again and retry',
+  },
+];
+
 function formatError(error) {
   if (error instanceof ToolError) {
     const head = `error=${error.code} msg=${oneLine(error.message) || error.code}${error.hint ? ` hint=${oneLine(error.hint)}` : ''}`;
     const extra = (error.lines || []).map(line => `  ${line}`).join('\n');
     return extra ? `${head}\n${extra}` : head;
   }
-  return `error=internal msg=${oneLine(error && error.message || String(error))} hint=retry; if it persists reload the extension`;
+  const message = oneLine(error && error.message || String(error));
+  const mapped = BROWSER_ERROR_PATTERNS.find(entry => entry.pattern.test(message));
+  if (mapped) return `error=${mapped.code} msg=${message} hint=${mapped.hint}`;
+  return `error=internal msg=${message} hint=retry; if it persists reload the extension`;
 }
 
 function sendResponse(ws, id, payload) {

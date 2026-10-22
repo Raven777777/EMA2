@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.4.2.7（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.2.7
+exe        2.4.3.1（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.3.1
 helper     21
 guard      5（guardProtocolVersion 5）
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
@@ -101,7 +101,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-运行 `cargo test` 查看当前用例数（本版为 **124**）。
+运行 `cargo test` 查看当前用例数（本版为 **130**）。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -168,10 +168,23 @@ cargo test
 - `role:name` 先匹配可访问名称，再精确匹配 HTML `name` 属性
 - `select` 的位置参数是 option 的 `value`
 - `files download-dir` 固定返回 `download_dir_unsupported`
+- `internal` 只是最后兜底；Chromium 的 `Frame with ID 0 is showing error page`、`No tab with id`、
+  `Cannot access a chrome:// URL`、debugger attach/detach、`Target closed` 等原始异常在
+  `formatError` 单点归一成 `page_error` / `tab_not_found` / `internal_page` / `debugger_busy` / `page_changed`
+  （只改 `code`/`hint`，`msg=` 保留原文）；错误码漂移测试也扫 `error=<code>` 字面量
+- `read/snapshot/js/wait` 的 `--tabs/--urls/--url` 与 `open --urls` 在 CLI 编译成一次
+  `batch` /cmd 调用；daemon 仍只看到 11 个工具，扩展的 `batchTool` 执行器不变
+- `--tabs` / `--urls` / `--url` 三者互斥，且都与 `--tab` 互斥；`--concurrency` 1..4，
+  `--reuse url` 只用于 `--urls`（旧名 `session`），`open --reuse last`（旧名 `session`）
+- `open --until` 是 `load|dom|none` 的新名（`--wait` 隐藏别名）；`--background` 只对新建标签生效
+- `open/js --timeout`、`wait --timeout`、`observe --collect` 统一接受 `30` / `30s` / `500ms`
+- observe 新名：`--url-filter`（network; 旧 `--filter` 隐藏）、`--collect`（旧 `--wait` 隐藏）、
+  `--no-bodies`（旧 `--bodies=false` 保留）
+- `batch` 在 budget/cursor 截断的块后追加 `resume=<tool> --tab <id> --cursor <next>`
 - `batch` 内层参数放在 `args`；内层校验复用子工具 validator
-- `batch --urls --reuse session` 只复用精确 URL 命中的会话标签；默认仍新开
+- `batch --urls --reuse url`（旧名 `session`）只复用精确 URL 命中的会话标签；默认仍新开
 - `js` 全局 debugger 串行；attach 非超时失败自动重试一次；运行时 SyntaxError 不重跑
-- `observe console --wait` 先装 hook 再等待；console/network 的 document epoch 分开记录
+- `observe console --collect`（旧名 `--wait`）先装 hook 再等待；console/network 的 document epoch 分开记录
 - `observe console --level` 默认 `error`，输出显式带 `level=<阈值>`
 - HAR 导出是完整 JSON，不经过 20 万字符文本上限；凭证头默认 `<redacted>`，`--headers all` 才导出原值
 - command guard 的 tab 集合持久化到 `chrome.storage.session`；disarm 分 top/all-frames 验证，失败的 tab 留待下次重试

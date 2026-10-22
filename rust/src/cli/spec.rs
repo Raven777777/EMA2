@@ -50,25 +50,41 @@ pub enum Command {
     Tabs(TabsArgs),
     /// 打开 URL，等页面就绪，装网络 hook
     Open {
-        url: String,
+        /// URL（与 --urls 二选一）
+        url: Option<String>,
+        /// 为每个 URL 新开标签后打开（逗号分隔，可重复；与位置参数 URL 互斥）
+        #[arg(long, value_name = "URL,URL", action = clap::ArgAction::Append)]
+        urls: Vec<String>,
+        /// 并发数（仅用于 --urls；1..4，默认 2）
+        #[arg(long, value_name = "N")]
+        concurrency: Option<u32>,
         /// 导航指定标签（不计入会话）
         #[arg(long = "tab")]
         tab: Option<u64>,
         /// 在当前活动标签里导航（不新建）
         #[arg(long)]
         replace: bool,
-        /// 复用本会话最近打开的标签并导航；同一文档不重载（session）
+        /// 复用本会话最近标签并导航（last）；session 是旧别名
         #[arg(long)]
         reuse: Option<String>,
-        /// 等待级别：load|dom|none
+        /// 返回到什么程度：load|dom|none（--wait 是隐藏的旧别名）
         #[arg(long)]
+        until: Option<String>,
+        /// 隐藏的旧别名：--until
+        #[arg(long, hide = true)]
         wait: Option<String>,
-        /// 等文档接位的秒数（默认 15，1..60）
-        #[arg(long, value_name = "SECONDS")]
-        timeout: Option<f64>,
+        /// 等文档接位的时长：20 / 20s / 500ms（默认 15，1..60）
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
+        /// 在后台新建，不切换活动标签、不聚焦窗口
+        #[arg(long)]
+        background: bool,
     },
     /// 读页面为 md|text|html|visible
     Read {
+        #[command(flatten)]
+        fanout: FanoutArgs,
+        /// 单个目标标签（与 --tabs/--urls/--url 互斥）
         #[arg(long = "tab")]
         tab: Option<u64>,
         /// 输出格式：md|text|html|visible（visible=innerText）
@@ -89,6 +105,9 @@ pub enum Command {
     },
     /// ref 快照：[e12@d1] button "X"
     Snapshot {
+        #[command(flatten)]
+        fanout: FanoutArgs,
+        /// 单个目标标签（与 --tabs/--urls/--url 互斥）
         #[arg(long = "tab")]
         tab: Option<u64>,
         /// interactive|full|links|buttons|form
@@ -174,6 +193,8 @@ pub enum Command {
   waitFor text=... timeout=5s           等页面文本/选择器条件
 act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
     Wait {
+        #[command(flatten)]
+        fanout: FanoutArgs,
         /// text|textGone|selector|time|idle
         kind: String,
         /// 条件值（文本 / CSS / 时长，如 "5s"）
@@ -181,6 +202,7 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
         /// 兜底超时，如 30s（0..300s）
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// 单个目标标签（与 --tabs/--urls 互斥）
         #[arg(long = "tab")]
         tab: Option<u64>,
     },
@@ -216,6 +238,8 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
   续读时源输出必须不变（换 code 或换 budget 都会错位）。
 "##)]
     Js {
+        #[command(flatten)]
+        fanout: FanoutArgs,
         /// JS 表达式或语句体（与 --file 互斥）
         code: Option<String>,
         #[arg(long = "file")]
@@ -228,9 +252,9 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
         /// 从上次输出的 next 续读（字符偏移；换 code 或 budget 会错位）
         #[arg(long)]
         cursor: Option<u64>,
-        /// 执行上限秒数（默认 10，0.1..300）；超时会 terminateExecution
-        #[arg(long, value_name = "SECONDS")]
-        timeout: Option<f64>,
+        /// 执行上限：10 / 10s / 500ms（默认 10s，0.1..300）
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
     },
     /// console 增量 / network（真实状态码+响应体，HAR）
     Observe {
@@ -244,17 +268,26 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
         /// log|warn|error（console 最低级别；默认 error，log 含全部）
         #[arg(long, value_name = "LEVEL")]
         level: Option<String>,
-        /// URL 子串过滤
-        #[arg(long)]
+        /// network：URL 子串过滤
+        #[arg(long = "url-filter", value_name = "SUBSTR")]
+        url_filter: Option<String>,
+        /// 隐藏的旧别名：--url-filter（console 仍按文本过滤）
+        #[arg(long, hide = true)]
         filter: Option<String>,
-        /// 等异步请求（≤10s，如 "5s"）
+        /// 采集窗口，如 5s（≤10s；--wait 是隐藏的旧别名）
         #[arg(long, value_name = "DURATION")]
+        collect: Option<String>,
+        /// 隐藏的旧别名：--collect
+        #[arg(long, hide = true)]
         wait: Option<String>,
         /// 响应体正则（≤512 字符）
         #[arg(long = "body-filter")]
         body_filter: Option<String>,
-        /// 设为 false 关闭响应体预览（--bodies=false）
-        #[arg(long, require_equals = true)]
+        /// 关闭响应体预览
+        #[arg(long = "no-bodies")]
+        no_bodies: bool,
+        /// 隐藏的旧写法：--bodies=false
+        #[arg(long, require_equals = true, hide = true)]
         bodies: Option<bool>,
         /// 导出 HAR 到指定路径
         #[arg(long, value_name = "PATH")]
@@ -288,7 +321,7 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
     /// 多标签并发 open/read/snapshot/js/wait
     #[command(after_help = "\
 目标工具 flags（与 --tab-ids/--urls 混用）：
-  --reuse session  与 --urls 使用：精确 URL 命中本会话标签时复用文档（不重载），否则新开
+  --reuse url|session  与 --urls 使用：精确 URL 命中本会话标签时复用文档（不重载），否则新开
   read      --mode md|text|html|visible  --selector S  --no-main  --budget N  --cursor N
   snapshot  --filter F  --near REF  --budget N  --cursor N
   js        --code CODE | --file FILE  --budget N  --cursor N  --timeout 10s
@@ -312,6 +345,29 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
 pub enum ServerAction {
     /// 干净关闭 daemon（POST /shutdown，PID 兜底）
     Stop,
+}
+
+/// 多目标参数（read/snapshot/js/wait 共享）。
+///
+/// 带 `--tabs` / `--urls` / `--url` 时，命令不再直达工具，而是编译成一次
+/// `batch` 调用；`batch` 从此只是执行器，不再是唯一的多标签语法。
+#[derive(Args, Debug, Clone, Default)]
+pub struct FanoutArgs {
+    /// 对已有标签并发执行（逗号分隔，可重复；≤8）
+    #[arg(long, value_name = "ID,ID", action = clap::ArgAction::Append)]
+    pub tabs: Vec<String>,
+    /// 为每个 URL 新开标签后执行（逗号分隔，可重复；≤8）
+    #[arg(long, value_name = "URL,URL", action = clap::ArgAction::Append)]
+    pub urls: Vec<String>,
+    /// 单 URL 形式：等价于 --urls "<URL>"
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+    /// 并发数（1..4，默认 2；只能和 --tabs/--urls/--url 一起用）
+    #[arg(long, value_name = "N")]
+    pub concurrency: Option<u32>,
+    /// 仅用于 --urls：url=按精确 URL 复用会话标签；session 是旧别名
+    #[arg(long, value_name = "url|session")]
+    pub reuse: Option<String>,
 }
 
 #[derive(Args)]
@@ -425,5 +481,70 @@ mod tests {
     #[test]
     fn clap_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// 从 Markdown 表格里取出所有 `ema2 <command>` 的第一个词。
+    fn table_commands(section: &str) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for line in section.lines() {
+            let line = line.trim();
+            if !line.starts_with('|') {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(index) = rest.find("ema2 ") {
+                rest = &rest[index + "ema2 ".len()..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_lowercase())
+                    .collect();
+                if !name.is_empty() {
+                    names.insert(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// 命令表是用户侧文档的第二份拷贝；它和 clap 可见子命令必须同步。
+    ///
+    /// 隐藏的子命令（`daemon`，以及后续版本要隐藏的 `batch`）不在表里，
+    /// 所以这里只比较 `is_hide_set() == false` 的顶层命令。
+    #[test]
+    fn documented_command_tables_match_visible_subcommands() {
+        let root = Cli::command();
+        let visible: std::collections::BTreeSet<String> = root
+            .get_subcommands()
+            .filter(|command| !command.is_hide_set())
+            .map(|command| command.get_name().to_owned())
+            .collect();
+        assert!(
+            visible.len() >= 14,
+            "unexpectedly few commands: {visible:?}"
+        );
+
+        let tools = include_str!("../../../docs/TOOLS.md");
+        let overview = tools
+            .split("## 命令总览")
+            .nth(1)
+            .and_then(|rest| rest.split("## 全局约定").next())
+            .expect("docs/TOOLS.md must have a command overview table");
+        assert_eq!(
+            table_commands(overview),
+            visible,
+            "docs/TOOLS.md 命令总览与 clap 可见子命令不一致"
+        );
+
+        let agents = include_str!("../../assets/AGENTS.md");
+        let signatures = agents
+            .split("## 命令签名")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("rust/assets/AGENTS.md must have a command signature table");
+        assert_eq!(
+            table_commands(signatures),
+            visible,
+            "rust/assets/AGENTS.md 命令签名与 clap 可见子命令不一致"
+        );
     }
 }
