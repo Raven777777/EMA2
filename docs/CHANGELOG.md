@@ -5,7 +5,7 @@
 只做可维护性改造，行为、CLI 语法、协议与超时语义保持不变；唯一有意的行为修正是
 扩展 batch watchdog 从 620s 提前到 580s。
 
-- **扩展拆分（P2）**：6153 行的 `extension/background.js` 变成 39 行入口 +
+- **扩展拆分（P2）**：6153 行的 `extension/background.js` 变成 38 行入口 +
   `extension/modules/` 下 17 个经典脚本（core/tabs/network/open_wait/page/guard/
   injected_helpers/actions/hooks/act/files_shot/debugger/har/batch/observe/
   read_snapshot/dispatch）。入口用同步 `importScripts` 按依赖顺序加载，共享全局

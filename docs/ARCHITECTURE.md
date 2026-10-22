@@ -77,7 +77,7 @@ EMA2 是**一个单文件 exe + 一个 MV3 扩展**。exe 既能以后台 daemon
 | `extension/contract.js` | 由 runtime.json 生成，SW 最先加载 |
 | `rust/src/save.rs` | 截图/HAR 落盘，把 base64/JSON 换成 `path=` 行 |
 | `rust/src/paths.rs` | 产品版本、默认端口、输出目录、临时 PID/日志路径 |
-| `extension/background.js` | 39 行入口：按依赖顺序 `importScripts` 全部模块 |
+| `extension/background.js` | 38 行入口：按依赖顺序 `importScripts` 全部模块 |
 | `extension/modules/` | 17 个经典脚本模块：core/tabs/network/open_wait/page/guard/injected_helpers/actions/hooks/act/files_shot/debugger/har/batch/observe/read_snapshot/dispatch；共享全局作用域是刻意设计，页面注入函数仍自包含 |
 | `extension/page_guard.js` | 命令租约内按需启用：非阻塞记录 alert/confirm/prompt/print，解除后恢复原生 API |
 | `extension/page_guard_armed.js` | document_start 动态 guard 的第二个脚本，在页面脚本前立即 arm |

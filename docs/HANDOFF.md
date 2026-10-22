@@ -47,7 +47,7 @@ AI / shell
 | `rust/src/save.rs` | 截图/HAR 落盘 |
 | `rust/src/client.rs` | 本机 HTTP 客户端 |
 | `rust/src/paths.rs` | 端口、PID/日志、输出目录 |
-| `extension/background.js` | 39 行入口，按序 importScripts 全部模块 |
+| `extension/background.js` | 38 行入口，按序 importScripts 全部模块 |
 | `extension/modules/` | 17 个经典脚本模块：工具实现、ref、hook、webRequest、settle/await、debugger 队列 |
 | `contract/runtime.json` | 版本/超时单一来源；`extension/contract.js` 由它生成 |
 | `extension/page_guard.js` | 命令租约内非阻塞记录 alert/confirm/prompt/print/window.open；解除后恢复原生 API |
