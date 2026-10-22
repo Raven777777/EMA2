@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Shell scripts are executed directly (examples/jss/*.sh). With core.autocrlf=true
+# a Windows checkout would give them CRLF and the shebang would fail, so pin LF.
+*.sh text eol=lf
