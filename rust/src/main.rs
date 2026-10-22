@@ -20,6 +20,7 @@ mod state;
 mod tools;
 
 use std::fs;
+use std::io::{self, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
@@ -443,6 +444,77 @@ const AGENTS_BEGIN: &str = "<!-- ema2:begin -->";
 const AGENTS_END: &str = "<!-- ema2:end -->";
 const AGENTS_TEMPLATE: &str = include_str!("../assets/AGENTS.md");
 
+/// 读取现有 AGENTS.md；只有“文件不存在”才等价于空文件。
+///
+/// `unwrap_or_default()` 会把 EACCES、InvalidData（非 UTF-8）等错误也当成空文件，
+/// 然后 `init` 用模板覆盖掉用户原来的内容。这里必须区分“不存在”和“读不了”。
+fn read_existing_agents(path: &Path) -> io::Result<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// 同目录临时文件 + rename，避免写到一半崩溃/断电后留下半个 AGENTS.md。
+///
+/// 临时文件必须和目标是同一目录，跨卷 rename 不是原子操作；写入后 `sync_all`
+/// 再替换。Windows 上 rename 可以覆盖已存在文件（MoveFileEx + REPLACE_EXISTING），
+/// 失败时清理临时文件，绝不回退成直接覆盖。
+fn write_atomic(path: &Path, body: &str) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("AGENTS.md");
+    for attempt in 0..32 {
+        let temp = dir.join(format!(
+            ".{file_name}.ema2-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let result = file
+            .write_all(body.as_bytes())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&temp, path));
+        drop(file);
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "cannot create a unique temporary file next to AGENTS.md",
+    ))
+}
+
+/// 返回新文件内容与 action 标记。模板区块外的用户内容原样保留。
+fn merge_agents(existing: &str, block: &str) -> (String, &'static str) {
+    if existing.trim().is_empty() {
+        return (format!("{block}\n"), "created");
+    }
+    if let Some(start) = existing.find(AGENTS_BEGIN) {
+        if let Some(offset) = existing[start..].find(AGENTS_END) {
+            let end = start + offset + AGENTS_END.len();
+            return (
+                format!("{}{}{}", &existing[..start], block, &existing[end..]),
+                "updated",
+            );
+        }
+    }
+    (format!("{}\n\n{block}\n", existing.trim_end()), "appended")
+}
+
 fn init_agents() -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -454,26 +526,21 @@ fn init_agents() -> i32 {
         }
     };
     let path = cwd.join("AGENTS.md");
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let block = AGENTS_TEMPLATE.trim_end();
-    let (body, action) = if existing.trim().is_empty() {
-        (format!("{block}\n"), "created")
-    } else if let Some(start) = existing.find(AGENTS_BEGIN) {
-        if let Some(offset) = existing[start..].find(AGENTS_END) {
-            let end = start + offset + AGENTS_END.len();
-            (
-                format!("{}{}{}", &existing[..start], block, &existing[end..]),
-                "updated",
-            )
-        } else {
-            (format!("{}\n\n{block}\n", existing.trim_end()), "appended")
+    let existing = match read_existing_agents(&path) {
+        Ok(existing) => existing,
+        Err(error) => {
+            eprintln!(
+                "error=init_failed msg=cannot read {}: {error} hint=fix the file permissions or encoding; the existing file was not touched",
+                path.display()
+            );
+            return 1;
         }
-    } else {
-        (format!("{}\n\n{block}\n", existing.trim_end()), "appended")
     };
-    if let Err(error) = fs::write(&path, body) {
+    let block = AGENTS_TEMPLATE.trim_end();
+    let (body, action) = merge_agents(&existing, block);
+    if let Err(error) = write_atomic(&path, &body) {
         eprintln!(
-            "error=init_failed msg=cannot write {}: {error} hint=check directory permissions",
+            "error=init_failed msg=cannot write {}: {error} hint=check directory permissions; the existing file was not replaced",
             path.display()
         );
         return 1;
@@ -561,7 +628,10 @@ fn send_cmd(
         .map_err(|error| request_error(port, &error))?;
     let value = serde_json::from_str::<Value>(&response.body).unwrap_or(Value::Null);
     if response.status == 200 {
-        let result = value.get("result").cloned();
+        let result = value
+            .get("result")
+            .cloned()
+            .filter(|value| !value.is_null());
         return result.ok_or_else(|| CmdError {
             code: "relay_error".into(),
             msg: format!(
@@ -896,8 +966,76 @@ fn kill_process(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::lexical_normalize;
+    use super::{
+        AGENTS_BEGIN, AGENTS_END, lexical_normalize, merge_agents, read_existing_agents,
+        write_atomic,
+    };
     use std::path::{Path, PathBuf};
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ema2-init-test-{}-{name}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn init_treats_only_missing_file_as_empty() {
+        let dir = scratch_dir("read");
+        let missing = dir.join("missing.md");
+        assert_eq!(read_existing_agents(&missing).unwrap(), "");
+
+        let invalid = dir.join("AGENTS.md");
+        std::fs::write(&invalid, [0xff, 0xfe, 0xfd]).unwrap();
+        let error = read_existing_agents(&invalid).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn init_replaces_the_block_and_preserves_user_text() {
+        let before =
+            format!("# My notes\n\nkeep me\n\n{AGENTS_BEGIN}\nold\ntemplate\n{AGENTS_END}\n\ntail");
+        let (merged, action) = merge_agents(&before, "new block");
+        assert_eq!(action, "updated");
+        assert!(merged.starts_with("# My notes\n\nkeep me\n\n"));
+        assert!(merged.contains("new block"));
+        assert!(!merged.contains("old\ntemplate"));
+        assert!(merged.ends_with("\n\ntail"));
+
+        let (created, action) = merge_agents("  \n", "block");
+        assert_eq!(action, "created");
+        assert_eq!(created, "block\n");
+
+        let (appended, action) = merge_agents("user text", "block");
+        assert_eq!(action, "appended");
+        assert_eq!(appended, "user text\n\nblock\n");
+    }
+
+    #[test]
+    fn init_writes_atomically_and_leaves_no_temp_file() {
+        let dir = scratch_dir("write");
+        let path = dir.join("AGENTS.md");
+        std::fs::write(&path, "old").unwrap();
+        write_atomic(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary file left behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[cfg(windows)]
     #[test]

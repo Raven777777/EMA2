@@ -15,13 +15,14 @@ pub const TOOL_NAMES: &[&str] = &[
     "tabs", "open", "read", "snapshot", "act", "wait", "js", "observe", "files", "shot", "batch",
 ];
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(80);
 pub const ACT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const LONG_TIMEOUT: Duration = Duration::from_secs(120);
 pub const PAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 单次工具调用的产品总时长上限；超出时在调用前明确拒绝，而不是让 daemon 伪装成超时。
 pub const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(600);
-const RELAY_MARGIN_SECS: f64 = 15.0;
+/// daemon 必须比扩展 watchdog（默认 70s）更晚超时，才能把扩展的 tool_timeout 带回来。
+const RELAY_MARGIN_SECS: f64 = 20.0;
 // 扩展侧 act watchdog 是 70s + 3s/step + waits；daemon 必须在它之后超时。
 const ACT_EXTENSION_GRACE_SECS: f64 = 10.0;
 const MAX_BUDGET: u64 = 200_000;
@@ -1504,43 +1505,43 @@ mod tests {
     fn timeout_budget() {
         assert_eq!(
             timeout_for("wait", &json!({ "text": "x" })),
-            Duration::from_secs(45)
+            Duration::from_secs(50)
         );
         assert_eq!(
             timeout_for("wait", &json!({ "text": "x", "timeout": 60 })),
-            Duration::from_secs(75)
+            Duration::from_secs(80)
         );
         assert_eq!(
             timeout_for("wait", &json!({ "time": 120 })),
-            Duration::from_secs(135)
+            Duration::from_secs(140)
         );
         assert_eq!(
             timeout_for("wait", &json!({ "time": 0 })),
-            Duration::from_secs(15)
+            Duration::from_secs(20)
         );
         // act 的 daemon 预算必须在扩展 watchdog（70s + 3s/step）之后，
-        // 再留 15s 中继余量，避免完整脚本先撞上 extension_error。
+        // 再留 20s 中继余量，避免完整脚本先撞上 extension_error。
         assert_eq!(
             timeout_for("act", &json!({})),
-            ACT_TIMEOUT + Duration::from_secs(28)
+            ACT_TIMEOUT + Duration::from_secs(33)
         );
         assert_eq!(
             timeout_for("act", &json!({ "waitFor": { "timeout": 10 } })),
-            ACT_TIMEOUT + Duration::from_secs(38)
+            ACT_TIMEOUT + Duration::from_secs(43)
         );
-        assert_eq!(timeout_for("open", &json!({})), Duration::from_secs(30));
+        assert_eq!(timeout_for("open", &json!({})), Duration::from_secs(35));
         assert_eq!(
             timeout_for("open", &json!({ "waitTimeout": 45 })),
-            Duration::from_secs(60)
+            Duration::from_secs(65)
         );
         assert_eq!(
             timeout_for("open", &json!({ "wait": "none", "waitTimeout": 60 })),
             DEFAULT_TIMEOUT
         );
-        assert_eq!(timeout_for("js", &json!({})), Duration::from_secs(25));
+        assert_eq!(timeout_for("js", &json!({})), Duration::from_secs(30));
         assert_eq!(
             timeout_for("js", &json!({ "code": "1", "timeout": 30 })),
-            Duration::from_secs(45)
+            Duration::from_secs(50)
         );
         assert_eq!(timeout_for("shot", &json!({})), LONG_TIMEOUT);
         assert_eq!(timeout_for("batch", &json!({})), LONG_TIMEOUT);
@@ -1553,14 +1554,14 @@ mod tests {
                     "args": { "waitTimeout": 60 }
                 })
             ),
-            Duration::from_secs(87)
+            Duration::from_secs(92)
         );
         assert_eq!(
             timeout_for(
                 "batch",
                 &json!({ "tool": "wait", "tabIds": [1, 2], "args": { "time": 40 } })
             ),
-            Duration::from_secs(55)
+            Duration::from_secs(60)
         );
         // 8 tab / 并发 1/2/4：波次 × 单次 40s + 15s 余量。
         assert_eq!(
@@ -1571,7 +1572,7 @@ mod tests {
                     "args": { "time": 40 }
                 })
             ),
-            Duration::from_secs(335)
+            Duration::from_secs(340)
         );
         assert_eq!(
             timeout_for(
@@ -1581,7 +1582,7 @@ mod tests {
                     "args": { "time": 40 }
                 })
             ),
-            Duration::from_secs(175)
+            Duration::from_secs(180)
         );
         assert_eq!(
             timeout_for(
@@ -1591,7 +1592,7 @@ mod tests {
                     "args": { "time": 40 }
                 })
             ),
-            Duration::from_secs(95)
+            Duration::from_secs(100)
         );
         // js 受全局 debugger 串行队列限制：声明并发 4 时仍按 1 计算波次；
         // 单次预算跟随 args.timeout（默认 10s + 8s）。
@@ -1603,12 +1604,12 @@ mod tests {
                     "args": { "code": "1+1" }
                 })
             ),
-            Duration::from_secs(51)
+            Duration::from_secs(56)
         );
         assert_eq!(timeout_for("tabs", &json!({})), DEFAULT_TIMEOUT);
         assert_eq!(
             timeout_for("wait", &json!({ "await": true, "timeout": 10 })),
-            Duration::from_secs(25)
+            Duration::from_secs(30)
         );
         assert_eq!(
             timeout_for(
@@ -1621,7 +1622,7 @@ mod tests {
                     ]
                 })
             ),
-            ACT_TIMEOUT + Duration::from_secs(49)
+            ACT_TIMEOUT + Duration::from_secs(54)
         );
         // 复合 batch 的 open 成本跟随内层 waitTimeout，而不是固定 30s。
         assert_eq!(
@@ -1631,7 +1632,7 @@ mod tests {
                     "tool": "read", "urls": ["https://a/"], "args": { "waitTimeout": 60 }
                 })
             ),
-            Duration::from_secs(107)
+            Duration::from_secs(162)
         );
     }
     /// 错误码表是 AI 自我纠正的依据；新增 `fail('code'` 时文档必须同步。

@@ -51,5 +51,5 @@ docs/
 ```bash
 cargo test                                   # 含“错误码必须写进 TOOLS.md”的漂移测试
 python scripts/verify.py --skip-real-edge     # 同一件事的快速版
-python scripts/verify.py                      # 真实前台 Edge 冒烟（113 项）
+python scripts/verify.py                      # 真实前台 Edge 冒烟（135 项）
 ```

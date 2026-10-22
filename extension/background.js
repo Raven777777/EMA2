@@ -1,5 +1,5 @@
 /**
- * EMA2 Edge 扩展 · v2.4.1.1（AI 专用浏览器接口）
+ * EMA2 Edge 扩展 · v2.4.2.1（AI 专用浏览器接口）
  * -------------------------------------------
  * 设计前提：这是给 AI 用的浏览器，不是给人用的自动化工具。
  *   - 输出一律行式紧凑文本（key=value / TSV / [ref]），不 pretty-print JSON
@@ -47,6 +47,9 @@ const COMMAND_GUARD_ID = 'ema2-command-guard';
 const COMMAND_GUARD_BRIDGE_ID = 'ema2-command-guard-bridge';
 const COMMAND_GUARD_FILES = ['page_guard.js', 'page_guard_armed.js'];
 const COMMAND_GUARD_BRIDGE_FILES = ['page_guard_bridge.js'];
+// 动态 content script 不能按 tabId 限定；至少把注入面收窄到 EMA2 支持的 http(s)，
+// 不碰 file/ftp/data/chrome-extension 等其它 scheme。租约结束即注销。
+const COMMAND_GUARD_MATCHES = ['http://*/*', 'https://*/*'];
 const COMMAND_GUARD_DISARM_MS = 800;
 const COMMAND_GUARD_SWEEP_MS = 1500;
 const LEGACY_GUARD_SWEEP_MS = 2500;
@@ -56,7 +59,7 @@ const COMMAND_GUARD_ABANDON_GRACE_MS = 2000;
 const COMMAND_GUARD_KEEPALIVE_GRACE_MS = 5000;
 const COMMAND_GUARD_TABS_KEY = 'ema2_command_guard_tabs';
 const GUARD_PROTOCOL_KEY = 'ema2_guard_protocol';
-const GUARD_PROTOCOL_VERSION = 3;
+const GUARD_PROTOCOL_VERSION = 4;
 const SENSITIVE_HAR_HEADERS = new Set([
   'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
 ]);
@@ -82,6 +85,7 @@ let sessionTabsLoaded = false;
 let sessionTabsLoad = null;
 let sessionWriteChain = Promise.resolve();
 let lastActContext = null;
+let lastActWrite = Promise.resolve();
 let commandGuardLeases = 0;
 let commandGuardLifecycle = Promise.resolve();
 const commandGuardLeaseTokens = new Set();
@@ -192,6 +196,7 @@ async function connect() {
       jsonrpc: '2.0',
       method: 'bridge/hello',
       role: 'extension',
+      extensionId: chrome.runtime.id,
       version: chrome.runtime.getManifest().version,
     }));
   };
@@ -542,7 +547,7 @@ async function closeTabIds(ids) {
       await chrome.tabs.remove(id);
       observedConsoleDocs.delete(id);
       observedNetworkDocs.delete(id);
-      webRequestLog.delete(id);
+      dropWebRequestCapture(id);
       closed.push(id);
     } catch (_) { /* 已经不存在：跳过，不算失败 */ }
   }
@@ -555,10 +560,11 @@ async function closeTabIds(ids) {
 // ---------------------------------------------------------------- webRequest
 //
 // 页面 hook 只能看到安装之后的 fetch/XHR；首屏文档/资源的状态码、响应头只能靠
-// webRequest。这里按 tab 保存最近 500 条，observe network 用它补齐 status/headers/MIME，
-// 并把 HAR 的 request.url/时间戳/headers 变成真实值。响应体仍由页面 hook 采样。
+// webRequest。监听器只在 `observe network` 期间按目标 tab 注册（RequestFilter.tabId），
+// 命令结束立即移除，避免常驻观察所有标签的流量。响应体仍由页面 hook 采样。
 const WEBREQ_PER_TAB = 500;
 const webRequestLog = new Map(); // tabId -> Map<requestId, record>
+const webRequestCaptures = new Map(); // tabId -> { refs, listeners, scrub }
 
 function webRequestBucket(tabId, create) {
   let bucket = webRequestLog.get(tabId);
@@ -569,9 +575,17 @@ function webRequestBucket(tabId, create) {
   return bucket || null;
 }
 
-function webRequestAdd(details) {
-  if (!details || !Number.isInteger(details.tabId) || details.tabId < 0) return;
-  const bucket = webRequestBucket(details.tabId, true);
+function scrubHeaders(headers, scrub) {
+  if (!scrub || !Array.isArray(headers)) return Array.isArray(headers) ? headers : [];
+  return headers.map(item => {
+    const name = String(item && item.name || '');
+    if (!SENSITIVE_HAR_HEADERS.has(name.toLowerCase())) return item;
+    return { name, value: '<redacted>' };
+  });
+}
+
+function webRequestAdd(bucket, details) {
+  if (!details || details.tabId < 0) return;
   bucket.set(details.requestId, {
     requestId: details.requestId,
     url: String(details.url || ''),
@@ -596,9 +610,8 @@ function webRequestAdd(details) {
   }
 }
 
-function webRequestPatch(details, patch) {
-  if (!details || !Number.isInteger(details.tabId) || details.tabId < 0) return;
-  const bucket = webRequestBucket(details.tabId, true);
+function webRequestPatch(bucket, details, patch) {
+  if (!details || details.tabId < 0) return;
   const record = bucket.get(details.requestId);
   if (!record) return;
   Object.assign(record, patch || {});
@@ -616,53 +629,75 @@ function getWebRequests(tabId) {
   return [...bucket.values()].sort((left, right) => left.startedAt - right.startedAt);
 }
 
-function registerWebRequestListeners() {
+/**
+ * 只在目标 tab 上开始记录。`scrub` 为 true 时凭证头在进入内存前就替换掉；
+ * 并发 observe 中只要有一个要求脱敏，就保留更保守的行为。
+ */
+function startWebRequestCapture(tabId, scrub) {
+  const existing = webRequestCaptures.get(tabId);
+  if (existing) {
+    existing.refs += 1;
+    existing.scrub = existing.scrub || !!scrub;
+    return tabId;
+  }
+  const capture = { refs: 1, scrub: !!scrub, listeners: [] };
+  const bucket = webRequestBucket(tabId, true);
   try {
     const api = chrome.webRequest;
-    if (!api || !api.onBeforeRequest) return;
-    api.onBeforeRequest.addListener(
-      details => webRequestAdd(details),
-      { urls: ['<all_urls>'] },
-    );
-    api.onBeforeSendHeaders.addListener(
-      details => webRequestPatch(details, {
-        requestHeaders: Array.isArray(details.requestHeaders) ? details.requestHeaders : [],
-      }),
-      { urls: ['<all_urls>'] },
-      ['requestHeaders', 'extraHeaders'],
-    );
-    api.onHeadersReceived.addListener(
-      details => webRequestPatch(details, {
-        status: Number(details.statusCode) || 0,
-        responseHeaders: Array.isArray(details.responseHeaders) ? details.responseHeaders : [],
-        mimeType: headerMime(details.responseHeaders),
-        fromCache: !!details.fromCache,
-      }),
-      { urls: ['<all_urls>'] },
-      ['responseHeaders', 'extraHeaders'],
-    );
-    api.onCompleted.addListener(
-      details => webRequestPatch(details, {
-        status: Number(details.statusCode) || 0,
-        fromCache: !!details.fromCache,
-        ip: String(details.ip || ''),
-        timeMs: Math.max(0, Math.round((Number(details.timeStamp) || Date.now())
-          - (webRequestBucket(details.tabId, false)?.get(details.requestId)?.startedAt || Date.now()))),
-      }),
-      { urls: ['<all_urls>'] },
-    );
-    api.onErrorOccurred.addListener(
-      details => webRequestPatch(details, {
-        status: 0,
-        error: String(details.error || ''),
-        timeMs: Math.max(0, Math.round((Number(details.timeStamp) || Date.now())
-          - (webRequestBucket(details.tabId, false)?.get(details.requestId)?.startedAt || Date.now()))),
-      }),
-      { urls: ['<all_urls>'] },
-    );
+    if (!api || !api.onBeforeRequest) {
+      webRequestCaptures.set(tabId, capture);
+      return tabId;
+    }
+    const filter = { urls: ['<all_urls>'], tabId };
+    const add = (method, listener, extra) => {
+      if (!api[method] || typeof api[method].addListener !== 'function') return;
+      api[method].addListener(listener, filter, extra);
+      capture.listeners.push({ method, listener });
+    };
+    add('onBeforeRequest', details => webRequestAdd(bucket, details));
+    add('onBeforeSendHeaders', details => webRequestPatch(bucket, details, {
+      requestHeaders: scrubHeaders(details.requestHeaders, capture.scrub),
+    }), ['requestHeaders', 'extraHeaders']);
+    add('onHeadersReceived', details => webRequestPatch(bucket, details, {
+      status: Number(details.statusCode) || 0,
+      responseHeaders: scrubHeaders(details.responseHeaders, capture.scrub),
+      mimeType: headerMime(details.responseHeaders),
+      fromCache: !!details.fromCache,
+    }), ['responseHeaders', 'extraHeaders']);
+    add('onCompleted', details => webRequestPatch(bucket, details, {
+      status: Number(details.statusCode) || 0,
+      fromCache: !!details.fromCache,
+      ip: String(details.ip || ''),
+      timeMs: Math.max(0, Math.round((Number(details.timeStamp) || Date.now())
+        - (bucket.get(details.requestId)?.startedAt || Date.now()))),
+    }));
+    add('onErrorOccurred', details => webRequestPatch(bucket, details, {
+      status: 0,
+      error: String(details.error || ''),
+      timeMs: Math.max(0, Math.round((Number(details.timeStamp) || Date.now())
+        - (bucket.get(details.requestId)?.startedAt || Date.now()))),
+    }));
   } catch (error) {
     console.warn('[EMA2] webRequest listeners unavailable:', error && error.message || error);
   }
+  webRequestCaptures.set(tabId, capture);
+  return tabId;
+}
+
+/** 最后一个 observe 结束后注销监听器并丢弃该 tab 的记录。 */
+function stopWebRequestCapture(tabId) {
+  const capture = webRequestCaptures.get(tabId);
+  if (!capture) return;
+  capture.refs -= 1;
+  if (capture.refs > 0) return;
+  webRequestCaptures.delete(tabId);
+  try {
+    const api = chrome.webRequest;
+    for (const { method, listener } of capture.listeners) {
+      try { api[method].removeListener(listener); } catch (_) { /* ignore */ }
+    }
+  } catch (_) { /* ignore */ }
+  webRequestLog.delete(tabId);
 }
 
 function isInternalUrl(url) {
@@ -1202,7 +1237,7 @@ async function registerCommandGuard() {
   const bridgeOk = await within(
     chrome.scripting.registerContentScripts([{
       id: COMMAND_GUARD_BRIDGE_ID,
-      matches: ['<all_urls>'],
+      matches: COMMAND_GUARD_MATCHES,
       js: COMMAND_GUARD_BRIDGE_FILES,
       runAt: 'document_start',
       allFrames: true,
@@ -1219,7 +1254,7 @@ async function registerCommandGuard() {
   const mainOk = await within(
     chrome.scripting.registerContentScripts([{
       id: COMMAND_GUARD_ID,
-      matches: ['<all_urls>'],
+      matches: COMMAND_GUARD_MATCHES,
       js: COMMAND_GUARD_FILES,
       runAt: 'document_start',
       allFrames: true,
@@ -1251,13 +1286,15 @@ async function runGuardDisarm(tabId, allFrames) {
     func: () => {
       const guard = window.__ema2_guard;
       if (!guard) return { guard: false, disarmed: false };
-      if (typeof guard.disarm !== 'function') return { guard: true, disarmed: false };
+      // 新版本只暴露事件；页面里没有可被误调用的 guard.disarm()。
       try {
-        guard.disarm();
-      } catch (_) {
-        return { guard: true, disarmed: false };
+        document.dispatchEvent(new CustomEvent('ema2-guard-disarm'));
+      } catch (_) { /* fall through to legacy below */ }
+      // 旧版本（v3 及更早）没有事件监听，保留一次性兼容路径。
+      if (guard.armed && typeof guard.disarm === 'function') {
+        try { guard.disarm(); } catch (_) { /* report below */ }
       }
-      return { guard: true, disarmed: true };
+      return { guard: true, disarmed: guard.armed !== true };
     },
   });
   return Array.isArray(results) ? results : [];
@@ -3828,42 +3865,63 @@ async function networkMark(tabId) {
 // ---------------------------------------------------------------- act / settle / await
 
 async function loadLastAct() {
+  let stored = null;
   try {
     const store = chrome.storage && chrome.storage.session;
     if (store) {
-      const stored = (await store.get(LAST_ACT_KEY)) || {};
-      const value = stored[LAST_ACT_KEY];
+      const values = (await store.get(LAST_ACT_KEY)) || {};
+      const value = values[LAST_ACT_KEY];
       if (value && typeof value === 'object'
           && (!value.updatedAt || Date.now() - value.updatedAt <= LAST_ACT_TTL_MS)) {
-        lastActContext = value;
-        return value;
+        stored = value;
       }
     }
   } catch (_) { /* storage.session 不可用：用内存兜底 */ }
-  if (lastActContext
-      && (!lastActContext.updatedAt || Date.now() - lastActContext.updatedAt <= LAST_ACT_TTL_MS)) {
-    return lastActContext;
+  const memory = lastActContext
+    && (!lastActContext.updatedAt || Date.now() - lastActContext.updatedAt <= LAST_ACT_TTL_MS)
+    ? lastActContext : null;
+  // 并发 act 的内存写入和 storage 写入完成顺序可能不同：只取较新的上下文。
+  let value = null;
+  if (stored && memory) {
+    value = (Number(stored.updatedAt) || 0) >= (Number(memory.updatedAt) || 0) ? stored : memory;
+  } else {
+    value = stored || memory;
   }
-  lastActContext = null;
-  return null;
+  lastActContext = value;
+  return value;
 }
 
 async function saveLastAct(context) {
   const value = { ...context, updatedAt: Date.now() };
-  lastActContext = value;
-  try {
-    const store = chrome.storage && chrome.storage.session;
-    if (store) await store.set({ [LAST_ACT_KEY]: value });
-  } catch (_) { /* 忽略：内存上下文仍然可用 */ }
+  if (!lastActContext || value.updatedAt >= (Number(lastActContext.updatedAt) || 0)) {
+    lastActContext = value;
+  }
+  // 串行化 storage 写入，避免较早的 act 在较晚的 clear/save 之后落盘。
+  const write = lastActWrite.then(async () => {
+    const current = lastActContext;
+    if (current && (Number(current.updatedAt) || 0) > (Number(value.updatedAt) || 0)) return;
+    try {
+      const store = chrome.storage && chrome.storage.session;
+      if (store) await store.set({ [LAST_ACT_KEY]: value });
+    } catch (_) { /* 忽略：内存上下文仍然可用 */ }
+  });
+  lastActWrite = write.catch(() => {});
+  await write;
   return value;
 }
 
 async function clearLastAct() {
   lastActContext = null;
-  try {
-    const store = chrome.storage && chrome.storage.session;
-    if (store) await store.remove(LAST_ACT_KEY);
-  } catch (_) { /* ignore */ }
+  const write = lastActWrite.then(async () => {
+    // 清空之后才 save 的新上下文不受影响；这里只删除已经落盘的旧值。
+    if (lastActContext) return;
+    try {
+      const store = chrome.storage && chrome.storage.session;
+      if (store) await store.remove(LAST_ACT_KEY);
+    } catch (_) { /* ignore */ }
+  });
+  lastActWrite = write.catch(() => {});
+  await write;
 }
 
 /**
@@ -4662,110 +4720,6 @@ async function runStep(tab, step) {
   return mapActionResult(step, result);
 }
 
-/** 在 MAIN world 里按 ref / selector / "role:name" 深度查找（含 shadow root / 同源 iframe）。 */
-function deepFindForDebugger(ref, selector, target) {
-  // 新版 helper 的 ref 存在页面内存表里；优先走它能同时处理 shadow DOM/iframe。
-  const helpers = window.__ema2_helpers;
-  if (helpers && typeof helpers.find === 'function') {
-    const found = helpers.find(ref || null, selector || null, target || null);
-    if (found) return found;
-  }
-  const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
-  const roleOf = (el) => {
-    const role = el.getAttribute('role'); if (role) return role;
-    const tag = el.tagName.toLowerCase();
-    if (tag === 'a') return 'link';
-    if (tag === 'button') return 'button';
-    if (tag === 'select') return 'combobox';
-    if (tag === 'textarea') return 'textbox';
-    if (tag === 'summary') return 'summary';
-    if (tag === 'input') {
-      const t = (el.type || 'text').toLowerCase();
-      if (t === 'checkbox' || t === 'radio') return t;
-      if (['submit', 'button', 'reset', 'image'].includes(t)) return 'button';
-      if (t === 'file') return 'file';
-      if (t === 'search') return 'searchbox';
-      return 'textbox';
-    }
-    if (el.isContentEditable) return 'textbox';
-    return 'element';
-  };
-  const nameOf = (el) => {
-    const tag = el.tagName;
-    const type = tag === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-    const safeValue = tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type) ? el.value : '';
-    const userValueControl = tag === 'TEXTAREA' || el.isContentEditable === true
-      || (tag === 'INPUT' && !['button', 'submit', 'reset', 'image'].includes(type));
-    return clean(el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('alt') || el.getAttribute('title') || safeValue || (userValueControl ? '' : el.innerText) || '').slice(0, 60);
-  };
-  const visible = (el) => {
-    if (!el || el.hidden) return false;
-    try {
-      if (typeof el.checkVisibility === 'function') {
-        return el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
-      }
-      if (!el.getClientRects().length) return false;
-      const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-      const style = view.getComputedStyle(el);
-      return style.visibility !== 'hidden' && style.display !== 'none';
-    } catch (_) {
-      return !!el.getClientRects().length;
-    }
-  };
-  const INTERACTIVE = 'a[href],button,input,textarea,select,summary,[role],[contenteditable=""],[contenteditable="true"],[tabindex],[onclick]';
-  const roots = [];
-  const seen = new Set();
-  (function visit(root) {
-    if (!root || seen.has(root)) return;
-    seen.add(root);
-    roots.push(root);
-    for (const el of root.querySelectorAll('*')) {
-      if (el.shadowRoot) visit(el.shadowRoot);
-    }
-    for (const frame of root.querySelectorAll('iframe,frame')) {
-      try { if (frame.contentDocument) visit(frame.contentDocument); } catch (_) { /* cross-origin */ }
-    }
-  })(document);
-  if (ref) {
-    const wanted = String(ref).trim().replace(/^\[|\]$/g, '').replace(/"/g, '');
-    for (const root of roots) {
-      const el = root.querySelector('[data-ema2-ref="' + wanted + '"]');
-      if (el) return el;
-    }
-    return null;
-  }
-  if (selector) {
-    for (const root of roots) {
-      try { const el = root.querySelector(selector); if (el) return el; } catch (_) { /* invalid here */ }
-    }
-  }
-  if (target) {
-    const match = /^([a-zA-Z]+)\s*:\s*(.+)$/.exec(String(target).trim());
-    if (match) {
-      const role = match[1].toLowerCase();
-      const name = match[2].trim().toLowerCase();
-      const candidates = [];
-      for (const root of roots) {
-        for (const el of root.querySelectorAll(INTERACTIVE)) {
-          if (roleOf(el).toLowerCase() === role) candidates.push(el);
-        }
-      }
-      // 与页面 helper 一致：每一层都优先可见控件，整层不可见才回退隐藏控件。
-      const pick = (test) => {
-        const matching = candidates.filter(test);
-        return matching.find(visible) || matching[0] || null;
-      };
-      const exact = pick(el => nameOf(el).toLowerCase() === name);
-      if (exact) return exact;
-      const named = pick(el => String(el.getAttribute('name') || '').toLowerCase() === name);
-      if (named) return named;
-      const partial = pick(el => nameOf(el).toLowerCase().includes(name));
-      if (partial) return partial;
-    }
-  }
-  return null;
-}
-
 // ---------------------------------------------------------------- files / js / observe / shot
 
 let platformOs = null;
@@ -4780,20 +4734,15 @@ async function currentOs() {
   return platformOs;
 }
 
-function looksAbsolute(path, os) {
-  if (os === 'win') {
-    return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith(String.fromCharCode(92, 92));
-  }
-  return path.startsWith('/');
-}
-
 async function filesTool(args) {
   const tab = await resolveTab(args);
   const action = args.action;
   if (action === 'upload') {
     const payload = Array.isArray(args.files) ? args.files : [];
-    const paths = Array.isArray(args.paths) ? args.paths.filter(p => typeof p === 'string' && p.trim()) : [];
-    if (!payload.length && !paths.length) fail('missing_files', 'upload requires paths[]', 'pass absolute file paths');
+    if (!payload.length) {
+      fail('missing_files', 'upload requires file bytes',
+        'use the ema2 CLI: `ema2 files upload C:/dir/file --ref ...`');
+    }
     if (!args.ref && !args.selector && !args.target) {
       fail('missing_target', 'upload requires ref, selector or target', 'call snapshot and pass the file input ref');
     }
@@ -4862,35 +4811,6 @@ async function filesTool(args) {
       }
       return 'uploaded=' + result.names.length + '\nfiles=' + result.names.join(',');
     }
-    // 旧路径：只给了路径没有字节时，仍走 debugger（扩展读不了本地文件）。
-    const os = await currentOs();
-    const bad = paths.find(p => !looksAbsolute(p, os));
-    if (bad) {
-      fail('invalid_path', `not an absolute path for ${os}: ${bad}`,
-        os === 'win' ? 'use a Windows path like C:/dir/file.pdf' : 'use a path starting with /');
-    }
-    return withDebugger(tab.id, async () => {
-      await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.enable');
-      const expression = '(' + deepFindForDebugger.toString() + ')('
-        + [targetRef, args.selector || null, args.target || null].map(v => JSON.stringify(v)).join(',')
-        + ')';
-      const evaluated = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
-        expression,
-        returnByValue: false,
-      });
-      if (evaluated.exceptionDetails) {
-        fail('upload_failed', 'cannot evaluate file input lookup', 'call snapshot again');
-      }
-      const objectId = evaluated.result && evaluated.result.objectId;
-      if (!objectId) {
-        fail('target_not_found', 'file input not found', 'call snapshot and pass the file input ref, or target="file:..."');
-      }
-      await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.setFileInputFiles', {
-        files: paths,
-        objectId,
-      });
-      return 'uploaded=' + paths.length + '\nfiles=' + paths.map(p => p.split(/[\\/]/).pop()).join(',');
-    });
   }
   if (action === 'download-dir') {
     // Edge 不允许扩展修改下载目录；在触碰浏览器之前就给出稳定错误。
@@ -5764,6 +5684,9 @@ async function observeTool(args) {
   }
 
   if (kind === 'network') {
+    // webRequest 只在本命令期间、只对目标 tab 开启；凭证头默认在进入内存前脱敏。
+    startWebRequestCapture(tab.id, args.harHeaders !== 'all');
+    try {
     // 先编译/校验正则，非法或高风险模式在触碰页面之前就失败。
     const bodyRegex = args.bodyFilter ? compileBodyFilter(args.bodyFilter) : null;
     await ensureNetworkHook(tab.id);
@@ -5884,6 +5807,9 @@ async function observeTool(args) {
     }
     if (data.reset) parts.push('reset=1');
     return parts.filter(Boolean).join('\n');
+    } finally {
+      stopWebRequestCapture(tab.id);
+    }
   }
 
 }
@@ -5909,22 +5835,6 @@ async function failInjection(tab, error, action) {
   }
   fail('page_changed', `the page changed while ${action} (${detail || 'injection failed'})`,
     'retry after the page settles; if the tab is still loading, run `ema2 wait idle` first');
-}
-
-/** 该 tab 最近一次主文档导航的 webRequest 记录（status/mime 是首屏真实值）。 */
-function mainFrameInfo(tabId) {
-  const bucket = webRequestBucket(tabId, false);
-  if (!bucket) return null;
-  let main = null;
-  for (const record of bucket.values()) {
-    if (record.type === 'main_frame') main = record;  // 后续导航覆盖前面的
-  }
-  if (!main) return null;
-  return {
-    status: main.status || 0,
-    mimeType: String(main.mimeType || ''),
-    error: String(main.error || ''),
-  };
 }
 
 /**
@@ -6051,12 +5961,8 @@ async function readTool(args) {
   if (isInternalUrl(tab.url)) fail('internal_page', 'browser internal pages cannot be read', 'open an http(s) page');
   const mode = args.mode || 'md';
   const selector = args.selector;
-  // PDF 没有正文 DOM：webRequest 已记录主文档 MIME 的话，注入前直接判定。
-  const mainFrame = mainFrameInfo(tab.id);
-  if (mainFrame && /^application\/pdf/i.test(mainFrame.mimeType)) {
-    fail('pdf_page', `the document is a PDF (content_type=${mainFrame.mimeType})`,
-      'read cannot extract PDF text; open the html version, or let the user save the pdf and read it with a file tool');
-  }
+  // PDF 由页面内 contentType / 扩展名判定：webRequest 只在 observe 期间开启，
+  // 不再为 read 常驻记录主文档 MIME。
   await ensureHelpers(tab.id);
   if (selector) await requireValidSelector(tab.id, selector);
   const budget = normalizeBudget(args.budget);
@@ -6210,11 +6116,18 @@ async function migrateSettings() {
   } catch (_) { /* storage 不可用时仍按默认端口连接 */ }
 }
 
-registerWebRequestListeners();
+/** tab 被关闭时无条件注销，忽略仍在进行的 observe 引用计数。 */
+function dropWebRequestCapture(tabId) {
+  const capture = webRequestCaptures.get(tabId);
+  if (capture) capture.refs = 1;
+  stopWebRequestCapture(tabId);
+  webRequestLog.delete(tabId);
+}
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   observedConsoleDocs.delete(tabId);
   observedNetworkDocs.delete(tabId);
-  webRequestLog.delete(tabId);
+  dropWebRequestCapture(tabId);
   if (commandGuardTabs.delete(tabId)) void persistCommandGuardTabs();
 });
 ensureWatchdog();

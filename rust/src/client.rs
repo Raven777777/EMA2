@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
@@ -34,7 +35,7 @@ pub fn request(
     let _ = stream.set_nodelay(true);
 
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nUser-Agent: ema2/{}\r\nConnection: close\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nUser-Agent: ema2/{}\r\nX-EMA2-Client: ema2-cli\r\nConnection: close\r\n",
         crate::paths::PRODUCT_VERSION
     );
     if let Some(body) = body {
@@ -85,14 +86,25 @@ fn parse_response(raw: &[u8]) -> std::io::Result<HttpResponse> {
         if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
             chunked = true;
         } else if name == "content-length" {
-            content_length = value.parse().ok();
+            content_length = Some(value.parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid Content-Length: {value:?}"),
+                )
+            })?);
         }
     }
 
     let mut body = raw[split + 4..].to_vec();
     if chunked {
-        body = decode_chunked(&body);
+        body = decode_chunked(&body)?;
     } else if let Some(length) = content_length {
+        if body.len() < length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("truncated HTTP body: got {} of {length} bytes", body.len()),
+            ));
+        }
         body.truncate(length);
     }
     Ok(HttpResponse {
@@ -101,29 +113,43 @@ fn parse_response(raw: &[u8]) -> std::io::Result<HttpResponse> {
     })
 }
 
-fn decode_chunked(mut data: &[u8]) -> Vec<u8> {
+fn decode_chunked(mut data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
-    while let Some(line_end) = data.windows(2).position(|window| window == b"\r\n") {
+    loop {
+        let Some(line_end) = data.windows(2).position(|window| window == b"\r\n") else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated chunked body: missing chunk header",
+            ));
+        };
         let size_text = String::from_utf8_lossy(&data[..line_end]);
         let size_text = size_text.split(';').next().unwrap_or_default().trim();
-        let Ok(size) = usize::from_str_radix(size_text, 16) else {
-            break;
-        };
+        let size = usize::from_str_radix(size_text, 16).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid chunk size: {size_text:?}"),
+            )
+        })?;
         data = &data[line_end + 2..];
         if size == 0 {
-            break;
+            return Ok(out);
         }
-        // 数据不足说明响应体被截断：丢掉不完整的块，不要把半截内容当成完整值。
         if data.len() < size {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("truncated chunk: got {} of {size} bytes", data.len()),
+            ));
         }
         out.extend_from_slice(&data[..size]);
         data = &data[size..];
-        if data.starts_with(b"\r\n") {
-            data = &data[2..];
+        if !data.starts_with(b"\r\n") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated chunked body: missing chunk terminator",
+            ));
         }
+        data = &data[2..];
     }
-    out
 }
 
 pub fn get_json(port: u16, path: &str, timeout: Duration) -> Option<Value> {
@@ -153,11 +179,20 @@ mod tests {
     }
 
     #[test]
-    fn drops_truncated_chunk() {
-        let response = parse_response(
+    fn rejects_truncated_content_length_and_chunked_bodies() {
+        let error =
+            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        let error = parse_response(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n wo",
         )
-        .unwrap();
-        assert_eq!(response.body, "hello");
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        let error =
+            parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

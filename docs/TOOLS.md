@@ -126,6 +126,7 @@ total=2 shown=2 next=none
 | `js_exception` | 页面 JS 抛错（语法或运行时） | 看 `hint`，先 `read`/`snapshot` 再改代码 |
 | `script_timeout` | `js` 超过 `--timeout`（默认 10s），已 `terminateExecution` | 简化表达式、加 `--timeout`，或改用 read/snapshot/wait |
 | `debugger_attach_failed` | 无法挂 debugger（DevTools 或其他扩展占用该 tab） | `js` 会自动降级（看 `via=scripting`）；否则重载该 tab |
+| `debugger_attach_timeout` / `debugger_detach_timeout` | attach/detach 在 10s/2s 内没有返回 | 关掉 DevTools/占用 debugger 的扩展，或重载 tab |
 | `debugger_timeout` / `debugger_busy` | JS 执行或队列等待超期 | 终止长任务后重试 |
 | `internal_page` | 内置页（edge:// 等）不可脚本化 | 换 http(s) 页面 |
 | `empty_page` | `read` 的整页 md/text 一个字都没提取到 | 页面可能还在加载；`ema2 wait idle` 或 `wait selector` 后重试；canvas/PDF 类页面用 `shot --annotate` |
@@ -558,9 +559,9 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
   `--har` 只适用于 network（console 传 `--har` 会报 `invalid_argument`）。
 - `--level` 是最低级别阈值，默认 `error`；`warn` 包含 warn/error，`log` 包含所有已采集级别。
   输出尾部明确带 `level=<阈值>`，避免把“没有输出”误认为“没有产生日志”。
-- network：hook `fetch`/`XMLHttpRequest`，真实 `status` + **受限**响应预览；同时用
-  `chrome.webRequest` 补齐页面 hook 安装前的首屏文档/资源 status、headers、MIME，
-  并给每条记录按 `startedAt` 排序匹配。
+- network：hook `fetch`/`XMLHttpRequest`，真实 `status` + **受限**响应预览；命令期间只对目标 tab 注册
+  `chrome.webRequest`（`RequestFilter.tabId`），补齐页面 hook 安装前的首屏文档/资源
+  status、headers、MIME，命令结束立即注销，不常驻观察其它标签。记录按 `startedAt` 排序匹配。
   - 列表行输出**完整绝对 URL**（跨域请求不再只剩 path）；`-1` 只用于确实拿不到状态的条目。
   - 预览在后台读取 `response.clone()`，最多 8KB/1.5s，不阻塞页面；事件流/二进制跳过。
   - `--bodies=false` 真正关闭新响应的 body clone/读取。
@@ -576,7 +577,8 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
     `request/response.headers`、`queryString`、真实 `startedDateTime`、`content.mimeType/size` 来自
     webRequest + 页面 hook；JSON 不经过文本预算截断，落盘并回 `path=` + `entries=N`。
   - HAR 里的 `authorization`、`proxy-authorization`、`cookie`、`set-cookie` 默认替换为
-    `<redacted>`。需要原始值时显式加 `--headers all`（只影响 HAR 导出）。
+    `<redacted>`，且在 webRequest 记录进入内存前就脱敏。需要原始值时显式加
+    `--headers all`（只影响本次 network 观测的 HAR 导出）。
 
 ## files
 
@@ -633,7 +635,7 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
   `snapshot --filter/--near/--budget/--cursor/--values`，
   `js --code/--budget/--cursor/--timeout`，`wait --text/--text-gone/--selector/--time/--timeout/--idle`。
   `js` 的位置参数可直接写 CODE，`wait` 的位置参数可直接写 TEXT；完整列表见 `ema2 batch --help`。
-- 预算按 `ceil(目标数/并发) × 单次最长耗时 + open 成本 + 15s`；js 因全局 debugger 串行按有效并发 1 计算。
+- 预算按 `ceil(目标数/并发) × 单次最长耗时 + open 成本 + 20s`；js 因全局 debugger 串行按有效并发 1 计算。
   `tool=open` 的单次耗时跟随内层 `waitTimeout`（默认 15s），不会再被固定 30s 提前掐断。
 - 估算超过 600s 时在执行前报 `invalid_argument`，请减少目标、提高并发或拆分 batch。
 
@@ -683,6 +685,8 @@ ema2 server stop
   `alert/confirm/prompt/print` 变成非阻塞记录：
   `confirm` 返回 false、`prompt` 返回 null、`print` 不打开预览；赋值型 `window.onbeforeunload`
   也会被吞掉（记录为 `dialog_opened=beforeunload handled=suppressed`），避免离开页面时被原生确认框卡住。
+  动态 content script 无法按 tabId 限定，所以租约期间只 match `http(s)` 页面并在
+  最后一个租约结束时注销；页面拥有同一个 JS realm，guard 只是防卡死优化，不是安全边界。
   需要用户确认的流程请先检查 `dialog_opened=`，不要假设页面拿到了“确认”。
   命令结束或失败后 guard 恢复原生 API；未调用 EMA2 时页面弹窗不会被扩展拦截。
 - 视觉兜底只有编号 + 坐标，没有 OCR。

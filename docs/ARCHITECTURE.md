@@ -75,7 +75,7 @@ EMA2 是**一个单文件 exe + 一个 MV3 扩展**。exe 既能以后台 daemon
 | `rust/src/tools.rs` | 11 个工具白名单 + 参数校验 + 超时预算 |
 | `rust/src/save.rs` | 截图/HAR 落盘，把 base64/JSON 换成 `path=` 行 |
 | `rust/src/paths.rs` | 产品版本、默认端口、输出目录、临时 PID/日志路径 |
-| `extension/background.js` | 11 个工具实现、ref 快照、网络/console hook、webRequest 补齐、debugger 队列、act settle/await 上下文 |
+| `extension/background.js` | 11 个工具实现、ref 快照、网络/console hook、按 tab 的 webRequest 补齐、debugger 队列、act settle/await 上下文 |
 | `extension/page_guard.js` | 命令租约内按需启用：非阻塞记录 alert/confirm/prompt/print，解除后恢复原生 API |
 | `extension/page_guard_armed.js` | document_start 动态 guard 的第二个脚本，在页面脚本前立即 arm |
 | `extension/page_guard_bridge.js` | ISOLATED world bridge：把 arm 事件转给 SW，租约已释放时通知页面自行 disarm |
@@ -106,7 +106,11 @@ v2 明确**只信任本机回环**，不做应用层鉴权：
 
 - 只 bind `127.0.0.1`；
 - 校验 `Host` 必须是 `127.0.0.1` / `localhost` / `[::1]`；
-- 校验 `Origin`：无 Origin（CLI/curl）、`chrome-extension://`、或回环 origin 才允许；
+- `/cmd` 与 `/shutdown` 必须无 `Origin`、带 `X-EMA2-Client: ema2-cli`（阻止浏览器跨源页面借用户会话发命令）；
+- `/health` 只允许无 `Origin` 或合法的 `chrome-extension://<32 位 a-p id>`；回环网页 Origin 也拒绝；
+- 扩展 WS 必须完成 `bridge/hello`：`role=extension`、32 位扩展 ID、Origin 精确等于
+  `chrome-extension://<id>`；未 hello 的连接不能收工具调用，5s 内不完成即断开；
+- 同一扩展 ID 重连会替换旧连接并清理 pending；不同 ID 不能顶掉当前扩展；
 - 不做 token/HMAC。任何能访问本机 7744 的进程都能驱动浏览器——这是设计取舍。
 
 扩展只连 `ws://127.0.0.1:<popup 端口>`，任何占用该端口的本机服务都能冒充 daemon；
@@ -126,8 +130,9 @@ CLI 参数
   → CLI 渲染文本（图片 --inline 输出 data URI）
 ```
 
-- 工具超时预算在 `tools.rs`：wait = timeout+15s；open = waitTimeout+15s；
-  act = 60s + 每步最多 3s 的隐式 settle + 脚本 waitFor/await；js = --timeout(默认 10s)+15s；shot/files=120s；
+- 工具超时预算在 `tools.rs`：默认 80s（扩展 watchdog 70s）；wait = timeout+20s；
+  open = waitTimeout+20s；act = 60s + 每步最多 3s 的隐式 settle + 脚本 waitFor/await；
+  js = --timeout(默认 10s)+20s；shot/files=120s；
   batch 按目标数/并发/内层工具估算，超过 600s 在执行前拒绝。
 - pending 表按扩展连接 generation 隔离；旧连接的迟到响应不会解决新请求。
 - CLI 中途断开时 `PendingGuard` 清掉 pending 条目。
@@ -155,7 +160,8 @@ CLI 参数
 - manifest 不再永久注入页面 guard；普通浏览和 daemon 空闲时不覆盖任何页面 API。
 - 页面命令开始时登记 guard lease；第一个 lease 通过
   `chrome.scripting.registerContentScripts` 动态注册 MAIN world、document_start、
-  all-frames 的 `page_guard.js` + `page_guard_armed.js`，覆盖导航后的新文档。
+  all-frames 的 `page_guard.js` + `page_guard_armed.js`，match 限定 `http(s)`，
+  覆盖导航后的新文档，租约结束注销。
 - 每个 RPC 有独立的 `guardContext`：租约带 token，释放时按 token 扣减，
   重复释放/超时兜底不会误扣别的命令。watchdog 触发后延迟
   `COMMAND_GUARD_ABANDON_GRACE_MS` 强制释放该上下文持有的租约，租约存活上限
@@ -165,13 +171,14 @@ CLI 参数
 - 扩展只记录真正被 arm 过的 tab（`ensurePageGuard` + document_start 新文档上报），
   不再每条命令扫全部标签。该集合写入 `chrome.storage.session`
   （`ema2_command_guard_tabs`），service worker 重启后仍能继续清理。
-- 最后一个 lease 结束时**先**注销动态脚本，**再**对记录过的 tab 广播 `disarm()`。
+- 最后一个 lease 结束时**先**注销动态脚本，**再**对记录过的 tab 广播
+  `ema2-guard-disarm` 文档事件；`page_guard.js` 不再向页面暴露可调用的 `disarm()`。
   disarm 分 top frame 和 all-frames 两次执行并分别验证：只有 top frame 与所有
   可脚本化 frame 都确认恢复，tab 才移出跟踪集合并持久化；受限/刚导航的 frame
   不能让 top frame 一起失败，也不能被成功结果掩盖。未验证的 tab 留待下次
   release/启动重试。每个 tab 的清理有单独时限，整批还有总上限；卡在原生对话框里
   的渲染进程不能拖死后续命令。释放窗口内仍在加载的新文档由 ISOLATED world
-  bridge 询问租约，已归零就立即自行 `disarm()`。
+  bridge 询问租约，已归零就立即自行恢复原生 API。
 - alert/confirm/prompt/print/window.open 以及赋值型 `onbeforeunload` 恢复原生行为。
 - `page_guard.js` 默认 disarmed；从旧 v1/v2 升级时使用原生 descriptor 恢复页面，
   v1 的 own `onbeforeunload` accessor 不会被当成原生引用。

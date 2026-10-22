@@ -11,6 +11,18 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
+/// `--port 0` 会让 daemon 绑定随机端口，但 PID/日志文件仍按 0 生成，
+/// 后续 `status`/`stop` 也找不到真实端口。端口必须在 1..=65535。
+fn parse_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port {value:?}: expected 1..65535"))?;
+    if port == 0 {
+        return Err("port must be between 1 and 65535".into());
+    }
+    Ok(port)
+}
+
 /// 解析完成的一次工具调用（CLI 子命令的编译产物）。
 pub struct ToolCall {
     pub tool: &'static str,
@@ -55,7 +67,7 @@ AI 会话顺序:
 )]
 pub struct Cli {
     /// 覆盖默认端口 7744；server 与所有客户端命令须用同一端口
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = parse_port)]
     pub port: Option<u16>,
     #[command(subcommand)]
     pub command: Command,
@@ -852,11 +864,9 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
                         concurrency = Some(parsed);
                     }
                     _ => {
-                        port_override = Some(
-                            value
-                                .parse::<u16>()
-                                .map_err(|_| format!("batch: invalid --port {value:?}"))?,
-                        );
+                        port_override = Some(parse_port(&value).map_err(|error| {
+                            format!("batch: invalid --port {value:?}: {error}")
+                        })?);
                     }
                 }
             }
@@ -1190,9 +1200,8 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             "--port" => {
                 let value = next_value("--port")?;
                 port_override = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("act: invalid --port {value:?}"))?,
+                    parse_port(&value)
+                        .map_err(|error| format!("act: invalid --port {value:?}: {error}"))?,
                 );
             }
             "--wait-for" => wait_for = Some(next_value("--wait-for")?),
@@ -2293,6 +2302,19 @@ click target=\"button:提交\"
         let call =
             build_batch(&["read".into(), "--tab-ids=1".into(), "--port=7801".into()]).unwrap();
         assert_eq!(call.port, Some(7801));
+
+        assert!(
+            build_batch(&["read".into(), "--tab-ids=1".into(), "--port=0".into()]).is_err(),
+            "port 0 would bind a random port and break status/stop"
+        );
+    }
+
+    #[test]
+    fn act_port_rejects_zero() {
+        assert_eq!(super::parse_port("7744").unwrap(), 7744);
+        assert!(super::parse_port("0").is_err());
+        assert!(super::parse_port("65536").is_err());
+        assert!(build_act(&["click".into(), "e1".into(), "--port".into(), "0".into(),]).is_err());
     }
 
     #[test]

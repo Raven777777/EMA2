@@ -31,6 +31,13 @@ pub type RpcId = Value;
 struct ExtConnection {
     generation: u64,
     tx: mpsc::UnboundedSender<Message>,
+    extension_id: String,
+}
+
+/// 完成 `bridge/hello` 之前，连接只能待在这里：不能执行工具、不计入 status。
+struct PendingConnection {
+    generation: u64,
+    tx: mpsc::UnboundedSender<Message>,
 }
 
 struct PendingEntry {
@@ -61,6 +68,8 @@ pub struct RelayState {
     /// 所有对 `ext` 的读写都在同一把锁内完成，因此 `generation` 与 `tx`
     /// 永远来自同一条连接，不需要额外的“活跃 generation”守卫。
     ext: Mutex<Option<ExtConnection>>,
+    /// 已升级 WS、但还没通过 `bridge/hello` 验证的连接。
+    pending_ext: Mutex<Option<PendingConnection>>,
     /// 内部请求 id -> 请求所属连接和响应通道。
     pending: Mutex<HashMap<RpcId, PendingEntry>>,
     /// 截图/HAR 等输出文件目录。
@@ -81,6 +90,7 @@ impl RelayState {
     pub fn new(output_dir: PathBuf, port: u16) -> Arc<Self> {
         Arc::new(Self {
             ext: Mutex::new(None),
+            pending_ext: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             output_dir,
             port,
@@ -100,6 +110,7 @@ impl RelayState {
         lock(&self.pending).len()
     }
 
+    #[cfg(test)]
     pub fn set_extension_version(&self, version: &str) {
         *lock(&self.extension_version) = Some(version.to_owned());
         // hello 也是一次扩展活动；status 不应该在已连接时显示 last_ping=never。
@@ -234,12 +245,67 @@ impl RelayState {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn register_extension(&self, tx: mpsc::UnboundedSender<Message>) -> u64 {
+    pub fn register_pending_extension(&self, tx: mpsc::UnboundedSender<Message>) -> u64 {
         let generation = self.next_id();
+        *lock(&self.pending_ext) = Some(PendingConnection { generation, tx });
+        generation
+    }
+
+    /// 完成握手：只有 hello 里的 extensionId 与 WS Origin 一致时才会调用。
+    ///
+    /// 已有一个不同 ID 的扩展连着时拒绝新连接，避免任意本机扩展抢占控制通道。
+    /// 同一 ID 重连（service worker 重启）则替换旧连接并清掉旧 pending 请求。
+    pub fn activate_extension(
+        &self,
+        generation: u64,
+        extension_id: &str,
+        version: &str,
+    ) -> Result<(), String> {
+        let pending = {
+            let mut pending = lock(&self.pending_ext);
+            match pending.as_ref() {
+                Some(connection) if connection.generation == generation => {
+                    pending.take().expect("checked above")
+                }
+                _ => return Err("handshake expired or generation mismatch".into()),
+            }
+        };
         let mut ext = lock(&self.ext);
-        // 旧连接上的等待者立刻失败，而不是白白等到超时。
+        if let Some(active) = ext.as_ref()
+            && active.extension_id != extension_id
+        {
+            return Err("another extension is already connected".into());
+        }
         lock(&self.pending).clear();
-        *ext = Some(ExtConnection { generation, tx });
+        *ext = Some(ExtConnection {
+            generation,
+            tx: pending.tx,
+            extension_id: extension_id.to_owned(),
+        });
+        *lock(&self.extension_version) = Some(version.to_owned());
+        self.touch_extension();
+        Ok(())
+    }
+
+    /// 握手超时/连接关闭时清理 pending；旧 generation 的清理不影响新连接。
+    pub fn unregister_pending_extension(&self, generation: u64) -> bool {
+        let mut pending = lock(&self.pending_ext);
+        if pending
+            .as_ref()
+            .is_some_and(|connection| connection.generation == generation)
+        {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    pub fn register_extension(&self, tx: mpsc::UnboundedSender<Message>) -> u64 {
+        let generation = self.register_pending_extension(tx);
+        self.activate_extension(generation, "test-extension", "test")
+            .expect("test handshake");
         generation
     }
 
@@ -397,6 +463,62 @@ mod tests {
     fn reports_disconnected_extension() {
         let state = state();
         assert!(!state.extension_connected());
+    }
+
+    #[tokio::test]
+    async fn pending_connection_is_not_usable_before_hello() {
+        let state = state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let generation = state.register_pending_extension(tx);
+        assert!(!state.extension_connected());
+        assert_eq!(state.last_ping_secs(), None);
+        assert!(state.unregister_pending_extension(generation));
+        assert!(!state.unregister_pending_extension(generation));
+    }
+
+    #[tokio::test]
+    async fn activation_rejects_a_different_extension_id() {
+        let state = state();
+        let (first, _first_rx) = mpsc::unbounded_channel();
+        let first_generation = state.register_pending_extension(first);
+        state
+            .activate_extension(first_generation, "extension-one", "1")
+            .unwrap();
+
+        let (second, _second_rx) = mpsc::unbounded_channel();
+        let second_generation = state.register_pending_extension(second);
+        let error = state
+            .activate_extension(second_generation, "extension-two", "2")
+            .unwrap_err();
+        assert!(error.contains("already connected"), "{error}");
+        assert!(state.extension_connected());
+    }
+
+    #[tokio::test]
+    async fn same_extension_id_can_reconnect_and_replaces_pending_requests() {
+        let state = state();
+        let (first, mut first_rx) = mpsc::unbounded_channel();
+        let first_generation = state.register_pending_extension(first);
+        state
+            .activate_extension(first_generation, "same-extension", "1")
+            .unwrap();
+        let call = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .call_extension(&request(), Duration::from_secs(5))
+                    .await
+            })
+        };
+        assert!(first_rx.recv().await.is_some());
+
+        let (second, _second_rx) = mpsc::unbounded_channel();
+        let second_generation = state.register_pending_extension(second);
+        state
+            .activate_extension(second_generation, "same-extension", "2")
+            .unwrap();
+        let error = call.await.unwrap().unwrap_err();
+        assert!(error.contains("closed"), "unexpected error: {error}");
     }
 
     #[test]

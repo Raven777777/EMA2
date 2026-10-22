@@ -1,5 +1,36 @@
 # 变更记录
 
+## v2.4.2.1 — 数据安全、握手与观测范围修复
+
+- **`ema2 init` 不再覆盖损坏文件（P0）**：只有 `NotFound` 才当成空文件；权限/编码/IO
+  错误返回 `init_failed` 并保留原内容。写入改为同目录唯一临时文件 + `sync_all` +
+  原子 rename，失败时清理临时文件；用户文本与 EMA2 区块的合并逻辑单测覆盖。
+- **端口 0 拒绝**：clap 全局 `--port`、`act`/`batch` 的尾部覆盖和 `server` 入口都拒绝
+  `0` 与越界值，避免 daemon/扩展连到随机端口。
+- **扩展握手**：WS 连接先进入 pending，必须收到 `bridge/hello`（`role=extension`、
+  32 位 `extensionId`、精确匹配的 `chrome-extension://<id>` Origin）才激活；5s 未完成
+  即断开。同 ID 重连替换旧连接，不同 ID 不能顶掉当前扩展。
+- **本机 HTTP 守卫**：`/cmd`/`/shutdown` 只接受无 Origin + `X-EMA2-Client: ema2-cli`；
+  `/health` 只接受无 Origin 或合法扩展 Origin，回环网页 Origin 也拒绝。CLI 客户端同步发送
+  CSRF 头，并对截断的 `Content-Length`/chunked 响应报错而不是接受半截结果。
+- **结果完整性**：HTTP 200 但缺少 `result`/`result:null` 不再伪装成功，返回
+  `extension_error`。
+- **网络观测范围**：`chrome.webRequest` 不再在启动时全局监听；只在 `observe network`
+  期间按 `RequestFilter.tabId` 注册，命令结束注销。凭证头默认在进入内存前替换为
+  `<redacted>`，`--headers all` 才保留原值。
+- **guard 释放**：`page_guard.js` 不再暴露可调用的 `disarm()`；后台通过
+  `ema2-guard-disarm` 文档事件释放，旧版本保留一次兼容路径。`GUARD_VERSION` /
+  `ema2_guard_protocol` 升至 4。
+- **超时对齐**：daemon 默认 80s（扩展 70s）；wait/open/js 的中继余量统一 20s；
+  batch 仍由 600s 产品上限约束。
+- **lastAct 顺序**：内存与 `storage.session` 按 `updatedAt` 取较新值，写入串行化，
+  避免并发 act 的旧上下文覆盖新上下文。
+- **清理死路径**：删除 `files upload` 的 debugger/`DOM.setFileInputFiles` 回退和
+  `deepFindForDebugger`/`looksAbsolute`；CLI 始终下发 base64 字节。
+- **验收**：`cargo test` 87 passed；clippy/fmt 通过；`verify.py` 增加密码框脱敏、
+  焦点精确匹配、annotate ref 非空和临时目录清理，仍为 135 项真机检查。
+- 版本：对外产品/扩展 `2.4.2.1`；Cargo crate metadata 仍为 SemVer `2.4.2`。
+
 ## v2.4.2 — read 正文质量与页面状态
 
 这版只改 `read` 的提取质量与状态语义；paywall 检测、PDF 抽文本、OCR、站点适配器仍明确不做。

@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -123,6 +124,7 @@ FIXTURE_BUGS = """<!doctype html>
 <input id="a" value="abc"><input id="b">
 <input id="hidden-search" name="q" type="search" value="hidden-value" style="display:none">
 <input id="named-search" name="q" type="search" placeholder="global search">
+<input id="pw" name="pw" type="password" value="hunter2-fixture-secret">
 <input id="num" type="number" value="42">
 <select id="sel"><option value="v1">one</option><option value="v2" selected>two</option></select>
 <textarea id="area">secret</textarea>
@@ -152,15 +154,12 @@ function ema2ReportGuard(stage) {
   fetch('/guard-report?' + params.toString()).catch(function () {});
 }
 (function () {
-  // disarm 由后台在命令释放时调用；事件驱动上报，避免永久轮询污染网络检查。
-  const guard = window.__ema2_guard;
-  if (!guard || typeof guard.disarm !== 'function') return;
-  const disarm = guard.disarm;
-  guard.disarm = function () {
-    const result = disarm.apply(this, arguments);
-    ema2ReportGuard('disarm');
-    return result;
-  };
+  // 后台通过 ema2-guard-disarm 事件释放；事件监听按注册顺序执行，
+  // 这里用 setTimeout 确保 page_guard 已恢复原生 API 后再上报。
+  if (!window.__ema2_guard) return;
+  document.addEventListener('ema2-guard-disarm', function () {
+    setTimeout(function () { ema2ReportGuard('disarm'); }, 0);
+  }, true);
 })();
 </script>
 </body></html>
@@ -556,7 +555,7 @@ def main() -> int:
 
     try:
         version = runner.run("--version")
-        runner.expect_ok("binary exposes product version", version, "2.4.2.0")
+        runner.expect_ok("binary exposes product version", version, "2.4.2.1")
 
         opened = runner.expect_ok("open fixture", runner.run("open", f"{base}/"), "status=200", "net_hook=on", "title=ema2 fixture home")
         tab_match = re.search(r"^id=(\d+)", opened, re.M)
@@ -573,7 +572,7 @@ def main() -> int:
             focus = runner.run("js", "return document.hasFocus()")
             runner.check(
                 "page is focused (foreground)",
-                "true" in (focus.stdout or "").lower(),
+                focus.returncode == 0 and (focus.stdout or "").strip() == "true",
                 "浏览器必须在前台可见状态下运行；本测试禁止无头/后台浏览器 " + (focus.stdout or "") + (focus.stderr or ""),
             )
 
@@ -864,6 +863,7 @@ def main() -> int:
             "shot --annotate keeps refs unique and coords non-negative",
             annotate.returncode == 0
             and annotate_path.exists()
+            and len(mark_refs) >= 1
             and len(mark_refs) == len(set(mark_refs))
             and all(int(x) >= 0 and int(y) >= 0 for x, y in mark_coords),
             annotate_out[:1600],
@@ -1157,7 +1157,8 @@ def main() -> int:
         form_out = (form.stdout or "") + (form.stderr or "")
         runner.check(
             "snapshot --filter form exposes values (not password)",
-            form.returncode == 0 and "value=secret" in form_out and "value=v2" in form_out,
+            form.returncode == 0 and "value=secret" in form_out and "value=v2" in form_out
+            and "value=<hidden>" in form_out and "hunter2-fixture-secret" not in form_out,
             form_out[:1200],
         )
 
@@ -1384,6 +1385,7 @@ def main() -> int:
         runner.check("tabs close --session", closed.returncode == 0 and "closed=" in (closed.stdout or ""), (closed.stdout or "")[:300])
     finally:
         server.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
         if not already_running and not args.keep_server:
             runner.run("server", "stop", timeout=20)
 

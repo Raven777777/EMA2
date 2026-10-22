@@ -5,8 +5,8 @@
 ## 当前版本
 
 ```text
-exe        2.4.2.0（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.2.0
+exe        2.4.2.1（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.2.1
 helper     20
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
@@ -98,7 +98,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前 Rust 测试：**80 passed**。
+当前 Rust 测试：**87 passed**。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。

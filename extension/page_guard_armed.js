@@ -11,7 +11,7 @@
   };
   const forceDisarm = () => {
     try {
-      if (typeof guard.disarm === 'function') guard.disarm();
+      document.dispatchEvent(new CustomEvent('ema2-guard-disarm'));
     } catch (_) { /* ignore */ }
   };
   // 同一文档可能被多次注入（每个命令一次）；监听器只装一次，避免长驻 SPA 叠加。

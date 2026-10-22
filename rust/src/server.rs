@@ -27,6 +27,10 @@ use crate::tools;
 
 /// daemon 主循环：绑定单端口，WS 与 HTTP 共用 listener，直到 `/shutdown`。
 pub async fn run(port: u16) -> i32 {
+    if port == 0 {
+        tracing::error!("invalid port 0: EMA2 needs a fixed port for the pid/log files");
+        return 2;
+    }
     let output_dir = paths::output_dir();
     if let Err(error) = std::fs::create_dir_all(&output_dir) {
         tracing::error!(
@@ -110,6 +114,14 @@ pub fn router(state: Arc<RelayState>, shutdown: Arc<Notify>) -> Router {
 
 // ---------------------------------------------------------------- origin / host
 
+/// CLI 请求必须带的自定义头。
+///
+/// 浏览器页面可以发跨源 `POST`，但自定义头会触发 CORS preflight；EMA2 不返回
+/// CORS 许可，所以恶意网页无法伪造这个头。表单（无 preflight）也带不了自定义头。
+/// 这不是 token：本机进程仍然可以直接调用；它挡的是“网页借用户浏览器打本机端口”。
+const CLIENT_HEADER: &str = "x-ema2-client";
+const CLIENT_VALUE: &str = "ema2-cli";
+
 /// 判断 Host / `host:port` / `[::1]:port` 是否指向本机。
 fn host_is_loopback(authority: &str) -> bool {
     let authority = authority.rsplit('@').next().unwrap_or(authority).trim();
@@ -135,38 +147,31 @@ fn host_header_is_loopback(headers: &HeaderMap) -> bool {
     }
 }
 
-/// Origin 校验：挡住恶意网页（含 DNS rebinding）借用本机回环端口。
-///
-/// 允许两类来源：无 Origin（CLI / curl / 脚本）与扩展自身（chrome-extension://）。
-/// 浏览器页面只允许回环 origin——本工具本来就只服务本机。
-fn origin_is_allowed(headers: &HeaderMap) -> bool {
-    let Some(origin) = headers
+fn header_origin(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-    else {
-        return true;
-    };
-    let origin = origin.trim();
-    if origin.is_empty() || origin == "null" {
-        return false;
-    }
-    if ["chrome-extension://", "moz-extension://", "extension://"]
-        .iter()
-        .any(|scheme| origin.starts_with(scheme))
-    {
-        return true;
-    }
-    match origin.split_once("://") {
-        Some(("http" | "https", rest)) => {
-            let authority = rest.split('/').next().unwrap_or_default();
-            host_is_loopback(authority)
-        }
-        _ => false,
-    }
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+}
+
+/// 只接受 Edge 扩展的 Origin，且 ID 必须是 32 个 a-p 字符。
+fn origin_is_extension(origin: &str) -> bool {
+    origin
+        .strip_prefix("chrome-extension://")
+        .is_some_and(relay::extension_id_valid)
+}
+
+#[derive(Clone, Copy)]
+enum Access {
+    /// `/health` 允许扩展 popup 读取；不允许网页 Origin。
+    Health,
+    /// `/cmd`、`/shutdown` 只允许无 Origin 的 CLI，并额外要求 CSRF 头。
+    Command,
 }
 
 /// 返回 `Some(response)` 表示应当直接拒绝该请求。
-fn check_origin_and_host(headers: &HeaderMap) -> Option<Response> {
+fn check_access(headers: &HeaderMap, access: Access) -> Option<Response> {
     if !host_header_is_loopback(headers) {
         return Some(
             (
@@ -176,14 +181,42 @@ fn check_origin_and_host(headers: &HeaderMap) -> Option<Response> {
                 .into_response(),
         );
     }
-    if !origin_is_allowed(headers) {
-        return Some(
-            (
-                StatusCode::FORBIDDEN,
-                "forbidden: Origin must be a loopback or chrome-extension origin",
-            )
-                .into_response(),
-        );
+    let origin = header_origin(headers);
+    match access {
+        Access::Health => {
+            if origin.is_some_and(|origin| !origin_is_extension(origin)) {
+                return Some(
+                    (
+                        StatusCode::FORBIDDEN,
+                        "forbidden: only the Edge extension may read /health from a browser context",
+                    )
+                        .into_response(),
+                );
+            }
+        }
+        Access::Command => {
+            if origin.is_some() {
+                return Some(
+                    (
+                        StatusCode::FORBIDDEN,
+                        "forbidden: CLI commands must not carry a browser Origin header",
+                    )
+                        .into_response(),
+                );
+            }
+            let client = headers
+                .get(CLIENT_HEADER)
+                .and_then(|value| value.to_str().ok());
+            if client != Some(CLIENT_VALUE) {
+                return Some(
+                    (
+                        StatusCode::FORBIDDEN,
+                        "forbidden: missing CSRF header; use the ema2 CLI",
+                    )
+                        .into_response(),
+                );
+            }
+        }
     }
     None
 }
@@ -209,14 +242,29 @@ async fn entry(
     State((state, _shutdown)): State<(Arc<RelayState>, Arc<Notify>)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = check_origin_and_host(&headers) {
-        return response;
+    if !host_header_is_loopback(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: Host header must be 127.0.0.1, localhost or [::1]",
+        )
+            .into_response();
+    }
+    let origin = header_origin(&headers).map(str::to_owned);
+    if origin
+        .as_deref()
+        .is_some_and(|origin| !origin_is_extension(origin))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: the extension WebSocket Origin must be chrome-extension://<id>",
+        )
+            .into_response();
     }
     match ws {
         Ok(ws) => ws
             .max_message_size(64 * 1024 * 1024)
             .max_frame_size(64 * 1024 * 1024)
-            .on_upgrade(move |socket| relay::handle_extension_ws(socket, state)),
+            .on_upgrade(move |socket| relay::handle_extension_ws(socket, state, origin)),
         // 扩展的 WS 握手一定带 Upgrade 头；到这里说明是普通 HTTP 客户端。
         Err(_) => (
             StatusCode::OK,
@@ -249,7 +297,7 @@ async fn cmd(
     headers: HeaderMap,
     axum::Json(request): axum::Json<CmdRequest>,
 ) -> Response {
-    if let Some(response) = check_origin_and_host(&headers) {
+    if let Some(response) = check_access(&headers, Access::Command) {
         return response;
     }
     if !tools::contains(&request.tool) {
@@ -335,7 +383,15 @@ async fn cmd(
             *result = save::save_har(&state, std::mem::take(result), request.out.as_deref()).await;
         }
     }
-    let body = json!({ "result": response.get("result").cloned().unwrap_or(Value::Null) });
+    let Some(result) = response.get("result") else {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "extension_error",
+            "extension returned a JSON-RPC response without a result",
+            "reload the extension and retry; check `ema2 status`",
+        );
+    };
+    let body = json!({ "result": result });
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -349,7 +405,7 @@ async fn health(
     State((state, _shutdown)): State<(Arc<RelayState>, Arc<Notify>)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = check_origin_and_host(&headers) {
+    if let Some(response) = check_access(&headers, Access::Health) {
         return response;
     }
     let body = json!({
@@ -381,7 +437,7 @@ async fn handle_shutdown(
     State((_state, shutdown)): State<(Arc<RelayState>, Arc<Notify>)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = check_origin_and_host(&headers) {
+    if let Some(response) = check_access(&headers, Access::Command) {
         return response;
     }
     // notify_one 会保留一个 permit：即使 handler 早于 graceful future 的首次 poll，
@@ -420,6 +476,7 @@ mod tests {
             .uri(uri)
             .header(header::HOST, "127.0.0.1:7744")
             .header(header::CONTENT_TYPE, "application/json")
+            .header("x-ema2-client", "ema2-cli")
             .body(Body::from(body.to_string()))
             .unwrap()
     }
@@ -531,7 +588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_foreign_origins_and_hosts() {
+    async fn rejects_foreign_origins_loopback_pages_and_missing_csrf_headers() {
         let (app, _) = app();
         let request = Request::builder()
             .method("POST")
@@ -539,9 +596,36 @@ mod tests {
             .header(header::HOST, "127.0.0.1:7744")
             .header(header::ORIGIN, "http://evil.example")
             .header(header::CONTENT_TYPE, "application/json")
+            .header("x-ema2-client", "ema2-cli")
             .body(Body::from(
                 json!({ "tool": "tabs", "args": {} }).to_string(),
             ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // 本机网页同样是跨源页面：不能借用户浏览器调用 /cmd。
+        let request = Request::builder()
+            .method("POST")
+            .uri("/cmd")
+            .header(header::HOST, "127.0.0.1:7744")
+            .header(header::ORIGIN, "http://127.0.0.1:3000")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-ema2-client", "ema2-cli")
+            .body(Body::from(
+                json!({ "tool": "tabs", "args": {} }).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // 无 Origin 但没有 CSRF 头：表单/简单请求必须被拒。
+        let request = Request::builder()
+            .method("POST")
+            .uri("/shutdown")
+            .header(header::HOST, "127.0.0.1:7744")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -557,13 +641,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_loopback_and_extension_origins() {
+    async fn accepts_extension_origin_for_health_only() {
+        let origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+        let (app, _) = app();
+        let request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header(header::HOST, "127.0.0.1:7744")
+            .header(header::ORIGIN, origin)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 扩展 Origin 不能调用 /cmd：CLI 永远不带 Origin。
+        let request = Request::builder()
+            .method("POST")
+            .uri("/cmd")
+            .header(header::HOST, "127.0.0.1:7744")
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-ema2-client", "ema2-cli")
+            .body(Body::from(
+                json!({ "tool": "tabs", "args": {} }).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
         for origin in [
+            "chrome-extension://too-short",
+            "chrome-extension://abcdefghijklmnopqrstuvwxyzabcde0",
             "http://127.0.0.1:3000",
-            "http://localhost:5173",
-            "chrome-extension://abcdefghijklmnop",
+            "https://localhost:5173",
         ] {
-            let (app, _) = app();
             let request = Request::builder()
                 .method("GET")
                 .uri("/health")
@@ -571,8 +682,8 @@ mod tests {
                 .header(header::ORIGIN, origin)
                 .body(Body::empty())
                 .unwrap();
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "origin {origin}");
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "origin {origin}");
         }
     }
 

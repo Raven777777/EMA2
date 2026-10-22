@@ -28,13 +28,13 @@
 
 ```bash
 cd rust
-cargo test                          # 80 项：参数校验、超时预算、脚本解析、路由、落盘
+cargo test                          # 87 项：参数校验、超时预算、脚本解析、路由、落盘
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（113 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（135 项）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 

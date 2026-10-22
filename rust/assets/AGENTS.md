@@ -154,6 +154,7 @@ Never：
 | `js_exception` | 看 hint，先 `read`/`snapshot` 再改代码 |
 | `script_timeout` | `js` 超时；简化表达式、加 `--timeout`，或改用 read/snapshot/wait |
 | `debugger_attach_failed` | 先重载该 tab；`ema2 js` 自动降级（看 `via=scripting`） |
+| `debugger_attach_timeout` / `debugger_detach_timeout` | 关掉 DevTools/占用 debugger 的扩展，或重载 tab |
 | `debugger_timeout` / `debugger_busy` | 终止长任务后重试 |
 | `internal_page` | `edge://` 等内置页不可脚本化；换 http(s) |
 | `empty_page` | `read` 整页 md/text 0 字符；`wait idle`/`wait selector` 后重试，或 `shot --annotate` |

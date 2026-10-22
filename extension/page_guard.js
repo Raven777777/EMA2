@@ -3,7 +3,8 @@
  *
  * 默认状态是 disarmed：页面保留原生 alert/confirm/prompt/print/window.open。
  * 命令执行前由 page_guard_armed.js 或 background.js 调用 guard.arm()，
- * 把同步阻塞的对话框变成非阻塞记录；命令结束后 guard.disarm() 恢复原生 API。
+ * 把同步阻塞的对话框变成非阻塞记录；命令结束后由后台派发 `ema2-guard-disarm`
+ * 文档事件恢复原生 API。
  *
  * 这个文件必须是自包含 IIFE，因为既会作为动态注册的 document_start content
  * script，也会由 chrome.scripting.executeScript 注入。
@@ -11,7 +12,7 @@
 (function ema2PageGuard() {
   // 修改 wrappers/restore 逻辑时递增；旧版本页面会在下一次命令注入时被替换。
   // 同步提升 background.js 的 GUARD_PROTOCOL_VERSION，让升级后的首次启动全量清理。
-  const GUARD_VERSION = 3;
+  const GUARD_VERSION = 4;
   const prior = window.__ema2_guard;
   if (prior && prior.version >= GUARD_VERSION) return;
 
@@ -218,16 +219,21 @@
     wrapped = false;
   };
 
+  const disarm = () => {
+    state.armed = false;
+    state.lease = '';
+    restore();
+  };
   state.arm = (lease) => {
     state.armed = true;
     state.lease = String(lease || '');
     install();
   };
-  state.disarm = () => {
-    state.armed = false;
-    state.lease = '';
-    restore();
-  };
+  // 不向页面暴露可调用的 disarm()：后台通过同一个文档事件触发释放。
+  // 页面仍能伪造事件（它拥有同一个 JS realm），但不会因为一个公开方法被误调用。
+  try {
+    document.addEventListener('ema2-guard-disarm', disarm, true);
+  } catch (_) { /* ignore */ }
 
   // 从永久覆盖的 v1 升级时，立即恢复原生 API；真正的 arm 由 armed helper 执行。
   if (legacy) {
