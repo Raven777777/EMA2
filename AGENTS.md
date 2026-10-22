@@ -56,6 +56,12 @@ ema2 server stop            # 收尾：关 daemon
 7744 不通不会自动拉起 daemon，只报 `relay_not_running`。
 参数不确定先 `ema2 <cmd> --help`；脚本语法 `ema2 act --help`。
 
+复合调用（少起几次 CLI）：`ema2 read --url <url>` 一次完成 open+read；
+`ema2 act --steps 'click e12@d1; fill e15 "hi"; press e15 Enter'` 或
+`ema2 act --script flow.ema2` 一次执行多个动作；
+`ema2 act click e12@d1 --wait-for "text=\"Done\" timeout=5s"` 把动作和等待合并；
+`ema2 read --tabs "1,2"` / `ema2 read --urls "u1,u2"` 并发读多个页面。
+
 `server` 后首次 `status` 若为 `extension=disconnected last_ping=never`，等 2–3s 再查；
 重连需人工点扩展图标 → 端口 7744 → 重连。
 
