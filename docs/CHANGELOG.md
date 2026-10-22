@@ -1,5 +1,94 @@
 # 变更记录
 
+## v2.4.2.5 — 正确性与并发加固
+
+修掉“命令成功但结果是假的”，并补齐并发、关闭与落盘路径的可信度。工具仍是 11 个，
+不新增命令、不改退出码语义。
+
+### P0 修复
+
+- **`act --wait-for` 不再把动作前的回填当本次响应**：动作前记录网络水位
+  （epoch + seq + `actionStartedAt`）；动作结束后实况条目按 seq 水位过滤，
+  `performance` 回填条目还要求 `startedAt` 不早于动作起点（缺失即跳过），
+  动作前已存在的历史资源条目因此永远不会参与匹配。
+  该 tab 从未装过 hook、没有可信基线时，从当前水位往后看，命中行带 `baseline_lost=1`
+  提示起点不可信。此前新标签页会把页面资源回填当成 `response=200 ...` 并 exit 0。
+
+### CLI 与脚本
+
+- **`waitFor` 支持含空格的值**：`selector="#main a"`、`text="保存 成功"` 在 `--wait-for`
+  与 `.ema2` 脚本里都能表达；解析改为只分词一次、按第一个 `=` 切分，不再二次 `join(" ")`。
+- **定位参数互斥**：`ref` 与 `selector=` / `target=` 只能三选一（单步、`--steps`、`--script`
+  走同一个校验）；同时给多个直接 `invalid_argument`，不再静默以 ref 为准。
+- **flag 解析**：支持 `--flag=value`；同一个 flag 重复出现报 `invalid_argument`，
+  不再取最后一个。
+- **数值校验**：`--delta-y` 拒绝 `nan` / `inf`；`scroll down|up <n>` 的次数限定 1..1000
+  （`1e30` 这类值在解析阶段就拒绝）。
+- **脚本容错**：`.ema2` 文件允许 UTF-8 BOM（首行自动去掉），并支持行尾 `#` 注释。
+- **步数上限**：脚本 1..20 步；20 步脚本再加一个 `--wait-for` 是合法的 21 步，
+  先校验脚本再注入 waitFor，不再误报 `too_many_steps`。
+- **`batch --urls` 可重复**：`--urls u1 --urls u2` 与逗号分隔等价；URL 自带逗号时，
+  因为逗号仍是分隔符，只能拆成多次传入。
+
+### 扩展
+
+- **per-tab 串行化**：`executeTool` 把调用挂到目标 tab 的串行链上，同一 tab 的
+  act/settle、read、snapshot、js、observe、shot 按提交顺序执行，不同 tab 仍并发；
+  `batch` 外层不排队（否则等自己），`tabs` 与不带 `tabId` 的 `open` 也不排队。
+- **`lastAct` 按 tab 分槽**：并发 act 不再互相覆盖上下文，`await` 只读动作所属 tab 的槽。
+- **debugger 竞态**：attach 超时后补偿 detach，避免占着 debugger 不放；
+  `press`/`type` 遇到 `debugger_timeout` 不再重放（避免输入/按键执行两次）。
+- **console 错误统计**：`console_errors` 改用水位（seq）增量统计，不再把历史错误
+  重复算进本次动作。
+- **snapshot**：页面 helper 缺失时明确报 `helpers_missing`（此前可能静默空快照）；
+  helper `href` 截断到 2048 字符；ref 表加 5000 条软上限，超大页面不会无限增长。
+- **截图**：释放 `createImageBitmap` 产生的 bitmap，连续截图不再累积内存。
+- **page guard v5**：原生 API 只保留在 IIFE 闭包里（不再挂到 `window.__ema2_guard`）；
+  新增只读 `probe()` 三态验证（无 guard / 无法验证 / `armed===false && wrapped===false`）；
+  arm 租约带随机 nonce，disarm 事件与后台释放都必须回显同一 lease；验证失败的 tab
+  保留跟踪并在下次 release/启动重试（内部诊断 `console.warn('guard_unverified')`，
+  不是 CLI 错误码）；guard 作用域收窄到本次命令的目标 tab（`commandGuardTargetTabs`），
+  其他标签的新文档立即自行 disarm。
+
+### daemon
+
+- **keepalive 半开检测**：连续 30s（3 个 keepalive 周期）收不到扩展任何消息就摘除连接，
+  `status` 不再长期显示 `connected`。
+- **有界发送队列**：发往扩展的通道容量 64；队列满只算拥塞（keepalive 丢弃并记日志），
+  不误判断线。
+- **消息分类**：带 `method` 的入站消息按请求处理，不再被当成某个 pending 请求的响应；
+  迟到/无法归属的消息不会解决错误的调用。
+- **`/shutdown` 语义**：立即打断在途请求（返回 503 `shutting_down`），并给 3s 硬期限；
+  期限到仍未结束就强制退出，不再让一条卡住的命令拖住关闭流程。
+- **`server stop`**：等到 PID 真正消失才输出 `relay=stopped`；端口已关闭但进程还活着时
+  报 `shutdown_failed`，不谎报成功。
+- **`call_extension` 错误分类**：扩展未连接/连接中途丢失 → 503，等响应超时 → 504，
+  关闭中 → 503 `shutting_down`。
+
+### 落盘
+
+- **原子写**：截图/HAR 等落盘统一走“同目录临时文件 + `sync_all` + rename”，
+  失败时清理临时文件，不再出现半截文件。
+- **目录型 `--out`**：`shot --out` / `observe --har` 指向目录（或以 `/` 结尾）时自动拼
+  `shot-<timestamp>.png` / `har-<timestamp>.har`。
+- **截图后缀**：只接受 `png` / `jpg` / `jpeg`，其他后缀报 `invalid_argument`。
+
+### 验收与契约
+
+- **`verify.py`**：版本从 `contract/runtime.json` 读取，不再硬编码；启动前校验 daemon 与
+  扩展版本，旧 daemon/旧脚本直接判 FAIL；清理移入 `finally`；新增 P0-1（历史回填负例+正例）、
+  P1-2（`waitFor selector="#main a"`）、P1-3（`ref` + `--selector` 必须 exit 1）真机回归。
+- **`reloadextension.py`**：改用扩展卡片按钮**实际所在窗口**执行点击，多窗口场景不再点错。
+- **契约断言**：19 个超时键全部有断言；工具子命令集合与 `TOOL_NAMES` 全等；
+  relay 新增 6 个测试。
+- **门禁结果**：`cargo test` 124 passed；扩展 17 个模块；
+  `python scripts/verify.py --skip-real-edge` 报告 58 个错误码已文档化。
+
+### 版本
+
+- 对外产品/扩展 `2.4.2.5`；`guardVersion` / `guardProtocolVersion` 5；`helpersVersion` 21；
+  工具仍 11 个；Cargo crate metadata 仍为 SemVer `2.4.2`。
+
 ## v2.4.2.4 — read 回退与输出提示
 
 减少 `read` 的一次性往返和截断后的多轮续读，并补齐 `open` 的对话框输出文档；不新增命令、
@@ -15,6 +104,8 @@
   `popup_blocked=1`，明确自动关闭/拦截不代表用户确认；`ema2 init` 模板同步。
 - **验收**：新增真机用例覆盖地标回退和首次截断预算提示；`cargo test` / clippy / fmt /
   `verify.py` 全部通过。
+- **工具**：新增 `scripts/reloadextension.py`（pywinauto/UIA 按扩展卡片按钮重载，
+  不依赖固定坐标）。
 - 版本：对外产品/扩展 `2.4.2.4`；Cargo crate metadata 仍为 SemVer `2.4.2`。
 
 ## v2.4.2.3 — act 的可验证终点

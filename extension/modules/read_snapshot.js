@@ -237,10 +237,16 @@ async function snapshotTool(args) {
   let data;
   try {
     data = await runInTab(tab.id, (filterName, budgetValue, cursorValue, nearRef, showValues) => {
+      // helper 缺失时先回一个明确结果：直接调用会抛 TypeError，被 failInjection
+      // 归类成 snapshot_failed，掩盖“页面没装 helper”这个真实原因。
+      if (!window.__ema2_helpers) return { kind: 'helpers_missing' };
       return window.__ema2_helpers.snapshot(filterName, budgetValue, cursorValue, nearRef, showValues);
     }, [filter, budget, cursor, args.near || null, args.values === true || filter === 'form']);
   } catch (error) {
     await failInjection(tab, error, 'taking the snapshot');
+  }
+  if (data && data.kind === 'helpers_missing') {
+    fail('helpers_missing', 'page helpers are not installed', 'reload the tab and retry');
   }
   if (!data) fail('snapshot_failed', 'snapshot produced no data', 'retry');
   const parts = [data.header];

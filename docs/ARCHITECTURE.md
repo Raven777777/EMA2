@@ -48,12 +48,19 @@ EMA2 是**一个单文件 exe + 一个 MV3 扩展**。exe 既能以后台 daemon
 - 同时挂 WS 升级和 HTTP handler，共享同一个 `TcpListener`；
 - 扩展断线不会退出 daemon，扩展 watchdog 每 30s 重连；
 - 每 10s 向扩展发 `ping`，防止 MV3 service worker 闲置回收；
+- 发往扩展的通道是**有界队列**（容量 64）。队列满只算拥塞：keepalive 丢弃并记日志，
+  连接不会因此被判死；工具调用仍按 pending 表等响应或超时。
+- keepalive 同时做**半开检测**：连续 30s（3 个 keepalive 周期）没有收到扩展任何消息，
+  就主动摘除该连接，`/health` 回到 `extension=disconnected`，避免 `status` 长期假在线。
+- `/shutdown` 触发 graceful shutdown 时会立即通知在途请求返回 `shutting_down`（503），
+  并给 3s 硬期限；期限到仍未结束就强制退出，不再让一条卡住的命令拖住整个 daemon。
 - `/shutdown` 或 Ctrl+C 触发 graceful shutdown，退出时删除自己写的 PID 文件。
 
 ### `ema2 server stop`
 
 1. `POST /shutdown`；
-2. 最多等 6s 确认端口关闭；
+2. 最多等 6s，确认端口关闭**且 PID 真的消失**，才输出 `relay=stopped`；
+   端口已关闭但进程还活着时报 `shutdown_failed`，不谎报成功；
 3. 卡死时读 PID 文件，确认进程名仍是 `ema2` 后 `taskkill /T /F`（Unix 用 `/proc/<pid>/exe` 校验 + `kill -TERM`）；
 4. 已停止时输出 `relay=not_running`，退出 0。
 
@@ -99,6 +106,8 @@ CLI 全部走 `POST /cmd`：
 
 成功：HTTP 200 + `{"result": <扩展 result>}`；参数错 400，扩展未连 503，
 扩展超时 504。工具业务错误仍是 200 + `result.isError=true`，由 CLI 转成 stderr + 退出码。
+`call_extension` 统一分类：扩展未连接或连接中途丢失 → 503（`extension_not_connected` /
+`relay_error`）；等响应超时 → 504（`extension_error`）；daemon 正在关闭 → 503 `shutting_down`。
 
 `GET /health` 返回 daemon/扩展状态，`ema2 status` 再调用一次 `tabs list` 补
 `tabs=/active_tab=` 摘要。
@@ -144,6 +153,23 @@ CLI 参数
 - pending 表按扩展连接 generation 隔离；旧连接的迟到响应不会解决新请求。
 - CLI 中途断开时 `PendingGuard` 清掉 pending 条目。
 
+## 并发模型
+
+扩展侧不再用一把全局锁，而是**按 tab 串行**：
+
+- `executeTool` 先解析目标 tab（显式 `tabId`，否则当前活动标签），把调用挂到
+  `tab:<id>` 的串行链上；同一 tab 上的 act/settle、read、snapshot、js、observe、shot
+  按提交顺序执行，不同 tab 之间仍然并发。链上前一条失败不会阻断后一条。
+- `tabs` 命令整体不排队：它的子命令操作标签页本身，不进页面执行链；`batch` **外层不排队**——
+  它内部的每个子命令都会各自调用 `executeTool` 排队，外层再持锁会等自己（自锁）。
+  单块之间因此仍可并行。
+- `open` 不带 `tabId` 是新建标签，没有可争用的页面状态，不排队；显式给 `tabId` 时
+  与该 tab 的其他命令互斥。
+- `lastAct` 上下文按 tab 分槽保存，写入串行化且按 `updatedAt` 取较新值；
+  `await` 只读对应 tab 的槽，不会被另一个 tab 的并发 act 覆盖。
+- daemon 侧 pending 仍按扩展连接 generation 隔离，per-tab 串行只约束扩展里的执行顺序，
+  不改变每个请求各自的超时预算。
+
 ## act settle / await
 
 动作执行和页面稳定是两件事：
@@ -166,35 +192,46 @@ CLI 参数
   `expect=ok condition=... ms=...`，超时为 `wait_timeout` 并带最后 URL/文本。
   页面条件是单一条件，不能和 `url`/`status` 混用；核心不判断业务成功与否。
 
-## command guard 生命周期
+## command guard 生命周期（v5）
 
 - manifest 不再永久注入页面 guard；普通浏览和 daemon 空闲时不覆盖任何页面 API。
 - 页面命令开始时登记 guard lease；第一个 lease 通过
   `chrome.scripting.registerContentScripts` 动态注册 MAIN world、document_start、
   all-frames 的 `page_guard.js` + `page_guard_armed.js`，match 限定 `http(s)`，
   覆盖导航后的新文档，租约结束注销。
-- 每个 RPC 有独立的 `guardContext`：租约带 token，释放时按 token 扣减，
-  重复释放/超时兜底不会误扣别的命令。watchdog 触发后延迟
-  `COMMAND_GUARD_ABANDON_GRACE_MS` 强制释放该上下文持有的租约，租约存活上限
-  因此被约束为 `watchdog + 5000ms`；上下文关闭后迟到的新租约立即释放。
+- **原生 API 只留在闭包里**：`original.alert/confirm/prompt/print/open` 不会被挂到
+  `window.__ema2_guard`（旧版本暴露过后页面可以直接改写回去）。页面能看到的只有只读探针
+  `probe()` 和受控方法；`armed` 是 getter，不可重定义。
+- **`probe()` 三态**：没有 guard → `{guard:false}`（已干净）；有 guard 但没有
+  `probe()`（v5 之前）→ `verified:false`，不能凭 `armed:false` 这种裸布尔判定；
+  有 `probe()` → `verified:true`，只有 `armed===false && wrapped===false` 才算真正恢复。
+  probe 自身抛异常时保守地当作仍被包装。
+- **arm 租约 nonce**：每次 arm 生成随机 lease，页面只接受带同一 lease 的
+  `ema2-guard-disarm` 事件；后台 release 也必须回显该 lease，伪造的布尔值无法通过验证。
+- **guard 作用域收窄到本次命令的目标 tab**（`commandGuardTargetTabs`）：只有目标 tab
+  上报的 `ema2/guard-armed` 会拿到非零租约并进入清理集合；长命令期间用户在别的标签
+  打开的页面拿到 `lease=0`，bridge 会立即让它自行 disarm，不吞无关页面的对话框。
 - 对已经打开的 tab，扩展立即注入并 arm；读取、快照、动作、等待、JS、观测、
   上传和截图都在租约内执行。`open` 先导航，再 arm 最终文档。
 - 扩展只记录真正被 arm 过的 tab（`ensurePageGuard` + document_start 新文档上报），
   不再每条命令扫全部标签。该集合写入 `chrome.storage.session`
   （`ema2_command_guard_tabs`），service worker 重启后仍能继续清理。
 - 最后一个 lease 结束时**先**注销动态脚本，**再**对记录过的 tab 广播
-  `ema2-guard-disarm` 文档事件；`page_guard.js` 不再向页面暴露可调用的 `disarm()`。
+  `ema2-guard-disarm` 文档事件。
   disarm 分 top frame 和 all-frames 两次执行并分别验证：只有 top frame 与所有
-  可脚本化 frame 都确认恢复，tab 才移出跟踪集合并持久化；受限/刚导航的 frame
-  不能让 top frame 一起失败，也不能被成功结果掩盖。未验证的 tab 留待下次
-  release/启动重试。每个 tab 的清理有单独时限，整批还有总上限；卡在原生对话框里
-  的渲染进程不能拖死后续命令。释放窗口内仍在加载的新文档由 ISOLATED world
-  bridge 询问租约，已归零就立即自行恢复原生 API。
+  可脚本化 frame 都经 `probe()` 确认恢复，tab 才移出跟踪集合并持久化；受限/刚导航的
+  frame 不能让 top frame 一起失败，也不能被成功结果掩盖。
+- **验证失败保留 tab 跟踪**：未通过的 tab 留在 `commandGuardTabs` 里，下次 release/启动
+  继续重试，并打一条内部诊断 `console.warn('[EMA2] guard_unverified tab=...')`。
+  这个标签只出现在扩展控制台，不是 CLI 错误码，命令退出码不受影响。
+- 每个 tab 的清理有单独时限，整批还有总上限；卡在原生对话框里的渲染进程不能拖死
+  后续命令。释放窗口内仍在加载的新文档由 ISOLATED world bridge 询问租约，
+  已归零就立即自行恢复原生 API。
 - alert/confirm/prompt/print/window.open 以及赋值型 `onbeforeunload` 恢复原生行为。
-- `page_guard.js` 默认 disarmed；从旧 v1/v2 升级时使用原生 descriptor 恢复页面，
+- `page_guard.js` 默认 disarmed；从旧版本升级时先恢复原生 API，再用 `probe()` 复核；
   v1 的 own `onbeforeunload` accessor 不会被当成原生引用。
 - `ema2_guard_protocol` 标记避免每次 service worker 唤醒都全量清理已升级页面；
-  修改 guard 清理协议时与 `page_guard.js` 的 `GUARD_VERSION` 一起提升。
+  修改 guard 清理协议时与 `page_guard.js` 的 `GUARD_VERSION`（当前 5）一起提升。
 - guard 注册失败不影响工具调用；页面若主动弹出同步对话框，仍由 watchdog
   返回 `tool_timeout`。
 

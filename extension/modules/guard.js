@@ -47,6 +47,11 @@ async function persistCommandGuardTabs() {
  * document_start 阶段出现的对话框；已经打开的 tab 由这里立即注入并 arm。
  */
 async function ensurePageGuard(tabId) {
+  // 必须先登记作用域再注入：page_guard_armed.js 在 executeScript 返回前就会向
+  // SW 要租约，晚一步登记会被当成无关标签拿到 lease=0 而立刻 disarm。
+  if (Number.isInteger(tabId)) {
+    commandGuardTargetTabs.set(tabId, (commandGuardTargetTabs.get(tabId) || 0) + 1);
+  }
   try {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
@@ -124,16 +129,26 @@ async function runGuardDisarm(tabId, allFrames) {
     world: 'MAIN',
     func: () => {
       const guard = window.__ema2_guard;
-      if (!guard) return { guard: false, disarmed: false };
-      // 新版本只暴露事件；页面里没有可被误调用的 guard.disarm()。
-      try {
-        document.dispatchEvent(new CustomEvent('ema2-guard-disarm'));
-      } catch (_) { /* fall through to legacy below */ }
-      // 旧版本（v3 及更早）没有事件监听，保留一次性兼容路径。
-      if (guard.armed && typeof guard.disarm === 'function') {
-        try { guard.disarm(); } catch (_) { /* report below */ }
+      if (!guard) return { guard: false, verified: true, disarmed: true };
+      // disarm() 只恢复原生 API（安全方向），有就直接调用。
+      if (typeof guard.disarm === 'function') {
+        try { guard.disarm(); } catch (_) { /* 交给 probe 判定 */ }
       }
-      return { guard: true, disarmed: guard.armed !== true };
+      // v5 之前没有 probe()：不能凭页面里的 armed 布尔值判断，交给升级路径重试。
+      let probe = null;
+      try {
+        probe = typeof guard.probe === 'function' ? guard.probe() : null;
+      } catch (_) {
+        probe = null;
+      }
+      if (!probe) return { guard: true, verified: false, disarmed: false };
+      return {
+        guard: true,
+        verified: true,
+        // 必须 armed 与 wrapped 同时为 false 才算真的解开。
+        disarmed: probe.armed === false && probe.wrapped === false,
+        version: probe.version,
+      };
     },
   });
   return Array.isArray(results) ? results : [];
@@ -142,7 +157,10 @@ async function runGuardDisarm(tabId, allFrames) {
 function guardDisarmed(results) {
   return Array.isArray(results) && results.length > 0 && results.every(item => {
     const value = item && item.result;
-    return !!value && (value.disarmed === true || value.guard === false);
+    if (!value) return false;
+    if (value.guard === false) return true;
+    // 只认 probe 验证过的结果，不接受 armed:false 这种裸布尔。
+    return value.verified === true && value.disarmed === true;
   });
 }
 
@@ -161,7 +179,11 @@ async function upgradePassiveGuard(tabId, allFrames) {
  */
 async function disarmPageGuard(tabId) {
   try { await chrome.tabs.get(tabId); }
-  catch (_) { return true; } // tab 已关闭：没有页面可残留
+  catch (_) {
+    // tab 已关闭：顺手清掉作用域计数（dispatch.js 的 onRemoved 只清跟踪集合）。
+    commandGuardTargetTabs.delete(tabId);
+    return true;
+  }
   let top;
   try { top = await runGuardDisarm(tabId, false); }
   catch (_) { return false; }
@@ -203,7 +225,8 @@ async function allScriptableTabIds() {
  */
 async function disarmPageGuards(tabIds, budget = COMMAND_GUARD_SWEEP_MS) {
   const ids = [...new Set(tabIds)].filter(id => Number.isInteger(id));
-  if (!ids.length) return true;
+  if (!ids.length) return 0;
+  const failed = [];
   const results = await within(
     Promise.all(ids.map(async id => {
       const ok = await within(
@@ -211,13 +234,21 @@ async function disarmPageGuards(tabIds, budget = COMMAND_GUARD_SWEEP_MS) {
         COMMAND_GUARD_DISARM_MS,
         false,
       );
-      if (ok === true && commandGuardTabs.delete(id)) await persistCommandGuardTabs();
-      return ok === true;
+      if (ok === true) {
+        if (commandGuardTabs.delete(id)) await persistCommandGuardTabs();
+        return true;
+      }
+      // 验证失败的 tab 留在跟踪集合里，下次 release/启动继续重试。
+      failed.push(id);
+      console.warn(`[EMA2] guard_unverified tab=${id}`);
+      return false;
     })),
     budget,
     null,
   );
-  return Array.isArray(results) && results.every(Boolean);
+  // 整批超时时无法区分哪些 tab 已验证，按全部失败上报。
+  if (!Array.isArray(results)) return ids.length;
+  return failed.length;
 }
 
 async function disarmTrackedPageGuards(budget = COMMAND_GUARD_SWEEP_MS) {
@@ -260,13 +291,24 @@ async function releaseCommandGuard(lease) {
   lease.released = true;
   try {
     await enqueueCommandGuard(async () => {
+      // 作用域计数：最后一个引用该 tab 的租约释放后，bridge 会立刻让新文档 disarm。
+      if (Number.isInteger(lease.tabId)) {
+        const count = commandGuardTargetTabs.get(lease.tabId) || 0;
+        if (count <= 1) commandGuardTargetTabs.delete(lease.tabId);
+        else commandGuardTargetTabs.set(lease.tabId, count - 1);
+      }
       if (!commandGuardLeaseTokens.delete(lease)) return;
       if (commandGuardLeases > 0) commandGuardLeases -= 1;
       if (commandGuardLeases !== 0) return;
       // 顺序很重要：先注销动态脚本，再 disarm。反序会在注销窗口里把正在
       // 加载的新文档 arm 掉，而 sweep 已经结束，guard 会永久残留。
       await unregisterCommandGuard();
-      await disarmTrackedPageGuards();
+      const failed = await disarmTrackedPageGuards();
+      // 全局 0 时作用域集合必须为空；openTool 直接 ensurePageGuard 的 tab
+      // 没有对应的租约可递减，这里一并清掉，避免残留把后续命令的范围放大。
+      commandGuardTargetTabs.clear();
+      // fail-open：不因 guard 失败让命令报错，但也不假装清理成功。
+      if (failed) console.warn(`[EMA2] guard_release_incomplete tabs=${failed}`);
     });
   } catch (_) { /* guard failure must not fail the command */ }
 }
@@ -360,7 +402,12 @@ async function withCommandGuard(name, args, run, context) {
   if (context) context.leases.add(lease);
   try {
     const targetTabId = await guardTargetForTool(name, args);
-    if (targetTabId !== undefined && args.tabId === undefined) args.tabId = targetTabId;
+    if (targetTabId !== undefined) {
+      if (args.tabId === undefined) args.tabId = targetTabId;
+      // 作用域计数已在 ensurePageGuard 注入前登记，这里只把它挂到租约上，
+      // 由 release 时递减。
+      lease.tabId = targetTabId;
+    }
     return await run();
   } finally {
     if (context) context.leases.delete(lease);

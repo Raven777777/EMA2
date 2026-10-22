@@ -5,15 +5,16 @@
 ## 当前版本
 
 ```text
-exe        2.4.2.4（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.2.4
-helper     20
+exe        2.4.2.5（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.2.5
+helper     21
+guard      5（guardProtocolVersion 5）
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
 ```
 
 `await` 是 CLI 命令，映射到 `wait` 工具，不增加第 12 个工具。
 
-分发包只带 exe + `ema2 init` 生成的 AGENTS.md；**脚本语法以 `ema2 act --help` 为准**，
+分发包 = `ema2.exe` + `extension/` + `ema2 init` 生成的 `AGENTS.md`；**脚本语法以 `ema2 act --help` 为准**，
 不要在用户可见 hint 里引用仓库文档。
 
 ## 最短心智模型
@@ -100,7 +101,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前 Rust 测试：**87 passed**。
+运行 `cargo test` 查看当前用例数（本版为 **124**）。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -181,6 +182,25 @@ cargo test
 
 ## 已知弱点与下一步优先级
 
+### 残余风险（v2.4.2.5）
+
+下面这些是**设计边界或有意留下的取舍**，不是待修的 P0/P1：
+
+- **a) page guard 与页面共享 realm，不是安全边界。** guard 只是“命令期间不卡死”的优化，
+  页面仍可替换 `__ema2_guard`，或直接改写 `window.alert`/`confirm` 绕过记录。
+  不要把 `dialog_opened=` 当成页面真的确认过，也不要拿 guard 做权限控制。
+- **b) daemon 3s 硬退出可能留下未清理的 `.tmp`。** 数据文件本身是原子写
+  （临时文件 + `sync_all` + rename），不会出现半截内容；但极端情况下进程被强制结束时，
+  同目录可能残留临时文件，可安全删除。
+- **c) `--out` 无后缀路径会被当作目录。** `shot --out ./shots` 会拼
+  `shot-<timestamp>.png` 而不是写一个无后缀文件；想写具体文件请显式带 `.png`/`.jpg`/`.jpeg`。
+- **d) 多 Edge 窗口/profile 时 `reloadextension.py` 只操作按钮所在的窗口。**
+  脚本按 UIA 找卡片并点击，不会替你确认是哪个 profile；多 profile 场景仍需人工核对。
+- **e) 真机验收必须由人跑前台 Edge。** CI 只能跑 `python scripts/verify.py --skip-real-edge`
+  （静态契约 + 文档链接 + 错误码漂移），真实前台窗口无法自动化替代。
+- **f) `relay` 收到未知 method 现在只 warn 后忽略。** 旧行为会直接断开连接；
+  现在保持连接，但未知消息不会得到响应，排查时看 daemon 日志。
+
 ### P1：act 结果可信度（v2.2.1 已收口）
 
 HN 真机出现过一次 `act click` 返回 `ok=1/1` 但页面没有导航，换 selector 后成功。
@@ -231,7 +251,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 ## 开发陷阱
 
 1. **修改页面 helper 必须提升 `__ema2_helpers_version`**
-   当前是 20；否则已打开页面继续用旧 helper。
+   当前是 21；否则已打开页面继续用旧 helper。
 
 2. **Edge 会按 manifest 版本缓存扩展脚本**
    行为没更新时提升 `extension/manifest.json` 版本，或在 `edge://extensions` 重新加载；
@@ -275,7 +295,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [TOOLS.md](TOOLS.md)
 3. `cargo test` / `clippy` / `fmt`
 4. `bin\ema2.exe server` + `status`，确认扩展连接（窗口必须在前台）
-5. `python scripts/verify.py` —— 135 项真机检查，跑不过就别改行为
+5. `python scripts/verify.py` —— 真机检查项数以脚本运行输出为准，跑不过就别改行为
 6. 打开一个真实网站，跑 `open → snapshot → act → read`
 7. 修改行为前先问：这是通用原语，还是网站特例？
 8. 任何动作相关改动，必须真机验证“成功就是真的成功”

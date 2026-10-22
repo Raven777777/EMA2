@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use super::ToolCall;
-use super::shared::{TokenCursor, parse_duration_secs, parse_port};
+use super::shared::{TokenCursor, parse_duration_secs, parse_port, split_flag};
 
 /// `ema2 batch` 的全部 token（`<tool>` 之后）都由这里解析：
 /// 顶层识别 `--tab-ids/--urls/--concurrency/--port`，其余交给目标工具的
@@ -21,7 +21,8 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
     cursor.advance();
 
     let mut tab_ids: Option<String> = None;
-    let mut urls: Option<String> = None;
+    // `--urls` 可重复：URL 自带逗号时，逗号拆分无法表达，只能分多次传入。
+    let mut urls: Vec<String> = Vec::new();
     let mut reuse: Option<String> = None;
     let mut concurrency: Option<u32> = None;
     let mut port_override: Option<u16> = None;
@@ -33,7 +34,7 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
                 let value = cursor.take_flag_value(inline, "batch", flag)?;
                 match flag {
                     "--tab-ids" => tab_ids = Some(value),
-                    "--urls" => urls = Some(value),
+                    "--urls" => urls.push(value),
                     "--reuse" => reuse = Some(value),
                     "--concurrency" => {
                         let parsed: u32 = value
@@ -82,13 +83,13 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
         }
     }
 
-    if tab_ids.is_some() && urls.is_some() {
+    if tab_ids.is_some() && !urls.is_empty() {
         return Err("batch: --tab-ids and --urls are mutually exclusive".into());
     }
-    if reuse.is_some() && urls.is_none() {
+    if reuse.is_some() && urls.is_empty() {
         return Err("batch: --reuse session only applies to --urls".into());
     }
-    if tab_ids.is_none() && urls.is_none() {
+    if tab_ids.is_none() && urls.is_empty() {
         return Err("batch: pass --tab-ids \"1,2\" or --urls \"u1,u2\"".into());
     }
     if tool == "open" && tab_ids.is_some() {
@@ -104,12 +105,23 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
         }
         arguments["tabIds"] = json!(parsed);
     }
-    if let Some(list) = urls {
-        let parsed: Vec<&str> = list
-            .split(',')
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .collect();
+    if !urls.is_empty() {
+        let mut parsed: Vec<&str> = Vec::new();
+        for list in &urls {
+            for part in list
+                .split(',')
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                let lower = part.to_ascii_lowercase();
+                if !lower.starts_with("http://") && !lower.starts_with("https://") {
+                    return Err(format!(
+                        "batch: --urls entry {part:?} is not http(s); commas are used as separators — pass a URL that contains a comma with a separate --urls flag"
+                    ));
+                }
+                parsed.push(part);
+            }
+        }
         if parsed.is_empty() || parsed.len() > 8 {
             return Err("batch: --urls must contain 1..8 urls".into());
         }
@@ -129,15 +141,6 @@ pub fn build_batch(tokens: &[String]) -> Result<ToolCall, String> {
     let mut call = ToolCall::new("batch", arguments);
     call.port = port_override;
     Ok(call)
-}
-
-fn split_flag(token: &str) -> (&str, Option<String>) {
-    if let Some((flag, value)) = token.split_once('=')
-        && flag.starts_with("--")
-    {
-        return (flag, Some(value.to_owned()));
-    }
-    (token, None)
 }
 
 fn numeric_flag(context: &str, flag: &str, value: String) -> Result<Value, String> {
@@ -402,6 +405,42 @@ mod tests {
             .is_err()
         );
         assert!(build_batch(&[]).is_err());
+    }
+
+    #[test]
+    fn batch_urls_can_repeat_and_explain_comma_splitting() {
+        // 重复 --urls 追加而不是覆盖：URL 自带逗号时只能这样传。
+        let call = build_batch(&[
+            "read".into(),
+            "--urls".into(),
+            "https://a.example/".into(),
+            "--urls".into(),
+            "https://b.example/".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            args_of(&call)["urls"],
+            json!(["https://a.example/", "https://b.example/"])
+        );
+
+        // 兼容逗号拆分；拆出的段不是 http(s) 时，错误必须点明逗号是分隔符。
+        let call = build_batch(&[
+            "read".into(),
+            "--urls".into(),
+            "https://a.example/,https://b.example/".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["urls"].as_array().unwrap().len(), 2);
+
+        let error = build_batch(&[
+            "read".into(),
+            "--urls".into(),
+            "https://a.example/,https://b.example/?x=1,2".into(),
+        ])
+        .err()
+        .expect("expected an error");
+        assert!(error.contains("commas are used as separators"), "{error}");
+        assert!(error.contains("separate --urls flag"), "{error}");
     }
 
     #[test]

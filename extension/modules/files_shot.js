@@ -110,34 +110,51 @@ function resultText(value) {
   return String(value == null ? '' : value);
 }
 
+/** 标注结果的 base64 上限：再大就不适合经 relay 回传，应落盘。 */
+const ANNOTATED_MAX_BASE64 = 12 * 1024 * 1024;
+
 async function annotateScreenshot(dataUrl, marks, dpr, format) {
+  // 这条路径同时持有原图 base64、解码后的 bitmap、OffscreenCanvas 和输出 blob，
+  // 每一份都是整图级别的大对象：用完必须立刻释放，否则 SW 峰值能到数百 MB。
   const blob = await (await fetch(dataUrl)).blob();
-  const bitmap = await createImageBitmap(blob);
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(bitmap, 0, 0);
-  ctx.scale(dpr || 1, dpr || 1);
-  ctx.font = '600 12px sans-serif';
-  ctx.textBaseline = 'top';
-  for (const mark of marks) {
-    ctx.strokeStyle = '#ff2d55';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(mark.x, mark.y, mark.w, mark.h);
-    const label = String(mark.ref).replace(/^e(\d+)@.*$/, '$1').replace(/^e/, '');
-    const width = ctx.measureText(label).width + 8;
-    const top = Math.max(0, mark.y - 16);
-    ctx.fillStyle = '#ff2d55';
-    ctx.fillRect(mark.x, top, width, 16);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(label, mark.x + 4, top + 2);
+  let bitmap = null;
+  let canvas = null;
+  try {
+    bitmap = await createImageBitmap(blob);
+    canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    ctx.scale(dpr || 1, dpr || 1);
+    ctx.font = '600 12px sans-serif';
+    ctx.textBaseline = 'top';
+    for (const mark of marks) {
+      ctx.strokeStyle = '#ff2d55';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(mark.x, mark.y, mark.w, mark.h);
+      const label = String(mark.ref).replace(/^e(\d+)@.*$/, '$1').replace(/^e/, '');
+      const width = ctx.measureText(label).width + 8;
+      const top = Math.max(0, mark.y - 16);
+      ctx.fillStyle = '#ff2d55';
+      ctx.fillRect(mark.x, top, width, 16);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(label, mark.x + 4, top + 2);
+    }
+    const outBlob = await canvas.convertToBlob({ type: format === 'jpeg' ? 'image/jpeg' : 'image/png' });
+    const bytes = new Uint8Array(await outBlob.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return { base64: btoa(binary), mime: 'image/' + (format === 'jpeg' ? 'jpeg' : 'png') };
+  } finally {
+    // 每个 createImageBitmap 都必须显式 close（否则解码缓冲要等 GC）；
+    // 中间 canvas 置 0 让引擎立刻回收后备缓冲区。
+    if (bitmap) bitmap.close();
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
   }
-  const outBlob = await canvas.convertToBlob({ type: format === 'jpeg' ? 'image/jpeg' : 'image/png' });
-  const bytes = new Uint8Array(await outBlob.arrayBuffer());
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-  }
-  return { base64: btoa(binary), mime: 'image/' + (format === 'jpeg' ? 'jpeg' : 'png') };
 }
 
 async function activeTabInWindow(windowId) {
@@ -207,6 +224,13 @@ async function shotTool(args) {
   }
   const dpr = await runInTab(tab.id, () => window.devicePixelRatio || 1, []).catch(() => 1);
   const annotated = await annotateScreenshot(dataUrl, marks, dpr, format);
+  // 标注图要整份经 relay 回传，base64 过大时会长时间占住 SW/daemon 内存；
+  // 超过上限直接报错，让调用方改用 --out 落盘（path= 输出契约不变）。
+  if (annotated.base64.length > ANNOTATED_MAX_BASE64) {
+    fail('payload_too_large',
+      `annotated screenshot is ${annotated.base64.length} bytes of base64 (limit ${ANNOTATED_MAX_BASE64})`,
+      'use `ema2 shot --annotate --out <file>` to write the image to disk, or capture a smaller window');
+  }
   const content = [];
   const prefix = activated ? `activated=1 tab=${tab.id}\n` : '';
   if (marks.length) content.push({ type: 'text', text: prefix + marksText + '\nmarks=' + marks.length });

@@ -23,7 +23,6 @@ async function navigationTiming(tabId) {
 }
 
 async function openTool(args) {
-  await clearLastAct();
   const wait = args.wait || 'load';
   let tab;
   let reuse = 'new';
@@ -72,6 +71,9 @@ async function openTool(args) {
     // 新标签必须让用户看得见：窗口提到前台（测试也依赖前台语义）。
     try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* ignore */ }
   }
+  // 只清本次导航的 tab 槽：lastAct 已按 tab 分槽，不能因为 open 把其它标签
+  // 正在进行的 act 上下文一起抹掉（否则并发 await 会找不到上下文）。
+  await clearLastAct(tab.id);
   let loaded = true;
   let docTimeout = 0;
   // --timeout 覆盖“打开标签 + 等文档 + 装 hook + 读 timing/focus”全流程。

@@ -2,7 +2,7 @@
 # EMA2 · 用 CLI 操作真实 Edge
 
 本文件由 `ema2 init` 生成。EMA2 无 MCP、无 token、无授权页、无配置文件；AI 直接 shell 调用 `ema2`。
-默认端口 **7744**。分发包只带 `ema2.exe` 和本文件；**`ema2 <cmd> --help` 是用户侧权威文档**。
+默认端口 **7744**。分发包 = `ema2.exe` + `extension/` + 本文件；**`ema2 <cmd> --help` 是用户侧权威文档**。
 
 ## 最小流程
 
@@ -32,8 +32,8 @@ ema2 server stop            # 收尾：关 daemon
 - 退出码：`0` 成功 / `1` 参数错 / `2` 中继不可用 / `3` 扩展未连 / `4` 工具执行错。
 - 端口：默认 **7744**；`--port N` 时 server 与所有命令必须一致。
 - 时间：`--timeout` 单位秒；`wait/await/waitFor` 可写 `5s` / `500ms`。
-- `budget`：返回文本字符预算，默认 **4000**，范围 200–200000；`cursor` 用上次 `next` 续读。
-- 列表尾部固定 `total/shown/next`；`next=none` 表示读完，否则原样传给 `--cursor`/`--since`。
+- `budget`：返回文本字符预算，默认 4000（js 8000 / observe 3000），范围 200–200000；`cursor` 用上次 `next` 的数字续读。
+- 列表尾部固定 `total/shown/next`；`next=none` 表示读完，否则把 `next` 的数字传给 `--cursor`/`--since`。
 
 ## 命令签名
 
@@ -66,8 +66,8 @@ ema2 server stop            # 收尾：关 daemon
 - `act`：默认最多 settle 3s；`settle=pending` **不是失败**，接 `ema2 await 10s`。
   点链接没导航给 `nav=none`；可导航 `<a>` 无任何变化才自动重试一次，输出 `retried=1`。
   普通按钮最多 800ms；SPA 只改 DOM 时约 1s 后按 `nav=none` 结算。
-- `act --wait-for`：动作 settle 后验证后置条件。`url=`/`status=` 等响应/导航；
-  `text=`/`textGone=`/`selector=` 等页面条件（与 `ema2 wait` 同义，一次一个）。
+- `act --wait-for`：动作 settle 后验证后置条件。`url=`/`status=` 等响应/导航，只匹配本次动作之后的请求；
+  `text=`/`textGone=`/`selector=` 等页面条件（与 `ema2 wait` 同义，一次一个），含空格要加引号（`text="保存 成功"`）。
   成功多一行 `expect=ok condition=... ms=...`；超时 `wait_timeout` + `expect=timeout`。
 - `.ema2` 脚本：只允许 11 个 act 动作 + `await 10s` + `waitFor url=... status=... timeout=5s`
   或 `waitFor text=... timeout=5s`；
@@ -104,7 +104,7 @@ Must：
 - 导航/刷新后重新 `snapshot` 再操作 ref。
 - `settle=pending` 后接 `ema2 await 10s`。
 - `open focused=0` 时先 `tabs activate <id>`。
-- `read` 被截断时按 `--cursor next` 续读，保持同一 `--mode`。
+- `read` 被截断时把上一次输出里的 `next` 数字传给 `--cursor` 续读，保持同一 `--mode`。
 - 收尾执行 `tabs close --session` 和 `server stop`。
 
 Never：

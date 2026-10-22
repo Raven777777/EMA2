@@ -93,7 +93,27 @@ fn main() {
             )),
             port,
         ),
-        cli::Command::Act { tokens } => run_built(cli::build_act(&tokens), port),
+        cli::Command::Act { tokens } => {
+            // trailing_var_arg + allow_hyphen_values 会把 `act click e1 --help` 的
+            // `--help` 当成位置参数；这里先识别（`--` 之后的除外），避免它变成
+            // “unknown flag”。`type e1 --help` 要输入字面量时用 `--` 分隔。
+            let mut wants_help = false;
+            for token in &tokens {
+                if token == "--" {
+                    break;
+                }
+                if token == "--help" || token == "-h" {
+                    wants_help = true;
+                    break;
+                }
+            }
+            if wants_help {
+                print_subcommand_help("act");
+                0
+            } else {
+                run_built(cli::build_act(&tokens), port)
+            }
+        }
         cli::Command::Wait {
             kind,
             value,
@@ -248,6 +268,7 @@ fn start_server(port: u16) -> i32 {
             return port_in_use(port);
         }
         if let Ok(Some(status)) = child.try_wait() {
+            terminate_child(&mut child);
             eprintln!(
                 "error=relay_start_failed msg=daemon exited early ({status}) hint={}",
                 log_hint(&log_path)
@@ -257,6 +278,9 @@ fn start_server(port: u16) -> i32 {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // 超时后自己 spawn 的 daemon 可能仍在跑：必须先收尸，否则会留下一个
+    // 没有 PID 记录、CLI 也不认识的孤儿进程。
+    terminate_child(&mut child);
     eprintln!(
         "error=relay_start_failed msg=daemon did not answer /health within 12s hint={}",
         log_hint(&log_path)
@@ -265,8 +289,29 @@ fn start_server(port: u16) -> i32 {
     2
 }
 
+/// 杀掉并回收自己 spawn 的子进程；失败（如已经退出）忽略。
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn stop_server(port: u16) -> i32 {
+    let recorded_pid = read_pid_file(port);
     if !port_alive(port) {
+        // 端口关闭不等于进程退出：axum graceful shutdown 会先 drop listener，
+        // 再等在途请求（可能正在等扩展）。此时必须继续等 PID 真的消失。
+        if let Some(pid) = recorded_pid.filter(|&pid| process_alive(pid)) {
+            if wait_until_down(port, Some(pid), Duration::from_secs(6)) {
+                cleanup_pid_file(port);
+                out_line(format!("relay=stopped port={port} pid={pid}"));
+                return 0;
+            }
+            eprintln!(
+                "error=shutdown_failed msg=127.0.0.1:{port} is not listening but pid={pid} is still running hint=wait a moment and retry; {} was kept because the process is alive",
+                paths::pid_file(port).display()
+            );
+            return 2;
+        }
         cleanup_pid_file(port);
         out_line(format!("relay=not_running port={port}"));
         return 0;
@@ -283,16 +328,17 @@ fn stop_server(port: u16) -> i32 {
             );
             return 2;
         }
-        if let Some(pid) = read_pid_file(port)
+        if let Some(pid) = recorded_pid
+            && pid_file_allows_kill(port, pid)
             && kill_process(pid)
-            && wait_until_down(port, Duration::from_secs(4))
+            && wait_until_down(port, Some(pid), Duration::from_secs(4))
         {
             cleanup_pid_file(port);
             out_line(format!("relay=stopped port={port} pid={pid} forced=1"));
             return 0;
         }
         eprintln!(
-            "error=shutdown_failed msg=127.0.0.1:{port} is still listening but /health did not answer hint=close the daemon process manually; check {}",
+            "error=shutdown_failed msg=127.0.0.1:{port} is still listening but /health did not answer hint=close the daemon process manually; check {} (the port check prevents killing a reused PID)",
             paths::pid_file(port).display()
         );
         return 2;
@@ -302,7 +348,7 @@ fn stop_server(port: u16) -> i32 {
         .get("pid")
         .and_then(Value::as_u64)
         .map(|pid| pid as u32)
-        .or_else(|| read_pid_file(port));
+        .or(recorded_pid);
 
     let _ = client::request(
         port,
@@ -311,7 +357,7 @@ fn stop_server(port: u16) -> i32 {
         Some("{}"),
         Duration::from_secs(3),
     );
-    if wait_until_down(port, Duration::from_secs(6)) {
+    if wait_until_down(port, pid, Duration::from_secs(6)) {
         cleanup_pid_file(port);
         out_line(format!(
             "relay=stopped port={port}{}",
@@ -320,17 +366,19 @@ fn stop_server(port: u16) -> i32 {
         return 0;
     }
 
-    // server 卡死：用 PID 文件兜底，但必须先确认这个 PID 确实还是 ema2。
+    // server 卡死：用 PID 文件兜底，但必须先确认这个 PID 确实还是 ema2，
+    // 且 PID 文件记录的端口与目标一致（防 PID 复用误杀其他实例）。
     if let Some(pid) = pid
+        && pid_file_allows_kill(port, pid)
         && kill_process(pid)
-        && wait_until_down(port, Duration::from_secs(4))
+        && wait_until_down(port, Some(pid), Duration::from_secs(4))
     {
         cleanup_pid_file(port);
         out_line(format!("relay=stopped port={port} pid={pid} forced=1"));
         return 0;
     }
     eprintln!(
-        "error=shutdown_failed msg=cannot stop the daemon on 127.0.0.1:{port} hint=close the daemon process manually or reboot; check {}",
+        "error=shutdown_failed msg=cannot stop the daemon on 127.0.0.1:{port} hint=close the daemon process manually or reboot; check {} (the port check prevents killing a reused PID)",
         paths::pid_file(port).display()
     );
     2
@@ -754,6 +802,19 @@ fn exit_for_code(code: &str) -> i32 {
 
 // ---------------------------------------------------------------- helpers
 
+/// 打印某个子命令的帮助。
+///
+/// `act` 使用 trailing_var_arg，clap 不会把位置参数之后的 `--help` 当帮助标志；
+/// 入口在解析前捕获它，这里复用同一份 clap 定义，避免维护第二份帮助文本。
+fn print_subcommand_help(name: &str) {
+    use clap::CommandFactory as _;
+    let mut command = Cli::command();
+    if let Some(subcommand) = command.find_subcommand_mut(name) {
+        let _ = subcommand.print_help();
+        println!();
+    }
+}
+
 fn health(port: u16) -> Option<Value> {
     client::get_json(port, "/health", Duration::from_secs(2))
 }
@@ -816,26 +877,66 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     }
 }
 
+/// PID 文件内容：`"<pid> <port> <started_at_unix>"`；旧格式只有 pid。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PidRecord {
+    pid: u32,
+    /// 旧格式没有端口；`None` 表示不做端口校验。
+    port: Option<u16>,
+}
+
+impl PidRecord {
+    fn parse(text: &str) -> Option<Self> {
+        let mut fields = text.split_whitespace();
+        let pid = fields.next()?.parse().ok()?;
+        let port = fields.next().and_then(|port| port.parse().ok());
+        Some(Self { pid, port })
+    }
+
+    /// 这条记录是否还允许对 `(port, pid)` 执行强杀。
+    fn allows_kill(&self, port: u16, pid: u32) -> bool {
+        self.pid == pid && self.port.is_none_or(|recorded| recorded == port)
+    }
+}
+
+fn read_pid_record(port: u16) -> Option<PidRecord> {
+    let text = fs::read_to_string(paths::pid_file(port)).ok()?;
+    PidRecord::parse(&text)
+}
+
 fn read_pid_file(port: u16) -> Option<u32> {
-    fs::read_to_string(paths::pid_file(port))
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
+    read_pid_record(port).map(|record| record.pid)
+}
+
+/// 强杀前校验 PID 文件：PID 必须就是要杀的那个，记录的端口也必须匹配。
+///
+/// 文件名里已经有端口，但内容是判断“这个 PID 现在还是不是当初那一个”的唯一
+/// 依据：PID 被系统复用后，旧文件可能指向另一个 pid/端口的 ema2 实例。
+/// 没有 PID 文件时退化为调用方的镜像名检查（保持旧行为）。
+fn pid_file_allows_kill(port: u16, pid: u32) -> bool {
+    read_pid_record(port).is_none_or(|record| record.allows_kill(port, pid))
 }
 
 fn cleanup_pid_file(port: u16) {
     let _ = fs::remove_file(paths::pid_file(port));
 }
 
-fn wait_until_down(port: u16, timeout: Duration) -> bool {
+/// 只有“端口不再监听”且“PID 对应进程确实不存在”才算退出。
+///
+/// graceful shutdown 先 drop listener，端口会早于进程消失；单独用端口判断会
+/// 让 `server stop` 在旧 daemon 仍持有扩展 WS 时误报成功。
+fn wait_until_down(port: u16, pid: Option<u32>, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        // 不用 /health 判断：卡死的 daemon 仍会接受 TCP，只是不应答。
-        if !port_alive(port) {
+    loop {
+        let down = !port_alive(port) && pid.is_none_or(|pid| !process_alive(pid));
+        if down {
             return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    !port_alive(port)
 }
 
 fn port_alive(port: u16) -> bool {
@@ -918,6 +1019,30 @@ fn tasklist_image_is_ema2(listed: &str) -> bool {
     })
 }
 
+/// `tasklist /FI "PID eq N"` 的输出里是否有这个 PID（不关心镜像名）。
+#[cfg(windows)]
+fn tasklist_lists_pid(listed: &str, pid: u32) -> bool {
+    listed.lines().any(|line| {
+        let mut fields = line.split(',');
+        let image = fields.next().unwrap_or_default().trim().trim_matches('"');
+        let id = fields.next().unwrap_or_default().trim().trim_matches('"');
+        !image.is_empty() && id == pid.to_string()
+    })
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let listed = Process::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    tasklist_lists_pid(&listed, pid)
+}
+
 #[cfg(windows)]
 fn kill_process(pid: u32) -> bool {
     let pid_text = pid.to_string();
@@ -936,6 +1061,19 @@ fn kill_process(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    // kill(pid, 0) 只做存在性检查：0 = 存活；EPERM 也说明进程存在。
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(unix)]
@@ -966,6 +1104,7 @@ mod tests {
         write_atomic,
     };
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     fn scratch_dir(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -1049,6 +1188,28 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn tasklist_pid_check_ignores_the_image_name() {
+        assert!(super::tasklist_lists_pid(
+            "\"ema2.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"",
+            1234
+        ));
+        assert!(super::tasklist_lists_pid(
+            "\"python.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"",
+            1234
+        ));
+        assert!(!super::tasklist_lists_pid(
+            "\"ema2.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"",
+            4321
+        ));
+        // tasklist 找不到 PID 时的固定提示不能被当成命中。
+        assert!(!super::tasklist_lists_pid(
+            "INFO: No tasks are running which match the specified criteria.",
+            1234
+        ));
+    }
+
     #[test]
     fn output_paths_are_normalized_without_touching_disk() {
         assert_eq!(
@@ -1059,6 +1220,52 @@ mod tests {
             lexical_normalize(Path::new("out/./nested/../shot.png")),
             PathBuf::from("out/shot.png")
         );
+    }
+
+    #[test]
+    fn pid_file_accepts_new_and_legacy_formats() {
+        let record = super::PidRecord::parse("1234 7744 1750000000\n").unwrap();
+        assert_eq!(record.pid, 1234);
+        assert_eq!(record.port, Some(7744));
+
+        // 旧格式只有 pid：仍然可用，但不做端口校验。
+        let record = super::PidRecord::parse("1234\n").unwrap();
+        assert_eq!(record.pid, 1234);
+        assert_eq!(record.port, None);
+
+        assert!(super::PidRecord::parse("not-a-pid 7744 0").is_none());
+        assert!(super::PidRecord::parse("").is_none());
+    }
+
+    #[test]
+    fn pid_file_port_mismatch_is_detected() {
+        let record = super::PidRecord::parse("42 7744 0").unwrap();
+        assert!(record.allows_kill(7744, 42));
+        assert!(!record.allows_kill(7745, 42), "port must match");
+        assert!(!record.allows_kill(7744, 43), "pid must match");
+
+        // 旧格式没有端口：只能校验 PID。
+        let legacy = super::PidRecord::parse("42").unwrap();
+        assert!(legacy.allows_kill(7744, 42));
+        assert!(!legacy.allows_kill(7744, 43));
+    }
+
+    #[test]
+    fn current_process_is_alive_and_zero_is_not() {
+        assert!(super::process_alive(std::process::id()));
+        assert!(!super::process_alive(0));
+    }
+
+    #[test]
+    fn wait_until_down_returns_true_for_a_free_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(super::wait_until_down(
+            port,
+            None,
+            Duration::from_millis(200)
+        ));
     }
 
     #[cfg(windows)]

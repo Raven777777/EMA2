@@ -585,6 +585,21 @@ async function activeElementInfo(tabId) {
   }, [], undefined, 1).catch(() => ({ tag: '', role: '', name: '', formAction: '', invalid: false }));
 }
 
+/** 超时回读：目标控件（或当前焦点）的当前值，只用于判断输入是否已经落地；绝不把值回传给调用方。 */
+async function readControlValue(tabId, spec) {
+  return runInTab(tabId, (locator) => {
+    const helpers = window.__ema2_helpers;
+    let el = null;
+    try {
+      if (helpers) el = helpers.find(locator.ref || null, locator.selector || null, locator.target || null);
+    } catch (_) { el = null; }
+    if (!el) el = document.activeElement;
+    if (!el) return '';
+    if (typeof el.value === 'string') return el.value;
+    return el.isContentEditable ? String(el.textContent || '') : '';
+  }, [spec], undefined, 1).catch(() => '');
+}
+
 /** 可信按键：CDP Input.dispatchKeyEvent 会触发浏览器默认行为（Tab/Backspace/Enter/Ctrl+A）。 */
 async function pressViaDebugger(tab, step) {
   const spec = {
@@ -605,18 +620,33 @@ async function pressViaDebugger(tab, step) {
   }
   const combo = parseKeyComboBackground(String(step.key || ''));
   if (!combo.key) return { found: true, ok: false, code: 'missing_key', message: 'press requires key' };
+  const where = spec.ref ? `ref=${spec.ref}` : spec.selector ? `selector=${spec.selector}` : spec.target ? `target=${spec.target}` : 'target=active';
+  let timedOutAfter = null;
   try {
     await withDebugger(tab.id, async () => {
       await dispatchTrustedKey(tab.id, combo, prepared.after ? prepared.after.tag : prepared.before.tag);
     }, { timeoutMs: 8000, queueWaitMs: 15000 });
   } catch (error) {
-    // debugger 被占用时退回页面合成事件；结果里会标 trusted=0。
-    if (error instanceof ToolError && ['debugger_attach_failed', 'debugger_attach_timeout', 'debugger_busy', 'debugger_timeout'].includes(error.code)) {
+    if (error instanceof ToolError && error.code === 'debugger_timeout') {
+      // 超时是「结果未知」而不是「没有投递」：按键可能已经生效，重放会二次派发
+      // （Enter 可能提交两次表单）。回读焦点，相对按键前有变化就按已生效处理。
+      const after = await activeElementInfo(tab.id);
+      const beforeTag = prepared.after ? prepared.after.tag : prepared.before.tag;
+      const beforeName = prepared.after ? prepared.after.name : prepared.before.name;
+      if (beforeTag === after.tag && beforeName === after.name) {
+        fail('debugger_timeout', 'press result is unknown: the key may or may not have been delivered',
+          'inspect the page (snapshot/read) before retrying; do not blindly repeat');
+      }
+      timedOutAfter = after;
+    } else if (error instanceof ToolError
+      && ['debugger_attach_failed', 'debugger_attach_timeout', 'debugger_busy'].includes(error.code)) {
+      // 这几类错误确定没有投递（attach 没成功 / 队列没轮到），可以安全降级到页面合成事件。
       return null;
+    } else {
+      throw error;
     }
-    throw error;
   }
-  const after = await activeElementInfo(tab.id);
+  const after = timedOutAfter || await activeElementInfo(tab.id);
   const focusChanged = (prepared.after ? prepared.after.tag : prepared.before.tag) !== after.tag
     || (prepared.after ? prepared.after.name : prepared.before.name) !== after.name;
   const validation = (prepared.formInvalid || after.invalid) && combo.key === 'Enter' ? 'failed' : '';
@@ -625,11 +655,10 @@ async function pressViaDebugger(tab, step) {
   const effect = combo.key === 'Enter' && ((formAction && !validation) || after.tag === 'a')
     ? 'nav'
     : 'page';
-  const where = spec.ref ? `ref=${spec.ref}` : spec.selector ? `selector=${spec.selector}` : spec.target ? `target=${spec.target}` : 'target=active';
   return {
     found: true,
     ok: true,
-    info: `key=${step.key} ${where} trusted=1 focus_changed=${focusChanged ? 1 : 0} active=${after.tag || 'none'}`,
+    info: `key=${step.key} ${where} trusted=1 focus_changed=${focusChanged ? 1 : 0} active=${after.tag || 'none'}${timedOutAfter ? ' result=unknown' : ''}`,
     effect,
     nextUrl: effect === 'nav' ? formAction : '',
     validation,
@@ -653,6 +682,7 @@ async function typeViaDebugger(tab, step) {
   // number/date/range 等不支持 Input.insertText：交给页面 setValue（同样会校验并回滚）。
   if (!prepared.insertable) return null;
   const text = step.text === undefined ? '' : String(step.text);
+  let timedOut = false;
   try {
     await withDebugger(tab.id, async () => {
       await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.insertText', { text });
@@ -664,10 +694,22 @@ async function typeViaDebugger(tab, step) {
       queueWaitMs: 20000,
     });
   } catch (error) {
-    if (error instanceof ToolError && ['debugger_attach_failed', 'debugger_attach_timeout', 'debugger_busy', 'debugger_timeout'].includes(error.code)) {
+    if (error instanceof ToolError && error.code === 'debugger_timeout') {
+      // insertText 超时同样是「结果未知」：回读控件当前值，已包含待输入文本就按生效处理，不再重放。
+      // 字段本来就有同样文本时可能误判为成功，但重复插入的代价更高。
+      const current = text ? await readControlValue(tab.id, spec) : '';
+      if (!current || !current.includes(text)) {
+        fail('debugger_timeout', 'type result is unknown: the text may or may not have been inserted',
+          'inspect the field value (snapshot/read) before retrying; do not blindly repeat');
+      }
+      timedOut = true;
+    } else if (error instanceof ToolError
+      && ['debugger_attach_failed', 'debugger_attach_timeout', 'debugger_busy'].includes(error.code)) {
+      // 确定没有投递：退回页面 setValue 路径。
       return null;
+    } else {
+      throw error;
     }
-    throw error;
   }
   const after = await activeElementInfo(tab.id);
   const validation = step.submit && after.invalid ? 'failed' : '';
@@ -676,7 +718,7 @@ async function typeViaDebugger(tab, step) {
   return {
     found: true,
     ok: true,
-    info: `wrote=1 chars=${text.length} trusted=1${step.submit ? ` submit=${validation ? 0 : 1}` : ''}`,
+    info: `wrote=1 chars=${text.length} trusted=1${step.submit ? ` submit=${validation ? 0 : 1}` : ''}${timedOut ? ' result=unknown' : ''}`,
     effect,
     nextUrl: effect === 'nav' ? formAction : '',
     validation,

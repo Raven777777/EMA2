@@ -39,7 +39,8 @@ docs/
 ## 归档
 
 [`archive/`](archive/) 里的文件**不代表当前行为**，只用于追溯设计过程。
-每个文件头部都标注了归档状态与对应的现行文档；包括 v2.3.0 外部评测报告与 v2.4.1 发布收尾建议。
+每个文件头部都标注了归档状态与对应的现行文档；包括 v2.3.0 外部评测报告、v2.4.1 发布收尾建议，
+以及 `code-review-2026-10-22.md`（2026-10-22 代码审查，问题已在 v2.4.2.5 修复）。
 
 ## 维护脚本
 
@@ -52,5 +53,5 @@ docs/
 ```bash
 cargo test                                   # 含“错误码必须写进 TOOLS.md”的漂移测试
 python scripts/verify.py --skip-real-edge     # 同一件事的快速版
-python scripts/verify.py                      # 真实前台 Edge 冒烟（135 项）
+python scripts/verify.py                      # 真实前台 Edge 冒烟（项数以输出为准）
 ```

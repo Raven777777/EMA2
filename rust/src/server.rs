@@ -22,7 +22,7 @@ use tokio::sync::Notify;
 use crate::paths;
 use crate::relay;
 use crate::save;
-use crate::state::RelayState;
+use crate::state::{CallError, RelayState};
 use crate::tools;
 
 /// daemon 主循环：绑定单端口，WS 与 HTTP 共用 listener，直到 `/shutdown`。
@@ -43,6 +43,25 @@ pub async fn run(port: u16) -> i32 {
     let state = RelayState::new(output_dir, port);
     relay::spawn_keepalive(state.clone(), Duration::from_secs(10));
     let shutdown = Arc::new(Notify::new());
+
+    // 硬期限：graceful shutdown 会等所有在途请求跑完，而 batch/js 可能正在等
+    // 扩展（最长 600s）。收到关闭信号后最多再给 3s，然后直接退出，避免
+    // “端口已关闭但旧 daemon 还握着扩展 WS”导致新实例收不到扩展。
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = state.wait_for_shutdown() => {}
+                _ = tokio::signal::ctrl_c() => {
+                    state.begin_shutdown();
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            tracing::warn!("graceful shutdown did not finish within 3s; exiting");
+            std::process::exit(0);
+        });
+    }
+
     let app = router(state.clone(), shutdown.clone());
 
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
@@ -53,7 +72,15 @@ pub async fn run(port: u16) -> i32 {
         }
     };
     let pid_path = paths::pid_file(port);
-    if let Err(error) = std::fs::write(&pid_path, format!("{}\n", std::process::id())) {
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    // 记录 port/started_at：`server stop` 强杀前可以确认 PID 没被复用。
+    if let Err(error) = std::fs::write(
+        &pid_path,
+        format!("{} {port} {started_at}\n", std::process::id()),
+    ) {
         tracing::warn!("cannot write PID file {}: {error}", pid_path.display());
     }
     tracing::info!(
@@ -63,11 +90,13 @@ pub async fn run(port: u16) -> i32 {
 
     let graceful = {
         let shutdown = shutdown.clone();
+        let state = state.clone();
         async move {
             tokio::select! {
                 _ = shutdown.notified() => {}
                 _ = tokio::signal::ctrl_c() => {}
             }
+            state.begin_shutdown();
         }
     };
     let result = axum::serve(listener, app)
@@ -77,7 +106,7 @@ pub async fn run(port: u16) -> i32 {
     // 只删除自己写的 PID 文件，避免误删同端口重启后的新实例。
     if std::fs::read_to_string(&pid_path)
         .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
+        .and_then(|text| text.split_whitespace().next()?.parse::<u32>().ok())
         == Some(std::process::id())
     {
         let _ = std::fs::remove_file(&pid_path);
@@ -303,7 +332,7 @@ async fn cmd(
     if !tools::contains(&request.tool) {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid_argument",
+            "unknown_tool",
             &format!("unknown tool: {}", request.tool),
             "tools: tabs open read snapshot act wait js observe files shot batch",
         );
@@ -311,7 +340,7 @@ async fn cmd(
     let Some(arguments) = request.args.as_object().cloned() else {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid_argument",
+            "invalid_arguments",
             "args must be a JSON object",
             "pass tool arguments as a JSON object",
         );
@@ -341,13 +370,26 @@ async fn cmd(
     let timeout = tools::timeout_for(&request.tool, &arguments);
     let mut response = match state.call_extension(&call, timeout).await {
         Ok(value) => value,
-        Err(message) => {
-            return error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "extension_error",
-                &message,
-                "check `ema2 status`; the extension must be connected and responsive",
-            );
+        Err(error) => {
+            // 没有扩展/扩展刚断是“可重连”的 503；只有扩展收下却没回才是 504。
+            let (status, code, hint) = match &error {
+                CallError::NotConnected | CallError::Lost => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "extension_not_connected",
+                    "check the extension popup: its port must match (default 7744), then click reconnect or reload the extension",
+                ),
+                CallError::Timeout(_) => (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "extension_error",
+                    "check `ema2 status`; the extension must be connected and responsive",
+                ),
+                CallError::ShuttingDown => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "shutting_down",
+                    "the daemon is stopping; wait a moment and start it again with `ema2 server`",
+                ),
+            };
+            return error_response(status, code, &error.to_string(), hint);
         }
     };
     // JSON-RPC 层错误（未知 method / 扩展内部异常）没有 result；不能把它当成空成功。
@@ -434,19 +476,22 @@ async fn health(
 
 /// `POST /shutdown`：`ema2 server stop` 的干净通道。
 async fn handle_shutdown(
-    State((_state, shutdown)): State<(Arc<RelayState>, Arc<Notify>)>,
+    State((state, shutdown)): State<(Arc<RelayState>, Arc<Notify>)>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(response) = check_access(&headers, Access::Command) {
         return response;
     }
-    // notify_one 会保留一个 permit：即使 handler 早于 graceful future 的首次 poll，
-    // shutdown 也不会丢；notify_waiters 在没有已注册 waiter 时是空操作。
+    // 先让在途 call_extension 立即返回 ShuttingDown（watch 不会丢信号），
+    // 再唤醒 graceful future。notify_one 额外保留一个 permit：handler 可能
+    // 早于 graceful future 的首次 poll，notify_waiters 此时是空操作。
+    state.begin_shutdown();
+    shutdown.notify_waiters();
     shutdown.notify_one();
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        r#"{"stopping":true}"#,
+        json!({ "relay": "stopping", "stopping": true }).to_string(),
     )
         .into_response()
 }
@@ -516,7 +561,19 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = body_json(response).await;
-        assert_eq!(body["code"], "invalid_argument");
+        assert_eq!(body["code"], "unknown_tool");
+    }
+
+    #[tokio::test]
+    async fn non_object_arguments_are_rejected() {
+        let (app, _) = app();
+        let response = app
+            .oneshot(post("/cmd", json!({ "tool": "tabs", "args": [] })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "invalid_arguments");
     }
 
     #[tokio::test]
@@ -688,14 +745,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_triggers_the_notify() {
+    async fn shutdown_triggers_the_notify_and_marks_the_state() {
         let state = RelayState::new(PathBuf::from("target/test-output"), 7744);
         let shutdown = Arc::new(Notify::new());
-        let app = router(state, shutdown.clone());
+        let app = router(state.clone(), shutdown.clone());
         let response = app.oneshot(post("/shutdown", json!({}))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["stopping"], true);
+        assert_eq!(body["relay"], "stopping");
+        assert!(state.is_shutting_down());
         // permit 必须保留给随后才被 poll 的 graceful future。
         assert!(
             tokio::time::timeout(Duration::from_millis(200), shutdown.notified())
@@ -705,11 +764,32 @@ mod tests {
         );
     }
 
+    /// 关闭过程中 /cmd 必须立刻返回 503 shutting_down，而不是等满工具超时。
+    #[tokio::test]
+    async fn cmd_reports_shutting_down_while_stopping() {
+        let (_app, state) = app();
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::state::EXT_CHANNEL_CAPACITY);
+        state.register_extension(tx);
+        state.begin_shutdown();
+
+        let app = router(state, Arc::new(Notify::new()));
+        let response = app
+            .oneshot(post(
+                "/cmd",
+                json!({ "tool": "tabs", "args": { "action": "list" } }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "shutting_down");
+    }
+
     /// JSON-RPC 错误没有 result；daemon 必须报错，而不是返回 200 + null 让 CLI 静默成功。
     #[tokio::test]
     async fn cmd_maps_json_rpc_error_to_extension_error() {
         let (_app, state) = app();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(crate::state::EXT_CHANNEL_CAPACITY);
         let generation = state.register_extension(tx);
 
         let call = {
@@ -760,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn cmd_forwards_to_the_extension_and_returns_its_result() {
         let (_app, state) = app();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(crate::state::EXT_CHANNEL_CAPACITY);
         let generation = state.register_extension(tx);
 
         let call = {

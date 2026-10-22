@@ -2,9 +2,12 @@
  * EMA2 page guard · 只在 EMA2 命令租约期间改变页面对话框行为。
  *
  * 默认状态是 disarmed：页面保留原生 alert/confirm/prompt/print/window.open。
- * 命令执行前由 page_guard_armed.js 或 modules/guard.js 调用 guard.arm()，
- * 把同步阻塞的对话框变成非阻塞记录；命令结束后由后台派发 `ema2-guard-disarm`
- * 文档事件恢复原生 API。
+ * 命令执行前由 page_guard_armed.js 或 modules/guard.js 调用 guard.arm() 拿到
+ * 随机 lease，把同步阻塞的对话框变成非阻塞记录；命令结束后由后台派发带同一
+ * lease 的 `ema2-guard-disarm` 文档事件恢复原生 API。
+ *
+ * 暴露对象只有只读探针（version/seq/events/armed/probe）和受控方法
+ * （arm/disarm/disarmWith）；原生 API 引用只存在于本闭包。
  *
  * 这个文件必须是自包含 IIFE，因为既会作为动态注册的 document_start content
  * script，也会由 chrome.scripting.executeScript 注入。
@@ -12,11 +15,14 @@
 (function ema2PageGuard() {
   // 修改 wrappers/restore 逻辑时递增；旧版本页面会在下一次命令注入时被替换。
   // 同步提升 contract/runtime.json 的 guardProtocolVersion，让升级后的首次启动全量清理。
-  const GUARD_VERSION = 4;
+  const GUARD_VERSION = 5;
   const prior = window.__ema2_guard;
-  if (prior && prior.version >= GUARD_VERSION) return;
+  // 页面与本脚本共享同一个 realm，版本号不是安全边界，只防误撞/误伪造：
+  // 旧实例必须同时提供 probe() 才认可，否则照样重装（v1-v4 都没有 probe）。
+  if (prior && prior.version >= GUARD_VERSION && typeof prior.probe === 'function') return;
 
   const MAX_EVENTS = 50;
+  // 原生 API 只留在本 IIFE 闭包里，绝不再挂到 window.__ema2_guard。
   // 旧 v1 会永久覆盖页面 API；优先复用它保存的原生引用，避免包装套包装。
   const original = prior && prior.original ? prior.original : {
     alert: window.alert,
@@ -41,12 +47,12 @@
 
   const state = {
     version: GUARD_VERSION,
-    armed: false,
-    lease: '',
     seq: 0,
     events: [],
-    original,
   };
+  // armed / activeLease 只存在于闭包；state 上只暴露一个只读 getter。
+  let armed = false;
+  let activeLease = '';
   let wrapped = false;
   let beforeUnloadHandler = null;
 
@@ -145,27 +151,27 @@
       record('dialog', {
         dialog: 'alert',
         message: text(message),
-        handled: state.armed ? 'dismissed' : 'passed',
+        handled: armed ? 'dismissed' : 'passed',
       });
-      if (!state.armed) return original.alert.call(window, message);
+      if (!armed) return original.alert.call(window, message);
     },
     confirm(message) {
-      const result = state.armed ? false : original.confirm.call(window, message);
+      const result = armed ? false : original.confirm.call(window, message);
       record('dialog', {
         dialog: 'confirm',
         message: text(message),
-        handled: state.armed ? 'dismissed' : 'passed',
+        handled: armed ? 'dismissed' : 'passed',
         result,
       });
       return result;
     },
     prompt(message, defaultValue) {
-      const result = state.armed ? null : original.prompt.call(window, message, defaultValue);
+      const result = armed ? null : original.prompt.call(window, message, defaultValue);
       record('dialog', {
         dialog: 'prompt',
         message: text(message),
         defaultValue: text(defaultValue),
-        handled: state.armed ? 'dismissed' : 'passed',
+        handled: armed ? 'dismissed' : 'passed',
         result,
       });
       return result;
@@ -174,9 +180,9 @@
       record('dialog', {
         dialog: 'print',
         message: 'window.print()',
-        handled: state.armed ? 'blocked' : 'passed',
+        handled: armed ? 'blocked' : 'passed',
       });
-      if (!state.armed) return original.print.call(window);
+      if (!armed) return original.print.call(window);
     },
     open(url, target, features) {
       let opened = null;
@@ -191,7 +197,7 @@
         target: text(target),
         blocked: !opened,
         error,
-        handled: state.armed ? 'observed' : 'passed',
+        handled: armed ? 'observed' : 'passed',
       });
       return opened;
     },
@@ -219,24 +225,86 @@
     wrapped = false;
   };
 
-  const disarm = () => {
-    state.armed = false;
-    state.lease = '';
+  const randomLease = () => {
+    try {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      let value = '';
+      for (const byte of bytes) value += byte.toString(16).padStart(2, '0');
+      return value;
+    } catch (_) {
+      // 非安全上下文/老浏览器没有 crypto.getRandomValues：退回 Math.random。
+      return `l${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    }
+  };
+
+  const disarmNow = () => {
+    armed = false;
+    activeLease = '';
     restore();
   };
-  state.arm = (lease) => {
-    state.armed = true;
-    state.lease = String(lease || '');
+
+  const armWith = (lease) => {
+    activeLease = lease ? String(lease) : randomLease();
+    armed = true;
     install();
+    return activeLease;
   };
-  // 不向页面暴露可调用的 disarm()：后台通过同一个文档事件触发释放。
-  // 页面仍能伪造事件（它拥有同一个 JS realm），但不会因为一个公开方法被误调用。
+
+  // disarm() 是安全方向（恢复原生 API），允许页面调用；disarmWith() 必须回显
+  // 本次 arm 的租约，伪造的布尔值无法通过。
+  const disarmWith = (lease) => {
+    if (!activeLease || String(lease) !== activeLease) return false;
+    disarmNow();
+    return true;
+  };
+
+  const probe = () => {
+    try {
+      return {
+        version: GUARD_VERSION,
+        armed,
+        wrapped: window.alert === wrappers.alert
+          || window.confirm === wrappers.confirm
+          || window.prompt === wrappers.prompt
+          || window.print === wrappers.print
+          || window.open === wrappers.open,
+      };
+    } catch (_) {
+      // 页面给 window 装了会抛异常的 accessor：保守地当作仍被包装。
+      return { version: GUARD_VERSION, armed, wrapped: true };
+    }
+  };
+
+  const onDisarmEvent = (event) => {
+    // 只接受带匹配租约的事件；旧的无 detail 事件在 v5 不再生效。
+    const detail = event && event.detail;
+    if (!detail || !activeLease || detail.lease !== activeLease) return;
+    disarmNow();
+  };
   try {
-    document.addEventListener('ema2-guard-disarm', disarm, true);
+    document.addEventListener('ema2-guard-disarm', onDisarmEvent, true);
   } catch (_) { /* ignore */ }
 
-  // 从永久覆盖的 v1 升级时，立即恢复原生 API；真正的 arm 由 armed helper 执行。
-  if (legacy) {
+  // 只读探针 + 受控方法：armed 只有 getter，方法不可枚举、不可重定义。
+  try {
+    Object.defineProperty(state, 'armed', {
+      configurable: false, enumerable: false, get: () => armed,
+    });
+  } catch (_) { /* ignore */ }
+  const expose = (key, value) => {
+    try {
+      Object.defineProperty(state, key, { value, enumerable: false, configurable: false });
+    } catch (_) { /* ignore */ }
+  };
+  expose('arm', armWith);
+  expose('disarm', disarmNow);
+  expose('disarmWith', disarmWith);
+  expose('probe', probe);
+
+  // 从 v1-v4 升级：旧 armed 文档上仍是旧 wrapper，且旧对象保存着原生引用。
+  // 先恢复原生 API，避免 v5 probe 看不到旧 wrapper 而误报已 disarm。
+  if (legacy || priorArmed) {
     try { window.alert = original.alert; } catch (_) { /* ignore */ }
     try { window.confirm = original.confirm; } catch (_) { /* ignore */ }
     try { window.prompt = original.prompt; } catch (_) { /* ignore */ }
@@ -246,4 +314,8 @@
   }
 
   window.__ema2_guard = state;
+  if (prior && prior !== state) {
+    // 旧对象可能仍被页面持有：删掉它保存的原生引用。
+    try { delete prior.original; } catch (_) { /* ignore */ }
+  }
 })();

@@ -244,4 +244,7 @@ async function observeTool(args) {
     }
   }
 
+  // 未知 kind 必须报错：否则会返回空内容 + 退出码 0，看起来像“没有日志”。
+  fail('invalid_argument', `unknown observe kind: ${kind === undefined ? '(missing)' : kind}`,
+    'use kind=console or kind=network');
 }

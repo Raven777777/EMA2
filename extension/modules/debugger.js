@@ -102,6 +102,37 @@ async function describeAttachFailure(tabId) {
   return parts.join(' ');
 }
 
+/**
+ * 有界 detach，并处理 attach/detach 的竞态。
+ * 先 detach 调用方记下的 target（可能只有 tabId），再用 getTargets() 复核：
+ * attach 超时后才落地的可能不是同一个 target，只能按 tabId 兜底。
+ * 只处理 attached === true 的 target；失败只 warn，绝不覆盖调用方原本的错误。
+ * expectAttach 用于「attach 可能迟到落地」的清理路径：即使当前没有 attached 的 target，
+ * 也按 400ms 间隔再看几次，而不是立刻放弃。
+ */
+async function detachDebuggerTarget(target, tabId, attempts = 3, expectAttach = false) {
+  const detachOne = async (item) => {
+    try { await withDeadline(chrome.debugger.detach(item), 2000, 'debugger_detach_timeout', 'detach timed out'); }
+    catch (error) { console.warn('[ema2] debugger detach failed', item, error && error.message || error); }
+  };
+  if (target) await detachOne(target);
+  let lingering = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    lingering = null;
+    try {
+      const targets = await chrome.debugger.getTargets();
+      lingering = targets.find(item => item.tabId === tabId && item.attached === true) || null;
+    } catch (error) {
+      console.warn('[ema2] debugger getTargets failed during detach', error && error.message || error);
+      return;
+    }
+    if (!lingering && !expectAttach) return;
+    if (lingering) await detachOne({ tabId, targetId: lingering.id });
+    if (attempt + 1 < attempts) await sleep(400);
+  }
+  if (lingering) console.warn('[ema2] debugger target still attached after detach', { tabId, targetId: lingering.id });
+}
+
 function withDebugger(tabId, run, options = {}) {
   const taskTimeout = options.timeoutMs || DEBUGGER_TASK_TIMEOUT_MS;
   const queueWait = options.queueWaitMs || DEBUGGER_QUEUE_TIMEOUT_MS;
@@ -113,16 +144,24 @@ function withDebugger(tabId, run, options = {}) {
     }
     const remaining = Math.min(taskTimeout, queueWait - waited);
     let attachError = null;
+    let attachTimedOut = false;
     let target = { tabId };
     // 扩展重载/DevTools 关闭的瞬间会偶发 attach 失败；非超时错误重试一次。
     for (let attempt = 0; attempt < 2; attempt++) {
+      // attach Promise 必须留住：withDeadline 超时只是放弃等待，attach 仍可能在后台落地。
+      const attachPromise = chrome.debugger.attach(target, '1.3');
       try {
-        await withDeadline(chrome.debugger.attach(target, '1.3'), Math.min(10000, remaining), 'debugger_attach_timeout', `cannot attach debugger to tab ${tabId}`);
+        await withDeadline(attachPromise, Math.min(10000, remaining), 'debugger_attach_timeout', `cannot attach debugger to tab ${tabId}`);
         attachError = null;
         break;
       } catch (error) {
         attachError = error;
-        if (error instanceof ToolError && error.code === 'debugger_attach_timeout') break;
+        if (error instanceof ToolError && error.code === 'debugger_attach_timeout') {
+          attachTimedOut = true;
+          // 先给它落地的机会，再统一清理；否则 detach 可能先于 attach 落地，tab 永久附着。
+          await Promise.race([attachPromise.catch(() => {}), sleep(2500)]);
+          break;
+        }
         if (attempt === 0) {
           await sleep(200);
           const byTarget = await attachByTargetId(tabId);
@@ -135,7 +174,10 @@ function withDebugger(tabId, run, options = {}) {
       }
     }
     if (attachError) {
-      if (attachError instanceof ToolError && attachError.code === 'debugger_attach_timeout') throw attachError;
+      // 失败退出前先清理：attach 可能已经迟到地附着成功。清理失败只 warn，
+      // 不能掩盖原始的 debugger_attach_timeout / debugger_attach_failed。
+      await detachDebuggerTarget(null, tabId, 3, true);
+      if (attachTimedOut) throw attachError;
       const detail = await describeAttachFailure(tabId);
       throw new ToolError('debugger_attach_failed',
         `cannot attach debugger to tab ${tabId}: ${attachError.message || attachError} | ${detail}`,
@@ -153,8 +195,8 @@ function withDebugger(tabId, run, options = {}) {
       }
       throw error;
     } finally {
-      try { await withDeadline(chrome.debugger.detach(target), 2000, 'debugger_detach_timeout', 'detach timed out'); }
-      catch (_) { /* ignore */ }
+      // 正常路径也要复核：attach 迟到落地（或第一次 detach 与它交错）时 tab 会保持附着。
+      await detachDebuggerTarget(target, tabId, 2);
     }
   });
   debuggerQueue = task.then(() => {}, () => {});
@@ -251,7 +293,7 @@ async function jsTool(args) {
     if (error.code === 'debugger_timeout') {
       fail('script_timeout',
         `JS did not finish within ${Math.round(jsTimeoutMs(args) / 1000)}s; execution was terminated`,
-        'simplify the expression, add --timeout, or use read/snapshot/wait instead of a long-running loop');
+        'Runtime.terminateExecution also stops any script the page itself was running in this tab (timers/promises may never settle); reload the tab if the page looks stuck. Simplify the expression, add --timeout, or use read/snapshot/wait instead of a long-running loop');
     }
     // 别的扩展占住 tab 的页面目标时 attach 会持续失败；js 是原语，不能跟着一起消失。
     if (error.code !== 'debugger_attach_failed' && error.code !== 'debugger_attach_timeout') throw error;

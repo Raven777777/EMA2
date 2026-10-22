@@ -221,12 +221,18 @@ def main() -> int:
             return fail(
                 "extension_not_found",
                 f"no {args.name!r} card with a reload button on {EXTENSIONS_URL} within {args.timeout:g}s",
-                "confirm Edge can open edge://extensions and the extension name matches",
+                "confirm Edge can open edge://extensions and the extension name matches; "
+                "confirm which Edge window/profile has the extension loaded "
+                "(with several windows this script only drives the window that owns the button)",
             )
-        card, button, label = found[1], found[2], found[3]
+        # 必须用命中按钮的那个窗口：多窗口/多 profile 时“面积最大窗口”可能是另一个。
+        edge, card, button, label = found
         click_method = click_button(edge, button)
         version = extension_version(card.window_text())
-        print(f"extension={args.name!r} version={version}")
+        print(
+            f"extension={args.name!r} version={version} "
+            f"pid={edge.element_info.process_id} window={edge.window_text()!r}"
+        )
         print(f"button={label!r} method={click_method} reloaded=1")
         return 0
     except Exception as exc:  # noqa: BLE001

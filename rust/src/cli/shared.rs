@@ -48,12 +48,23 @@ pub(super) fn set_opt<T: Into<Value>>(object: &mut Value, key: &str, value: Opti
     }
 }
 
+/// `--flag=value` → `("--flag", Some("value"))`；普通 token 原样返回。
+/// 只有以 `--` 开头的 token 才拆分，避免把 `selector=#x` 这类位置参数误当 flag。
+pub(super) fn split_flag(token: &str) -> (&str, Option<String>) {
+    if let Some((flag, value)) = token.split_once('=')
+        && flag.starts_with("--")
+    {
+        return (flag, Some(value.to_owned()));
+    }
+    (token, None)
+}
+
 /// 顺序读取 token 的游标；越界返回 None，错误文案由调用方的 context/flag 决定。
 ///
 /// act/batch 原来各自维护 `index` + `tokens.get(index)` 样板代码；行为完全一致：
 /// - `required_next` 取紧跟当前 flag 的值（`--flag value`），不前进；
 /// - `take_flag_value` 兼容 `--flag=value`，内联值只前进一格；
-/// - 其余情况由调用方显式 `advance` / `advance_by`。
+/// - 其余情况由调用方显式 `advance`。
 pub(super) struct TokenCursor<'a> {
     tokens: &'a [String],
     index: usize,
@@ -103,10 +114,6 @@ impl<'a> TokenCursor<'a> {
 
     pub(super) fn advance(&mut self) {
         self.index += 1;
-    }
-
-    pub(super) fn advance_by(&mut self, count: usize) {
-        self.index += count;
     }
 }
 

@@ -4,7 +4,10 @@
 
 /** 页面内 helper（作为 executeScript 的 func 注入，必须自包含）。 */
 function installHelpers() {
-  if (window.__ema2_helpers && window.__ema2_helpers_version === 20) {
+  // 版本只在这里声明一次：rust/src/tools.rs 的契约测试会解析下面这行
+  // `const NAME = N` 常量声明取版本号；页面里的判定与写入也都引用它，避免字面量漂移。
+  const HELPERS_VERSION = 21;
+  if (window.__ema2_helpers && window.__ema2_helpers_version === HELPERS_VERSION) {
     return { installed: false, handle: String(window.__ema2_doc_handle || '') };
   }
   const clean = (value) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
@@ -88,8 +91,9 @@ function installHelpers() {
     const showValues = () => !!window.__ema2_show_values;
     // href 必须是完整绝对 URL：scheme/host/query/fragment 都是定位信息，
     // 截断成 path 会让 AI 跳到同源错误地址或分不清 mailto/tel。
+    // 2048 只是防御性上限（data:/超长追踪参数），正常 URL 远达不到，不受影响。
     if (el.tagName === 'A' && el.getAttribute('href')) {
-      parts.push('href=' + absoluteHref(el));
+      parts.push('href=' + clip(absoluteHref(el), 2048));
       if (el.hasAttribute('download')) parts.push('download');
     }
     if (el.tagName === 'INPUT') {
@@ -205,9 +209,30 @@ function installHelpers() {
     }
     return el;
   };
+  // refs 是长驻 SPA 里的长期表：反复 snapshot 只增不减，所以设一个软上限。
+  // 超限时先清掉已失效的条目（元素已移除或已被回收）；仍然超限就按 Map 插入顺序
+  // 丢掉最旧的约 10%。elRefs 是 WeakMap，元素被回收后条目自然消失，不用手动清理。
+  // 被删掉的旧 ref 会变成 stale，调用方应重新 snapshot；这是长驻 SPA 的预期取舍。
+  const REF_SOFT_LIMIT = 5000;
+  const pruneRefs = () => {
+    if (refs.size <= REF_SOFT_LIMIT) return;
+    for (const [ref, entry] of refs) {
+      const el = deref(entry);
+      if (!el || !el.isConnected) refs.delete(ref);
+    }
+    if (refs.size <= REF_SOFT_LIMIT) return;
+    const drop = Math.ceil(refs.size * 0.1);
+    let removed = 0;
+    for (const ref of refs.keys()) {
+      if (removed >= drop) break;
+      refs.delete(ref);
+      removed++;
+    }
+  };
   const setRef = (el, ref) => {
     refs.set(ref, typeof WeakRef === 'function' ? new WeakRef(el) : el);
     elRefs.set(el, ref);
+    pruneRefs();
     if (el.getAttribute && el.getAttribute('data-ema2-ref')) el.removeAttribute('data-ema2-ref');
   };
   const refEntries = (since) => {
@@ -228,7 +253,12 @@ function installHelpers() {
   };
   const refOf = (el) => {
     const existing = elRefs.get(el);
-    if (existing && refIsCurrent(existing)) return existing;
+    if (existing && refIsCurrent(existing)) {
+      // 软上限裁剪可能已把这条 ref 从 refs 表里删掉：补回去，否则重新 snapshot
+      // 仍会输出解析不了的 ref（elRefs 是 WeakMap，条目本身还在）。
+      if (!refs.has(existing)) refs.set(existing, typeof WeakRef === 'function' ? new WeakRef(el) : el);
+      return existing;
+    }
     // 旧版本写进 DOM 的 data-ema2-ref：迁移到内存表，然后清掉属性。
     const legacy = el.getAttribute('data-ema2-ref');
     if (refIsCurrent(legacy)) {
@@ -420,6 +450,14 @@ function installHelpers() {
     while (index < total) {
       const line = lines[index];
       if (used > 0 && used + line.length + 1 > budget) break;
+      // 首行同样受 budget 约束：单行就超预算时只能截断，否则一次超长记录会突破调用方的预算。
+      // index 照常推进，保证 next 不会重复交付本行。
+      if (used === 0 && line.length + 1 > budget) {
+        out.push(line.slice(0, Math.max(1, budget - 1)) + '…');
+        used = budget;
+        index++;
+        break;
+      }
       out.push(line);
       used += line.length + 1;
       index++;
@@ -1210,6 +1248,6 @@ function installHelpers() {
     collectRoots, roleOf, nameOf, marks, docEpoch, setDocHandle, parseRef, refIsCurrent,
     setValue, isActionableRole, absoluteHref,
   };
-  window.__ema2_helpers_version = 20;
+  window.__ema2_helpers_version = HELPERS_VERSION;
   return { installed: true };
 }

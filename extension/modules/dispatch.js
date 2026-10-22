@@ -12,7 +12,53 @@ function requireStringArg(args, key, max, allowEmpty) {
   return args[key];
 }
 
+/**
+ * per-tab 调用链：同一 tab 上的 act/settle、read、snapshot、js 按提交顺序执行，
+ * 不同 tab 之间仍然并发。链尾结算后只有「Map 里仍是自己的 tail」才删除，
+ * 避免把后来者刚挂上的链一起删掉（那样会留下不会再被回收的空条）。
+ */
+const tabCallQueues = new Map();
+
+function queuePerTab(key, run) {
+  const previous = tabCallQueues.get(key) || Promise.resolve();
+  // 两个 handler 都接上一条：前一条失败不能阻断后续调用。
+  const tail = previous.then(run, run);
+  const settled = tail.then(() => {}, () => {});
+  tabCallQueues.set(key, settled);
+  settled.then(() => {
+    if (tabCallQueues.get(key) === settled) tabCallQueues.delete(key);
+  });
+  return tail;
+}
+
+/**
+ * 计算这次调用该落在哪条 per-tab 链上；返回 null 表示不排队。
+ * - `tabs`：只读标签列表，不碰页面状态。
+ * - `batch`：内部每条子命令都会各自调用 executeTool 排队，外层再持锁就会等自己（自锁）。
+ * - `open`：只有显式 tabId（导航已有标签）才与该 tab 的其他命令互斥；
+ *   不带 tabId 是新建标签，没有可争用的页面状态。
+ * - 其余工具没给 tabId 时按当前活动标签解析；解析失败返回 null，交给 dispatchTool 报错。
+ */
+async function tabQueueKey(name, args) {
+  if (name === 'tabs' || name === 'batch') return null;
+  const explicit = args && typeof args === 'object' ? args.tabId : undefined;
+  if (Number.isInteger(explicit)) return `tab:${explicit}`;
+  if (name === 'open') return null;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (tab && Number.isInteger(tab.id)) return `tab:${tab.id}`;
+  } catch (_) { /* 没有可用窗口时不排队 */ }
+  return null;
+}
+
+/** 工具入口：先解析 tab，再排队；这里不再加任何全局锁，batch 内部调用因此不会自锁。 */
 async function executeTool(name, args, context) {
+  const key = await tabQueueKey(name, args);
+  if (!key) return dispatchTool(name, args, context);
+  return queuePerTab(key, () => dispatchTool(name, args, context));
+}
+
+async function dispatchTool(name, args, context) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
     fail('invalid_arguments', 'tool arguments must be an object', 'run `ema2 <command> --help`; for scripts run `ema2 act --help`');
   }

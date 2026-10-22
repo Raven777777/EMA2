@@ -3,7 +3,7 @@
 单文件 `ema2` CLI。AI 通过 shell 调用子命令操作真实 Edge。
 无 MCP、无 token、无授权、无配置文件。默认端口 **7744**。
 
-> 分发包只带 `ema2.exe` 和 `ema2 init` 生成的 `AGENTS.md`；**exe 内的
+> 分发包 = `ema2.exe` + `extension/` + `ema2 init` 生成的 `AGENTS.md`；**exe 内的
 > `ema2 <cmd> --help` 才是用户侧权威文档**，本文是仓库内参考。
 
 ## 命令总览
@@ -35,8 +35,9 @@
 - **输出是行式紧凑文本，不是 JSON**。HAR 导出是唯一例外（对外标准格式）。
 - **退出码**：`0` 成功 / `1` 参数错 / `2` 中继不可用 / `3` 扩展未连 / `4` 工具执行错。
 - **错误**：stderr 首行 `error=<code> msg=... hint=...`，`<code>` 见错误码表。
-- `budget`：返回文本的字符预算（默认 4000，范围 200–200000）。
-- `cursor`：从上次返回的 `next` 继续读。
+- `budget`：返回文本的字符预算，范围 200–200000；默认值按工具不同：
+  read / snapshot / tabs / wait 为 4000，js 为 8000，observe 为 3000。
+- `cursor`：把上次返回的 `next`（数字）传给 `--cursor` 继续读。
 
 ## 输出协议
 
@@ -50,7 +51,8 @@ url=https://example.com/  title=Example Domain  scroll=0/1  refs=3  doc=d3
 total=2 shown=2 next=none
 ```
 
-- `next=none` 表示没有更多；否则把 `next` 原样传给 `--cursor` / `--since`。
+- `next=none` 表示没有更多；否则 `next` 是**数字**，把它传给 `--cursor` / `--since`
+  （例如 `--cursor 4000`）。CLI 不接受字面量 `next`。
 - `ref` 内嵌 document epoch（`e<seq>@<doc>`）：同一 document 内稳定，导航/reload/跨 tab 后旧 ref 会 `stale_ref`。
 - 文件类结果：`path=<绝对路径>` 单独一行，后跟 `bytes=` 等元信息。
 - 图片默认落盘；`--inline` 才回图片内容（CLI 输出 `data:image/png;base64,...`）。
@@ -71,6 +73,7 @@ total=2 shown=2 next=none
 | `relay_error` | 已连上中继，但请求中途失败/响应不合法 | 检查 `ema2 status`；不要误以为 daemon 没起 |
 | `payload_too_large` | 请求体超过中继上限（含上传） | 减小上传文件或拆分调用 |
 | `shutdown_failed` | server 卡死且 PID 兜底失败 | 手动结束进程后重启 |
+| `shutting_down` | daemon 正在关闭（HTTP 503） | 稍后重试；重试前先 `ema2 status` |
 | `extension_error` | 中继连不上扩展（兜底） | `ema2 status` |
 | `init_failed` | `ema2 init` 读写 AGENTS.md 失败 | 换可写目录，或检查文件权限 |
 | `doc_handle_failed` | 文档句柄计数器无法读写 `chrome.storage.local` | 重载扩展；仍失败则检查浏览器存储/配置 |
@@ -81,7 +84,6 @@ total=2 shown=2 next=none
 | `invalid_tab` | tabId 不是非负整数 | `tabs list` 拿 id |
 | `invalid_tool` | batch 不支持该工具 | batch 只跑 open/read/snapshot/js/wait |
 | `invalid_url` | URL 不是 http(s) | 用完整 http(s) 地址 |
-| `invalid_path` | 上传路径不合法（Windows 必须绝对路径） | 用 `C:/dir/file.pdf` |
 | `invalid_regex` | `bodyFilter` 不合法或有灾难性回溯风险 | 改写正则或改用子串 |
 | `invalid_selector` | CSS selector 语法非法（`[`、未闭合括号等） | 修正 selector；或改用 snapshot ref/target |
 | `unknown_tool` | 工具名不在白名单 | 11 个工具之一 |
@@ -143,7 +145,9 @@ ema2 server [--port N]
 ```
 
 后台启动中继，**daemon 化，立即返回**。中继在 7744 上同时监听 WS（扩展，看 `Upgrade` 头）和 HTTP（CLI 命令）。
-扩展断线自动等重连，不需要重启 server。
+扩展断线自动等重连，不需要重启 server。daemon 每 10s 发一次 ping；
+连续 30s（3 个周期）收不到扩展任何消息即判定半开并摘除连接，`status` 随之回到
+`extension=disconnected`，不会长期假在线。
 
 - 7744 被占 → `port_in_use`，不自动换端口（避免和扩展 popup 配置错位）。
 - 重复执行 `server` 时若已有实例在跑，输出 `relay=already_running pid=... port=...`（退出码 0）。
@@ -156,6 +160,9 @@ ema2 server stop [--port N]
 ```
 
 干净关闭 daemon（`POST /shutdown`），server 卡死时用临时 PID 文件兜底。
+`/shutdown` 会打断在途请求，并给 3s 硬期限强制退出。
+命令会等到进程**真正退出**（PID 消失）后才输出 `relay=stopped`；端口已不监听但进程还活着时
+报 `shutdown_failed` 并保留 PID 文件。
 已停止时输出 `relay=not_running`，退出码 0（可重复执行）。
 
 ### status
@@ -370,12 +377,15 @@ ema2 act --script run.ema2 [--tab ID]          # 脚本文件，指定目标标�
 
 动作：`click | type | fill | select | press | hover | scroll | submit | back | forward | reload`
 
-定位（三选一）：裸写 `ref`（snapshot 给的）优先，其次 `--selector`，再 `--target "button:提交"`。
+定位（三选一）：裸写 `ref`（snapshot 给的）/ `--selector` / `--target "button:提交"`。
+三者**互斥**，同时给出两个及以上直接报 `invalid_argument`（单步与脚本同一规则），
+不再静默以 ref 优先。
 `--target "role:name"` 先匹配可访问名称，再精确匹配 HTML `name` 属性；例如没有 label、
 但 `<input type="search" name="q">` 可用 `--target "searchbox:q"`。
 `--selector/--target/--key/--delta-y/--submit` 只属于单步调用；`--steps`/`--script` 里改用脚本写法
 （`selector=` / `target=` / `press <key>` / `submit` 步骤；像素滚动用 `js`）。
 单步动作也会拒绝与该动作不匹配的 flag（例如 `back --selector`、`type --key`）。
+flag 支持 `--flag=value` 写法；同一个 flag 重复出现会报 `invalid_argument`，不会取最后一个。
 以 `-` 开头的文本用 `--` 分隔：`ema2 act type e1 -- -5`。
 
 | 动作 | 位置参数 | flag |
@@ -425,17 +435,26 @@ ema2 act --script run.ema2 [--tab ID]          # 脚本文件，指定目标标�
   点击前做 visibility/inert/pointer-events/`elementFromPoint` 检查：隐藏元素报 `not_clickable`，
   被 overlay 遮住报 `obscured`，不再穿透遮罩点到下面的链接。
 - 目标未渲染时自动重试 3 次（约 1s）；`stale_ref` 不重试。
+- `scroll down|up <n>` 的屏数是整数，范围 **1..1000**；`--delta-y` 只接受有限像素值，
+  `nan` / `inf` 在参数解析阶段就报 `invalid_argument`。
 - 位置参数必须完整：`type e15 hello world` 会报 `invalid_argument`，不会静默只输入 `hello`；含空格请加引号。
 - `waitFor` 有两种条件，动作 settle 后验证：
   - **响应/导航**：`url=` + 可选 `status=`；命中回 `response=<status> <method> <absolute-url> <ms>`，
     导航命中回 `nav=<url>`（只给 `url=` 时才算导航；带 `status=` 只匹配响应）。
-    跨导航时自动从新文档起点匹配；hook 安装前的历史请求只给 `observation_gap=status_unavailable`。
+    **只匹配本次动作之后发出的请求**：实况条目按动作前记录的 seq 水位过滤；
+    `performance` 回填条目另加 `startedAt` 判定——早于动作起点或缺少时间的回填一律跳过，
+    动作前已存在的历史资源不会被当成本次响应。
+    动作前没有可用基线时（例如该 tab 从未装过 hook），从当前水位往后看，
+    命中行可能带 `baseline_lost=1`，提示这次没有可信的起点。
+    跨导航时自动从新文档起点匹配；确实拿不到状态的旧请求只给 `observation_gap=status_unavailable`。
   - **页面条件**：`text=` / `textGone=` / `selector=`，与 `ema2 wait` 语义一致；命中回
     `expect=ok condition=text:"评论已提交" ms=820`（`selector` / `textGone` 同样带引号）。
     超时返回 `error=wait_timeout`，消息以 `expect=timeout` 开头并带最后看到的 URL/文本。
-  一次 `waitFor` 只写一个页面条件，页面条件不能和 `url=`/`status=` 混用；`timeout=5s`（最大 30s）
-  是可选兜底，不是 `waitFor.timeout` 字段。含空格的条件值在双引号内写，例如
-  `--wait-for "text=\"保存成功\" timeout=5s"`。
+  一次 `waitFor` 只写一个页面条件，页面条件不能和 `url=`/`status=` 混用；`timeout=5s`
+  是可选兜底，**上限 30s**（daemon 与扩展同源校验，越界在动作执行前拒绝），不是 `waitFor.timeout` 字段。
+  含空格的条件值必须在双引号内写：`--wait-for "text=\"保存 成功\" timeout=5s"`、
+  `--wait-for "selector=\"#main a\" timeout=5s"`（脚本里同样写 `text="保存 成功"` /
+  `selector="#main a"`）。
   单步示例：`ema2 act click e12 --wait-for "url=api/save status=200 timeout=5s"`、
   `ema2 act click e12 --wait-for "text=\"评论已提交\" timeout=5s"`。
   脚本里的 `waitFor` 是**独立步骤**，在它所在行执行；不再挪到整次调用末尾。
@@ -444,7 +463,8 @@ ema2 act --script run.ema2 [--tab ID]          # 脚本文件，指定目标标�
 ### act 脚本语法（`.ema2`）
 
 ```
-# 每行一条；空行和 # 注释忽略；含空格的值加双引号；key=value 是命名参数
+# 每行一条；空行和 # 注释忽略（也允许行尾 # 注释）；含空格的值加双引号；key=value 是命名参数
+# 文件可以是 UTF-8 带 BOM，首行 BOM 会被自动去掉
 click e12
 click selector="#submit"
 click target="button:提交"
@@ -481,8 +501,10 @@ click e30
 规则：
 1. 首个 token 是 11 个动作之一，或脚本专用的 `await` / `waitFor`。
    **脚本里不能写 `open/read/snapshot/wait/js/tabs` 等 CLI 命令**；这些在 shell 里单独调用。
-2. `ref` 裸写；`selector=` / `target=` 是命名参数（与裸写互斥）。
-3. 含空格的值用双引号包裹，引号内支持 `\"` 转义。
+2. `ref` 裸写；`selector=` / `target=` 是命名参数；三者**只能三选一**，多写会报
+   `invalid_argument`（与单步一致）。
+3. 含空格的值用双引号包裹，引号内支持 `\"` 转义；`waitFor` 的值同样适用
+   （`selector="#main a"`、`text="保存 成功"`）。
 4. `waitFor` 是独立步骤，在所在行执行（通常放在触发动作之后）；接受
    `url=` / `status=`（响应/导航）或 `text=` / `textGone=` / `selector=`（页面条件），
    一次只写一个页面条件，且不能和 `url=`/`status=` 混用。`timeout=` 接受 `500ms` / `5s`
@@ -490,7 +512,8 @@ click e30
 5. `await 10s` 等上一个动作的导航/页面稳定；如果上一步 `settle=pending` 且下一步不是 `await`，脚本会停止而不是在旧页面继续执行。
 6. 脚本语法/示例/常见错误以 `ema2 act --help` 为准。
 
-最多 20 步，可跨导航；返回每步结果 + `settle/expect/next_url/new_tab/changed/url/title/new/console_errors`。
+最多 20 步（1..20），可跨导航；`--steps`/`--script` 再加一个 `--wait-for` 时上限为 21 步。
+返回每步结果 + `settle/expect/next_url/new_tab/changed/url/title/new/console_errors`。
 
 ## await
 
@@ -588,7 +611,7 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
   - 预览在后台读取 `response.clone()`，最多 8KB/1.5s，不阻塞页面；事件流/二进制跳过。
   - `--bodies=false` 真正关闭新响应的 body clone/读取。
   - `--filter`：URL 子串；`--body-filter`：响应体正则。
-  - `--wait`：等异步请求（≤10s）；`--since` 用上次 `next`。
+  - `--wait`：等异步请求（≤10s）；`--since` 用上次 `next` 的数字。
   - 分页 `next` 只推进到已交付记录；环形缓冲溢出回 `dropped=`，导航回绕回 `reset=1`。
   - 响应体仍在读取（`preview=pending`）的条目不会被丢弃：记录行照常输出并带 `streaming=1`，
     尾部回 `pending=<n> seqs=<seq,...>`；需要补读时用 `--since <first seq - 1>`。
@@ -598,6 +621,7 @@ ema2 observe network [--tab ID] [--since SEQ] [--filter SUBSTR] [--body-filter R
   - `--har PATH`：导出 HAR 1.2（采样/预览，不是完整抓包），`request.url` 是绝对 URL，
     `request/response.headers`、`queryString`、真实 `startedDateTime`、`content.mimeType/size` 来自
     webRequest + 页面 hook；JSON 不经过文本预算截断，落盘并回 `path=` + `entries=N`。
+    `--har` 指向目录（或以 `/`、`\` 结尾）时自动拼 `har-<timestamp>.har`。
   - HAR 里的 `authorization`、`proxy-authorization`、`cookie`、`set-cookie` 默认替换为
     `<redacted>`，且在 webRequest 记录进入内存前就脱敏。需要原始值时显式加
     `--headers all`（只影响本次 network 观测的 HAR 导出）。
@@ -625,6 +649,8 @@ ema2 shot [--tab ID] [--inline] [--annotate] [--format png|jpeg] [--out PATH]
 - `--tab` 会把目标标签激活并把窗口提到前台（成功时回 `activated=1`）；
   激活失败（窗口最小化等）才回 `tab_not_active`，不会返回前台页图片。
 - 默认：落盘 PNG（`--out` 指定路径，缺省进默认输出目录），回 `path=` + `bytes=`。
+- `--out` 指向目录（已有目录，或以 `/` 结尾）时自动拼默认文件名 `shot-<timestamp>.png`；
+  截图后缀只接受 `png` / `jpg` / `jpeg`，其他后缀报 `invalid_argument`（不会写出半截文件）。
 - `--out` 的相对路径按 CLI 当前目录转为绝对路径，并清理 `.` / `..`；不解析符号链接。
 - `--inline`：不落盘，CLI 输出 `data:image/png;base64,...`（或 jpeg）。
 - `--annotate`：先快照，再在图上画 ref 编号，回坐标列表 + 标注图
@@ -646,6 +672,7 @@ ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
 - `--urls`：先为每个 URL 打开新标签，再在该标签上执行目标工具，每块头部 `url=<url>` + `tab=<id>`；
   `tool=open` 时只打开（并行开多页）。**`open` + `read` 因此一次命令完成**，不再串行两次。
   默认始终新开标签；内层 `--replace`/`--reuse`/`tabId` 会被拒绝。
+  `--urls` 可重复传入（`--urls u1 --urls u2`），逗号仍是分隔符；URL 本身带逗号时只能分多次传。
 - `--reuse session`：仅用于 `--urls`。按规范化后的完整 URL 只匹配本会话由
   `open`/`tabs new` 打开的标签；命中时复用文档（同一 URL 不重载）并回
   `reused=1 tab=<id>`，未命中仍新开。
@@ -670,7 +697,7 @@ ema2 status
 
 # 读取 / 抓数据（单次命令就能拿到主内容）
 ema2 batch read --urls "https://a.com,https://b.com"
-# 或者串行：open → wait selector → read → 需要时 read --cursor next
+# 或者串行：open → wait selector → read → 需要时把输出里的 next 数字传给 --cursor（如 --cursor 4000）
 
 # 同一页面连续翻页：不要每次开新标签
 ema2 open url1 --replace → ema2 read → ema2 open url2 --replace → ema2 read
@@ -683,8 +710,9 @@ ema2 open url → ema2 snapshot → ema2 act click e12 → 看 changed/new/conso
 ema2 act click e12 --wait-for "url=api/save status=200" → 直接拿 response 行
 
 # 调试
-ema2 observe console --since next
-ema2 observe network --since next --body-filter "error"
+ema2 observe console --since 0
+ema2 observe network --since 0 --body-filter "error"
+# 续读时把上一次输出里的 next 数字传给 --since（如 --since 12）
 
 # 多标签
 ema2 open urlA → ema2 open urlB → ema2 batch read --tab-ids "a,b"

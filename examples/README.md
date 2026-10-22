@@ -27,7 +27,8 @@ bin/ema2.exe act --script examples/form.ema2
 
 - 每行一条动作；空行和 `#` 注释忽略；
 - 只允许 act 动作 + `await` + `waitFor`，不能写 `open/read/wait`；
-- `waitFor` 独立成行，只接受 `url=` / `status=` / `timeout=`；
+- `waitFor` 独立成行，接受 `url=` / `status=` / `timeout=`，或页面条件
+  `text=` / `textGone=` / `selector=`（一次一个，与 `ema2 wait` 同义）；
 - `await 10s` 等上一个动作的导航/页面稳定；
 - `type` 在 caret/selection 处插入，`fill` 覆盖。
 
@@ -72,7 +73,7 @@ ema2 open https://example.com --replace
 ema2 read --mode md
 ema2 snapshot
 ema2 act click e1 --wait-for "url=status status=200 timeout=5s"
-ema2 observe network --since next
+ema2 observe network --since 0     # 续读时把上一次输出里的 next 数字传给 --since
 ema2 shot --annotate
 ema2 tabs close --session
 ema2 server stop

@@ -249,13 +249,29 @@ async function setNetworkBodyCapture(tabId, enabled) {
   }, [!!enabled], 'MAIN');
 }
 
-/** 网络水位用 {epoch, seq} 表示；不同文档的 seq 不可比较。 */
+/**
+ * 网络水位用 {epoch, seq, installed} 表示；不同文档的 seq 不可比较。
+ * installed=false 表示 hook 从未安装：此时 epoch 为空，seq 不能当作基线使用。
+ */
 async function networkMark(tabId) {
   try {
     return await runInTab(tabId, () => {
       const state = window.__ema2_net;
-      return state ? { epoch: state.epoch || '', seq: state.seq || 0 } : { epoch: '', seq: 0 };
+      return state
+        ? { epoch: state.epoch || '', seq: state.seq || 0, installed: true }
+        : { epoch: '', seq: 0, installed: false };
     }, [], 'MAIN');
+  } catch (_) {
+    return { epoch: '', seq: 0, installed: false };
+  }
+}
+
+/** console 水位用 {epoch, seq} 表示；无 hook 时 epoch 为空、seq 为 0。 */
+async function consoleMark(tabId) {
+  try {
+    return await runInTab(tabId, () => (window.__ema2_console
+      ? { epoch: window.__ema2_console_epoch || '', seq: window.__ema2_console_seq || 0 }
+      : { epoch: '', seq: 0 }), [], 'MAIN');
   } catch (_) {
     return { epoch: '', seq: 0 };
   }

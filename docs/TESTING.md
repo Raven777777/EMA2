@@ -28,13 +28,13 @@
 
 ```bash
 cd rust
-cargo test                          # 87 项：参数校验、超时预算、脚本解析、路由、落盘
+cargo test                          # 参数校验、超时预算、脚本解析、路由、落盘（用例数见命令输出）
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 ```bash
-python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（135 项）
+python scripts/verify.py                 # 静态契约 + 真实 Edge 冒烟（项数见命令输出）
 python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 ```
 
@@ -111,6 +111,9 @@ bin\ema2.exe status          # extension=connected
 | 10a | `ema2 act fill --target "searchbox:q" ...` | 无 label、`name=q` 的 searchbox 被命中 |
 | 10b | `ema2 act click ... --wait-for "text=\"fetched\" timeout=3s"` | `expect=ok condition=text:"fetched" ms=...` |
 | 10c | `ema2 act click ... --wait-for "selector=\"#never\" timeout=1s"` | `error=wait_timeout`，`expect=timeout`，保留 `step1 ok=click`，带最后 URL/文本 |
+| 10d | 先 `open` 一个已加载 `/history.html` 的页面，再 `act click ... --wait-for "url=/history.html timeout=2"`（该请求在动作**之前**已发出） | 不得命中：`error=response_timeout`，输出里没有 `response=200`；回归 P0-1。正例：动作触发的新请求必须命中 `response=200` |
+| 10e | 在含 `#main a` 的页面上 `ema2 act --steps 'waitFor selector="#main a" timeout=5'`（带空格的后代选择器） | 解析通过并命中：`ok=1/1`、`expect=ok condition=selector:"#main a"`，不是 `invalid_argument` |
+| 10f | `ema2 act click <ref> --selector "#main a"` | `error=invalid_argument`，exit 1（`ref`/`--selector`/`--target` 三选一） |
 | 11 | `ema2 wait text/selector/time/idle` | `ok=... elapsed=...s` |
 | 12 | `ema2 js '1+1'` / `ema2 js 'return 6*7'` / `--file` | `2` / `42` / 文件结果 |
 | 12a | 弹过密码管理器浮层的 tab 里 `ema2 js` | 结果 + `via=scripting`，不因 `debugger_attach_failed` 丢失 |
@@ -158,9 +161,10 @@ bin\ema2.exe status          # extension=connected
 
 ## 开发注意
 
-- 扩展是普通 MV3 service worker。改完 `extension/` 后在 `edge://extensions/`
-  点“重新加载”；如果 Edge 仍用旧脚本，把 `extension/manifest.json` 的
-  `version` 加一（Edge 按 manifest 版本缓存扩展脚本）。
+- 扩展是普通 MV3 service worker。改完 `extension/` 后必须在 `edge://extensions/`
+  点“重新加载”，并确认 `ema2 status` 输出 `version=2.4.2.5`（版本对不上说明还在跑旧脚本）；
+  如果 Edge 仍用旧脚本，把 `extension/manifest.json` 的 `version` 加一
+  （Edge 按 manifest 版本缓存扩展脚本）。
 - 页面 helper 有版本号（`__ema2_helpers_version`）。改 helper 行为时同步加一，
   否则已经打开的页面会继续用旧 helper。
 - 截图要求目标 tab 是活动 tab 且窗口可见；连续截图注意 Chromium 的

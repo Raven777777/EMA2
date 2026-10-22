@@ -42,6 +42,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORT = 7744
 
+
+def load_product_version() -> str:
+    """产品版本只有一个来源：`contract/runtime.json`。"""
+    try:
+        contract = json.loads((ROOT / "contract" / "runtime.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(contract.get("productVersion") or "")
+
+
+PRODUCT_VERSION = load_product_version()
+
 FIXTURE_HOME = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>ema2 fixture home</title></head>
 <body>
@@ -61,6 +73,7 @@ FIXTURE_HOME = """<!doctype html>
 <input id="file" type="file" name="upload">
 <textarea id="secret" name="secret">verify-secret-value</textarea>
 <div id="out">idle</div>
+<div id="main"><a id="main-link" href="/second.html">main link</a></div>
 <script>
   document.getElementById('btn').addEventListener('click', function () {
     document.getElementById('out').textContent = 'clicked';
@@ -143,24 +156,54 @@ FIXTURE_BUGS = """<!doctype html>
 </form>
 <div id="ov"></div>
 <script>
+function ema2GuardProbe() {
+  const guard = window.__ema2_guard;
+  if (!guard || typeof guard.probe !== 'function') return null;
+  try { return guard.probe(); } catch (_) { return null; }
+}
 function ema2ReportGuard(stage) {
   const guard = window.__ema2_guard;
+  const probe = ema2GuardProbe();
   const params = new URLSearchParams({
     stage: stage,
     guard: guard ? '1' : '0',
     armed: guard && guard.armed ? '1' : '0',
-    native: guard && guard.original && guard.original.alert === window.alert ? '1' : '0',
+    wrapped: probe ? (probe.wrapped ? '1' : '0') : '',
     at: String(Date.now())
   });
   fetch('/guard-report?' + params.toString()).catch(function () {});
 }
 (function () {
-  // 后台通过 ema2-guard-disarm 事件释放；事件监听按注册顺序执行，
-  // 这里用 setTimeout 确保 page_guard 已恢复原生 API 后再上报。
+  // v5 的 disarm 由后台直接调用 guard.disarm()，不再派发 ema2-guard-disarm 事件：
+  // 每 100ms 轮询 probe()，看到过 armed 之后 armed/wrapped 同时为 false 时上报一次。
+  // 命令很短时整段 arm 可能落在两次采样之间，所以 guard.seq 增长（命令期间记录到
+  // 对话框/弹窗）同样算本段 disarm 的证据；每段只上报一次，最长等 5s。
   if (!window.__ema2_guard) return;
-  document.addEventListener('ema2-guard-disarm', function () {
-    setTimeout(function () { ema2ReportGuard('disarm'); }, 0);
-  }, true);
+  let armedSeen = false;
+  let reported = false;
+  let deadline = 0;
+  let lastSeq = Number(window.__ema2_guard.seq) || 0;
+  const tick = function () {
+    const guard = window.__ema2_guard;
+    const probe = ema2GuardProbe();
+    const seq = (guard && Number(guard.seq)) || 0;
+    if (seq !== lastSeq) {
+      lastSeq = seq;
+      armedSeen = true;
+      reported = false;
+      deadline = Date.now() + 5000;
+    }
+    if (probe && (probe.armed || probe.wrapped)) {
+      armedSeen = true;
+      reported = false;
+      deadline = Date.now() + 5000;
+    } else if (probe && armedSeen && !reported && Date.now() <= deadline) {
+      reported = true;
+      ema2ReportGuard('disarm');
+    }
+    setTimeout(tick, 100);
+  };
+  tick();
 })();
 </script>
 </body></html>
@@ -179,6 +222,21 @@ window.addEventListener('load', function () {
     at: String(Date.now())
   });
   fetch('/guard-report?' + params.toString()).catch(function () {});
+});
+</script></body></html>
+"""
+
+
+FIXTURE_HISTORY = """<!doctype html>
+<html><head><meta charset="utf-8"><title>ema2 fixture history</title></head>
+<body><h1>History</h1>
+<img id="preload" src="/api/ping" alt="ping">
+<button id="noop" type="button">noop</button>
+<button id="fetch" type="button">fetch</button>
+<div id="out">idle</div>
+<script>
+document.getElementById('fetch').addEventListener('click', function () {
+  fetch('/api/save').then(function () { document.getElementById('out').textContent = 'saved'; });
 });
 </script></body></html>
 """
@@ -331,7 +389,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._send(FIXTURE_HOME.encode())
         elif path == "/second.html":
             self._send(FIXTURE_SECOND.encode())
-        elif path == "/api":
+        elif path in ("/api", "/api/ping", "/api/save"):
             self._send(json.dumps({"ok": True, "path": path}).encode(), "application/json")
         elif path == "/tall.html":
             self._send(FIXTURE_TALL.encode())
@@ -367,6 +425,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._send(fixture_pdf(), "application/pdf")
         elif path == "/idle.html":
             self._send(FIXTURE_IDLE.encode())
+        elif path == "/history.html":
+            self._send(FIXTURE_HISTORY.encode())
         elif path == "/slow":
             time.sleep(3)
             self._send(FIXTURE_HOME.encode())
@@ -378,6 +438,31 @@ def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def daemon_version(port: int, timeout: float = 2.0) -> str:
+    """直连回环 /health 读 daemon 版本；Host 是回环，/health 允许无 CSRF 头。"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as response:
+            payload = response.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return ""
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return ""
+    return str(data.get("version") or "") if isinstance(data, dict) else ""
+
+
+def wait_daemon_version(port: int, timeout: float = 6.0) -> str:
+    deadline = time.time() + timeout
+    version = ""
+    while time.time() < deadline:
+        version = daemon_version(port)
+        if version:
+            return version
+        time.sleep(0.3)
+    return version
 
 
 def find_binary() -> Path:
@@ -396,10 +481,12 @@ class Runner:
         self.port = port
         self.failures: list[str] = []
         self.passes = 0
+        # 本次运行创建过的标签页：finally 里做二次兜底清理。
+        self.opened_tabs: list[str] = []
 
     def run(self, *args: str, timeout: float = 90.0) -> subprocess.CompletedProcess:
         command = [str(self.binary), "--port", str(self.port), *args]
-        return subprocess.run(
+        result = subprocess.run(
             command,
             capture_output=True,
             text=True,
@@ -407,6 +494,19 @@ class Runner:
             errors="replace",
             timeout=timeout,
         )
+        self._record_opened_tab(args, result.stdout or "")
+        return result
+
+    def _record_opened_tab(self, args: tuple[str, ...], stdout: str) -> None:
+        """记录 `open` / `tabs new` 真正新建的标签 id。"""
+        if not args:
+            return
+        is_new_tab = args[0] == "open" or (args[0] == "tabs" and args[1:2] == ("new",))
+        if not is_new_tab:
+            return
+        match = re.search(r"^id=(\d+)", stdout, re.M)
+        if match:
+            self.opened_tabs.append(match.group(1))
 
     def check(self, name: str, condition: bool, detail: str = "") -> bool:
         if condition:
@@ -447,11 +547,28 @@ def static_contract_check() -> bool:
     sources = [entry_path, contract_js_path, *module_paths]
     js = "\n".join(path.read_text(encoding="utf-8") for path in sources)
     docs = (ROOT / "docs" / "TOOLS.md").read_text(encoding="utf-8")
+    contract = json.loads((ROOT / "contract" / "runtime.json").read_text(encoding="utf-8"))
     codes = sorted(set(re.findall(r"fail\('([a-z_]+)'", js)) | set(re.findall(r"code: '([a-z_]+)'", js)))
     missing = [code for code in codes if f"`{code}`" not in docs]
     print(f"PASS  static: {len(codes)} error codes documented" if not missing else "FAIL  static: error codes")
     if missing:
         print("      缺少文档:", ", ".join(missing))
+
+    # 反向扫描：daemon/CLI 真实返回的 Rust 错误码也必须进文档。
+    # 只匹配字面量（StatusCode 后面的 code、eprintln 里的 error=<code>）；
+    # 变量传递的 code 由上面的扩展 fail('...') 扫描覆盖。
+    rust_codes: set[str] = set()
+    for relative in ("server.rs", "main.rs"):
+        source = (ROOT / "rust" / "src" / relative).read_text(encoding="utf-8")
+        rust_codes |= set(re.findall(r'StatusCode::[A-Z_]+,\s*"([a-z_]+)"', source))
+        rust_codes |= set(re.findall(r"error=([a-z_]+)", source))
+    missing_rust = sorted(code for code in rust_codes if f"`{code}`" not in docs)
+    print(
+        f"PASS  static: {len(rust_codes)} daemon/CLI error codes documented" if not missing_rust
+        else "FAIL  static: daemon/CLI error codes"
+    )
+    if missing_rust:
+        print("      缺少文档:", ", ".join(missing_rust))
 
     entry = entry_path.read_text(encoding="utf-8")
     imported = set(re.findall(r"'((?:modules/)?[A-Za-z0-9_./-]+\.js)'", entry))
@@ -484,14 +601,24 @@ def static_contract_check() -> bool:
     if not agents_ok:
         print("      AGENTS.md must point to `ema2 act --help` and must not mention docs/TOOLS.md")
     manifest = json.loads((ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
-    idle_ok = "content_scripts" not in manifest and (ROOT / "extension" / "page_guard.js").exists()
+    page_guard_path = ROOT / "extension" / "page_guard.js"
+    page_guard = page_guard_path.read_text(encoding="utf-8")
+    idle_ok = "content_scripts" not in manifest and page_guard_path.exists()
     print("PASS  static: page guard is command-scoped" if idle_ok
           else "FAIL  static: manifest still injects page_guard globally")
+
+    # v5：只暴露只读探针，原生 API 引用留在闭包里；disarm 由后台直接调用。
+    guard_ok = (
+        f"const GUARD_VERSION = {contract.get('guardVersion')};" in page_guard
+        and "expose('probe', probe);" in page_guard
+        and "original," not in page_guard
+    )
+    print("PASS  static: page_guard v5 exposes probe() and keeps original private" if guard_ok
+          else "FAIL  static: page_guard must expose probe() and must not hang original on __ema2_guard")
 
     paths_rs = (ROOT / "rust" / "src" / "paths.rs").read_text(encoding="utf-8")
     version_match = re.search(r'PRODUCT_VERSION: &str = "([^"]+)"', paths_rs)
     product_version = version_match.group(1) if version_match else ""
-    contract = json.loads((ROOT / "contract" / "runtime.json").read_text(encoding="utf-8"))
     contract_version_ok = contract.get("productVersion") == product_version
     version_ok = bool(product_version) and manifest.get("version") == product_version and contract_version_ok
     print(
@@ -503,7 +630,8 @@ def static_contract_check() -> bool:
     chrome_ok = min_chrome.isdigit() and int(min_chrome) >= 111
     print("PASS  static: minimum_chrome_version >= 111" if chrome_ok
           else "FAIL  static: minimum_chrome_version must be >= 111 for registerContentScripts world=MAIN")
-    return not missing and agents_ok and idle_ok and version_ok and chrome_ok and modules_ok and sync_ok and contract_version_ok
+    return (not missing and not missing_rust and agents_ok and idle_ok and guard_ok
+            and version_ok and chrome_ok and modules_ok and sync_ok and contract_version_ok)
 
 
 def markdown_link_check() -> bool:
@@ -560,15 +688,54 @@ def main() -> int:
     runner = Runner(binary, args.port)
     status_before = runner.run("status", timeout=15)
     already_running = "relay=running" in (status_before.stdout or "")
+    if already_running:
+        # 旧的 daemon 会用旧代码给出假绿灯：版本不符就先停掉，再按“未运行”重启。
+        running_version = daemon_version(args.port)
+        if running_version != PRODUCT_VERSION:
+            print(
+                f"stale daemon: /health version={running_version or 'unknown'} "
+                f"expected={PRODUCT_VERSION}; stopping and restarting"
+            )
+            stopped = runner.run("server", "stop", timeout=20)
+            if stopped.returncode != 0:
+                print("FAIL  cannot stop the stale daemon")
+                print(((stopped.stdout or "") + (stopped.stderr or "")).strip()[:1200])
+                return 2
+            already_running = False
     if not already_running:
         started = runner.run("server", timeout=30)
         if started.returncode != 0:
             print("FAIL  cannot start daemon")
             print((started.stdout or "") + (started.stderr or ""))
             return 2
+        restarted_version = wait_daemon_version(args.port)
+        if restarted_version != PRODUCT_VERSION:
+            print(
+                f"FAIL  daemon reports version={restarted_version or 'unknown'} "
+                f"expected={PRODUCT_VERSION} after restart"
+            )
+            if not args.keep_server:
+                runner.run("server", "stop", timeout=20)
+            return 2
     if not wait_for_extension(runner):
         print("FAIL  extension is not connected")
         print("      打开 edge://extensions 重新加载 EMA2，确认 popup 端口 = %d" % args.port)
+        if not already_running and not args.keep_server:
+            runner.run("server", "stop", timeout=20)
+        return 2
+
+    # 扩展连上还不够：必须和 daemon 期望的产品版本一致，否则跑的是旧扩展。
+    status_now = runner.run("status", timeout=15)
+    status_out = (status_now.stdout or "") + (status_now.stderr or "")
+    extension_match = re.search(r"^extension=connected version=(\S+)", status_out, re.M)
+    extension_version = extension_match.group(1) if extension_match else "unknown"
+    if "extension=connected" not in status_out or extension_version != PRODUCT_VERSION:
+        print("FAIL  extension is not running the expected version")
+        print(status_out.strip()[:800])
+        print(
+            f"      在 edge://extensions 重新加载 EMA2（当前 daemon 期望 "
+            f"{PRODUCT_VERSION}，扩展是 {extension_version}）"
+        )
         if not already_running and not args.keep_server:
             runner.run("server", "stop", timeout=20)
         return 2
@@ -588,7 +755,7 @@ def main() -> int:
 
     try:
         version = runner.run("--version")
-        runner.expect_ok("binary exposes product version", version, "2.4.2.4")
+        runner.expect_ok("binary exposes product version", version, PRODUCT_VERSION)
 
         opened = runner.expect_ok("open fixture", runner.run("open", f"{base}/"), "status=200", "net_hook=on", "title=ema2 fixture home")
         tab_match = re.search(r"^id=(\d+)", opened, re.M)
@@ -615,6 +782,15 @@ def main() -> int:
             "snapshot does not leak textarea value",
             "verify-secret-value" not in snapshot,
             snapshot[:1200],
+        )
+
+        # P1-2：--steps 里的 waitFor selector= 带空格也必须整体保留。
+        steps_wait = runner.run("act", "--steps", 'waitFor selector="#main a" timeout=5')
+        steps_wait_out = (steps_wait.stdout or "") + (steps_wait.stderr or "")
+        runner.check(
+            "act --steps keeps a selector containing spaces",
+            steps_wait.returncode == 0 and "ok=1/1" in steps_wait_out,
+            steps_wait_out[:1200],
         )
 
         click = runner.expect_ok("act click button", runner.run("act", "click", "--selector", "#btn"), "settle=done")
@@ -772,6 +948,45 @@ def main() -> int:
         runner.expect_error("js throw is js_exception", runner.run("js", "throw new Error('boom')"), "js_exception", 4)
         runner.expect_ok("wait selector", runner.run("wait", "selector", "#btn"), "ok=selector=#btn")
         runner.expect_error("read missing selector", runner.run("read", "--selector", "#nope"), "selector_not_found", 4)
+
+        # P0-1：新文档的 performance 历史回填只证明“动作前发生过”，不能被
+        # --wait-for url= 当成本次动作的响应；真实请求仍要能匹配。
+        # 必须用 tabs new（不预装网络 hook）打开，才能覆盖「hook 从未安装 →
+        # 无基线」这条真正的 P0-1 路径；open 会预装 hook，测不出回填误匹配。
+        history_tab = runner.run("tabs", "new", f"{base}/history.html")
+        history_match = re.search(r"^id=(\d+)", history_tab.stdout or "", re.M)
+        runner.check("history tab opened", history_match is not None, history_tab.stdout or "")
+        if history_match:
+            runner.run("wait", "selector", "#noop")
+            no_hook = runner.run("js", "return !!window.__ema2_net")
+            runner.check(
+                "history tab has no network hook before act",
+                (no_hook.stdout or "").strip() == "false",
+                (no_hook.stdout or "") + (no_hook.stderr or ""),
+            )
+        time.sleep(0.6)
+        backfill = runner.run(
+            "act", "click", "--selector", "#noop",
+            "--wait-for", "url=/api/ping timeout=2",
+        )
+        backfill_out = (backfill.stdout or "") + (backfill.stderr or "")
+        runner.check(
+            "waitFor url= ignores completed resource backfill",
+            backfill.returncode == 4
+            and "error=response_timeout" in backfill_out
+            and "response=200" not in backfill_out,
+            backfill_out[:1200],
+        )
+        fresh = runner.run(
+            "act", "click", "--selector", "#fetch",
+            "--wait-for", "url=/api/save timeout=5",
+        )
+        fresh_out = (fresh.stdout or "") + (fresh.stderr or "")
+        runner.check(
+            "waitFor url= still matches a fresh request",
+            fresh.returncode == 0 and "response=200" in fresh_out,
+            fresh_out[:1200],
+        )
 
         # shadow DOM 正文必须能被 read 看到。
         runner.run("open", f"{base}/shadow.html")
@@ -1279,7 +1494,7 @@ def main() -> int:
             and alert_out.count("dialog_opened=") == 1,
             alert_out[:1200],
         )
-        # 事件驱动上报可能晚于 act 返回一拍；只采信 act 开始后采样的报告。
+        # 轮询上报可能晚于 act 返回一拍；只采信 act 开始后采样的报告。
         guard_deadline = time.time() + 2
         fresh_reports = []
         while time.time() < guard_deadline:
@@ -1297,7 +1512,7 @@ def main() -> int:
         runner.check(
             "guard is disarmed when act returns",
             disarm_report.get("guard") == "1" and disarm_report.get("armed") == "0"
-            and disarm_report.get("native") == "1",
+            and disarm_report.get("wrapped") == "0",
             f"report={disarm_report}",
         )
         printing = runner.run("act", "click", "--selector", "#print")
@@ -1471,10 +1686,30 @@ def main() -> int:
             "invalid_argument",
             1,
         )
-
-        closed = runner.run("tabs", "close", "--session")
-        runner.check("tabs close --session", closed.returncode == 0 and "closed=" in (closed.stdout or ""), (closed.stdout or "")[:300])
+        # P1-3：ref 与 selector 同时给出时必须由 CLI 拒绝，而不是扩展按 ref 优先。
+        runner.expect_error(
+            "act rejects ref plus selector at the CLI",
+            runner.run("act", "click", "e12@d1", "--selector", "#btn"),
+            "invalid_argument",
+            1,
+        )
     finally:
+        # P1-9：清理必须在 finally 第一行，失败/超时/Ctrl+C 都不能留下标签页。
+        try:
+            closed = runner.run("tabs", "close", "--session", timeout=20)
+            runner.check(
+                "tabs close --session",
+                closed.returncode == 0 and "closed=" in (closed.stdout or ""),
+                ((closed.stdout or "") + (closed.stderr or ""))[:300],
+            )
+        except Exception as exc:  # noqa: BLE001 - 清理失败不能掩盖原始失败
+            print(f"cleanup: tabs close --session failed ({type(exc).__name__}: {exc})")
+        # 二次兜底：本次 open / tabs new 打开过的标签逐个关闭（best effort）。
+        for tab_id in dict.fromkeys(runner.opened_tabs):
+            try:
+                runner.run("tabs", "close", tab_id, timeout=15)
+            except Exception as exc:  # noqa: BLE001
+                print(f"cleanup: tabs close {tab_id} failed ({type(exc).__name__})")
         server.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)
         if not already_running and not args.keep_server:

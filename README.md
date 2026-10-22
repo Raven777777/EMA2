@@ -23,6 +23,8 @@ cargo build --release --manifest-path rust/Cargo.toml
 
 产物： `bin\ema2.exe`（单文件）。
 
+分发包 = `bin\ema2.exe` + `extension/` + 在目标项目里执行 `ema2 init` 生成的 `AGENTS.md`。
+
 ### 2. 加载扩展
 
 1. 打开 `edge://extensions/`，开启“开发人员模式”；

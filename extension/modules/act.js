@@ -4,45 +4,98 @@
 
 // ---------------------------------------------------------------- act / settle / await
 
-async function loadLastAct() {
+// P1-6：lastAct 按 tab 分槽，内存侧用 Map，storage.session 用 `<前缀>:<tabId>`；
+// 沿用 core.js 的 LAST_ACT_KEY 作为前缀来源，避免两处字面量漂移。
+const LAST_ACT_SLOT_PREFIX = LAST_ACT_KEY + ':';
+const lastActSlots = new Map(); // tabId -> context
+
+function lastActSlotId(tabId) {
+  if (tabId === undefined || tabId === null || tabId === '') return null;
+  const value = Number(tabId);
+  return Number.isInteger(value) ? value : null;
+}
+
+function lastActFresh(value) {
+  return !!value && typeof value === 'object'
+    && (!value.updatedAt || Date.now() - value.updatedAt <= LAST_ACT_TTL_MS);
+}
+
+/** 同槽的两个候选（storage / 内存）只取较新的上下文。 */
+function lastActNewer(left, right) {
+  if (left && right) {
+    return (Number(left.updatedAt) || 0) >= (Number(right.updatedAt) || 0) ? left : right;
+  }
+  return left || right;
+}
+
+/**
+ * 读取动作上下文：传 tabId 只读该槽；不传时返回所有槽里 updatedAt 最新的一条
+ * （guard.js 的 `wait --await` 依赖这个“最近一次”语义）。TTL 仍按 LAST_ACT_TTL_MS。
+ */
+async function loadLastAct(tabId) {
+  const slotId = lastActSlotId(tabId);
   let stored = null;
+  let storedSlots = null;
   try {
     const store = chrome.storage && chrome.storage.session;
     if (store) {
-      const values = (await store.get(LAST_ACT_KEY)) || {};
-      const value = values[LAST_ACT_KEY];
-      if (value && typeof value === 'object'
-          && (!value.updatedAt || Date.now() - value.updatedAt <= LAST_ACT_TTL_MS)) {
-        stored = value;
+      if (slotId !== null) {
+        const key = LAST_ACT_SLOT_PREFIX + slotId;
+        const values = (await store.get(key)) || {};
+        if (lastActFresh(values[key])) stored = values[key];
+      } else {
+        storedSlots = new Map();
+        const values = (await store.get(null)) || {};
+        for (const [key, value] of Object.entries(values)) {
+          if (!key.startsWith(LAST_ACT_SLOT_PREFIX) || !lastActFresh(value)) continue;
+          const id = Number(key.slice(LAST_ACT_SLOT_PREFIX.length));
+          if (Number.isInteger(id)) storedSlots.set(id, value);
+        }
       }
     }
   } catch (_) { /* storage.session 不可用：用内存兜底 */ }
-  const memory = lastActContext
-    && (!lastActContext.updatedAt || Date.now() - lastActContext.updatedAt <= LAST_ACT_TTL_MS)
-    ? lastActContext : null;
-  // 并发 act 的内存写入和 storage 写入完成顺序可能不同：只取较新的上下文。
-  let value = null;
-  if (stored && memory) {
-    value = (Number(stored.updatedAt) || 0) >= (Number(memory.updatedAt) || 0) ? stored : memory;
-  } else {
-    value = stored || memory;
+
+  if (slotId !== null) {
+    const memory = lastActFresh(lastActSlots.get(slotId)) ? lastActSlots.get(slotId) : null;
+    // 并发 act 的内存写入和 storage 写入完成顺序可能不同：只取较新的上下文。
+    const value = lastActNewer(stored, memory);
+    if (value) lastActSlots.set(slotId, value);
+    else lastActSlots.delete(slotId);
+    return value || null;
   }
-  lastActContext = value;
-  return value;
+
+  // 无参调用：清理过期内存槽，再把 storage 里每个槽与内存对齐，最后取全局最新。
+  for (const [id, value] of [...lastActSlots]) {
+    if (!lastActFresh(value)) lastActSlots.delete(id);
+  }
+  for (const [id, value] of storedSlots || []) {
+    lastActSlots.set(id, lastActNewer(value, lastActSlots.get(id)));
+  }
+  let newest = null;
+  for (const value of lastActSlots.values()) newest = lastActNewer(newest, value);
+  return newest;
 }
 
 async function saveLastAct(context) {
-  const value = { ...context, updatedAt: Date.now() };
-  if (!lastActContext || value.updatedAt >= (Number(lastActContext.updatedAt) || 0)) {
-    lastActContext = value;
+  const tabId = lastActSlotId(context && context.tabId);
+  if (tabId === null) {
+    fail('invalid_argument', 'lastAct context is missing an integer tabId',
+      'internal: act must set context.tabId before saveLastAct');
   }
-  // 串行化 storage 写入，避免较早的 act 在较晚的 clear/save 之后落盘。
+  const value = { ...context, tabId, updatedAt: Date.now() };
+  const key = LAST_ACT_SLOT_PREFIX + tabId;
+  const current = lastActSlots.get(tabId);
+  if (!current || (Number(value.updatedAt) || 0) >= (Number(current.updatedAt) || 0)) {
+    lastActSlots.set(tabId, value);
+  }
+  // 串行化 storage 写入，避免较早的 act 在较晚的 clear/save 之后落盘；
+  // 只比较同一槽的新旧，跨槽写入互不覆盖。
   const write = lastActWrite.then(async () => {
-    const current = lastActContext;
-    if (current && (Number(current.updatedAt) || 0) > (Number(value.updatedAt) || 0)) return;
+    const latest = lastActSlots.get(tabId);
+    if (latest && (Number(latest.updatedAt) || 0) > (Number(value.updatedAt) || 0)) return;
     try {
       const store = chrome.storage && chrome.storage.session;
-      if (store) await store.set({ [LAST_ACT_KEY]: value });
+      if (store) await store.set({ [key]: value });
     } catch (_) { /* 忽略：内存上下文仍然可用 */ }
   });
   lastActWrite = write.catch(() => {});
@@ -50,14 +103,27 @@ async function saveLastAct(context) {
   return value;
 }
 
-async function clearLastAct() {
-  lastActContext = null;
+/** 传 tabId 只清该槽；不传时清全部槽（open 的调用保持原语义）。 */
+async function clearLastAct(tabId) {
+  const slotId = lastActSlotId(tabId);
+  if (slotId === null) lastActSlots.clear();
+  else lastActSlots.delete(slotId);
   const write = lastActWrite.then(async () => {
-    // 清空之后才 save 的新上下文不受影响；这里只删除已经落盘的旧值。
-    if (lastActContext) return;
     try {
       const store = chrome.storage && chrome.storage.session;
-      if (store) await store.remove(LAST_ACT_KEY);
+      if (!store) return;
+      if (slotId !== null) {
+        // 清空之后才 save 的新上下文不受影响；这里只删除已经落盘的旧值。
+        if (lastActSlots.has(slotId)) return;
+        await store.remove(LAST_ACT_SLOT_PREFIX + slotId);
+        return;
+      }
+      const values = (await store.get(null)) || {};
+      const keys = Object.keys(values).filter((key) => {
+        if (!key.startsWith(LAST_ACT_SLOT_PREFIX)) return false;
+        return !lastActSlots.has(Number(key.slice(LAST_ACT_SLOT_PREFIX.length)));
+      });
+      if (keys.length) await store.remove(keys);
     } catch (_) { /* ignore */ }
   });
   lastActWrite = write.catch(() => {});
@@ -284,7 +350,9 @@ async function awaitPendingAction(args) {
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > WAIT_MAX_SECONDS) {
     fail('invalid_argument', `await timeout must be between 0 and ${WAIT_MAX_SECONDS} seconds`, 'fix await duration');
   }
-  const context = await loadLastAct();
+  let context = await loadLastAct(args.tabId);
+  // 指定 tab 但没有对应槽时，退回“最近一次”：args.tabId 可能正是上次动作新建的 tab。
+  if (!context && args.tabId !== undefined) context = await loadLastAct();
   if (!context) {
     fail('no_pending_action', 'no recent act to await',
       'call `ema2 act ...` first, or use `ema2 wait text|selector|time|idle`');
@@ -332,14 +400,20 @@ async function actTool(args) {
   const batch = Array.isArray(args.steps) && args.steps.length > 0;
   const steps = batch ? args.steps : [args];
   if (steps.length > 20) fail('too_many_steps', 'at most 20 steps', 'split the batch');
-  await clearLastAct();
+  await clearLastAct(tab.id);
   try { await ensureHelpers(tab.id); } catch (_) { /* action will report a clearer error */ }
   const before = await pageState(tab.id);
-  // 动作前装 hook，并记录网络水位 {document epoch, seq}；不同文档的 seq 不可比较。
+  // 动作前装 hook，并记录网络水位 {document epoch, seq, installed}；不同文档的 seq 不可比较。
+  const actionStartedAt = Date.now();
   try { await ensureNetworkHook(tab.id); } catch (_) { /* non-http page */ }
   const netBaseline = await networkMark(tab.id);
+  netBaseline.actionStartedAt = actionStartedAt;
+  netBaseline.pageUrl = before.url || '';
+  netBaseline.pageOrigin = before.origin || 0;
   let lastActionNetBaseline = netBaseline;
   try { await ensureConsoleHook(tab.id); } catch (_) { /* ignore */ }
+  // 动作前的 console 水位：动作结束后只统计这之后新增的 error。
+  let lastActionConsoleMark = await consoleMark(tab.id);
   // page_guard 已由 withCommandGuard/guardTargetForTool 在动作前安装；
   // 这里不能重复注入，否则每个 act 都会多一次 all-frames executeScript。
   const guardSeq = await guardMark(tab.id);
@@ -362,7 +436,7 @@ async function actTool(args) {
         results.push(`step${index + 1} ${text}`);
         okCount++;
         // await 可能发现了 settle 阶段还没出现的新标签；后续 waitFor 必须用它。
-        const awaited = await loadLastAct();
+        const awaited = await loadLastAct(tab.id);
         if (awaited && awaited.targetTabId) awaitedTargetTabId = awaited.targetTabId;
         if (awaited && awaited.newTabId && !newTabIds.includes(awaited.newTabId)) {
           newTabIds.push(awaited.newTabId);
@@ -412,16 +486,19 @@ async function actTool(args) {
     let tabsBefore = [];
     try { tabsBefore = await chrome.tabs.query({}); } catch (_) { /* ignore */ }
     // waitFor 要匹配“上一步动作”产生的响应/导航，baseline 必须在该动作之前取。
+    const stepStartedAt = Date.now();
     lastActionNetBaseline = await networkMark(tab.id);
     lastActionNetBaseline.pageUrl = stepBefore.url || '';
     lastActionNetBaseline.pageOrigin = stepBefore.origin || 0;
+    lastActionNetBaseline.actionStartedAt = stepStartedAt;
+    lastActionConsoleMark = await consoleMark(tab.id);
     let outcome;
     try {
       await ensureHelpers(tab.id);
       if (step.selector) await requireValidSelector(tab.id, step.selector);
       outcome = await runStepWithRetry(tab, step);
     } catch (error) {
-      await clearLastAct();
+      await clearLastAct(tab.id);
       if (error instanceof ToolError) {
         if (batch) error.message = `steps[${index + 1}] ${step.action}: ${error.message}`;
         error.lines = [...(error.lines || []), ...results];
@@ -593,7 +670,7 @@ async function actTool(args) {
     const newRefs = await newRefsSince(tab.id, before.refSeq, before.doc);
     if (newRefs.length) lines.push('new=' + newRefs.join(' | '));
   }
-  const consoleErrors = await consoleErrorCount(summaryTabId);
+  const consoleErrors = await consoleErrorCount(summaryTabId, lastActionConsoleMark);
   if (consoleErrors > 0) lines.push(`console_errors=${consoleErrors}`);
   return lines.join('\n');
 }
@@ -662,11 +739,20 @@ async function waitForResponse(tabId, spec, baselineOverride) {
   const current = await networkMark(tabId);
   let since = current.seq;
   let reset = false;
+  let baselineLost = false;
+  let minStartedAt = 0;
   if (baselineOverride && typeof baselineOverride === 'object') {
-    if (baselineOverride.epoch === current.epoch) {
+    minStartedAt = Number(baselineOverride.actionStartedAt) || 0;
+    if (baselineOverride.installed === false || !baselineOverride.epoch) {
+      // hook 从未安装（epoch 为空）：没有可信基线，只能从当前水位往后看，
+      // 绝不让 ensureNetworkHook 刚回填的历史请求被当成本次响应。
+      since = current.seq;
+      baselineLost = true;
+    } else if (baselineOverride.epoch === current.epoch) {
       since = Math.min(baselineOverride.seq || 0, current.seq);
     } else {
-      // 导航后 hook 重建、seq 从 0 开始：从新文档起点匹配，而不是跨序列取 min。
+      // 导航后 hook 重建、seq 从 0 开始：从新文档起点匹配，而不是跨序列取 min；
+      // 旧文档的回填条目由扫描时的 minStartedAt 过滤掉。
       since = 0;
       reset = true;
     }
@@ -697,13 +783,21 @@ async function waitForResponse(tabId, spec, baselineOverride) {
     // 导航/重定向期间 executeScript 可能瞬时失败；waitFor 应该继续等，而不是把整次 act 判失败。
     let scan = null;
     try {
-      scan = await runInTab(tabId, (sinceSeq, url, status) => {
+      scan = await runInTab(tabId, (sinceSeq, url, status, minStart) => {
         const state = window.__ema2_net;
         if (!state) return { hit: null, uncertain: false };
         let gap = false;
         for (const entry of state.entries) {
           if (entry.seq <= sinceSeq) continue;
           const urlMatch = !url || String(entry.url).toLowerCase().includes(url);
+          // performance 回填条目只能证明“动作前发生过”：startedAt 不早于动作起点才算本次结果，
+          // 缺失或更早的一律跳过，只用于 gap/uncertain 判定。
+          if (entry.backfilled === true || entry.preview === 'history') {
+            if (!(Number(entry.startedAt) >= minStart)) {
+              if (urlMatch) gap = true;
+              continue;
+            }
+          }
           // status=-1 是 hook 安装前的 performance 回填：只能说明发生过，不能证明本次动作的响应。
           if (entry.status < 0) {
             if (urlMatch) gap = true;
@@ -717,7 +811,7 @@ async function waitForResponse(tabId, spec, baselineOverride) {
           };
         }
         return { hit: null, uncertain: gap };
-      }, [since, wantUrl, wantStatus], 'MAIN');
+      }, [since, wantUrl, wantStatus, minStartedAt], 'MAIN');
     } catch (_) {
       // 导航中可重试；tab 被关掉则立即失败，不要空等到 timeout。
       try { await chrome.tabs.get(tabId); }
@@ -725,7 +819,7 @@ async function waitForResponse(tabId, spec, baselineOverride) {
     }
     if (scan && scan.uncertain) uncertain = true;
     if (scan && scan.hit) {
-      return `response=${scan.hit.status} ${scan.hit.method} ${absoluteUrl(scan.hit.url)} ${scan.hit.ms}ms${reset ? ' doc=reset' : ''}`;
+      return `response=${scan.hit.status} ${scan.hit.method} ${absoluteUrl(scan.hit.url)} ${scan.hit.ms}ms${reset ? ' doc=reset' : ''}${baselineLost ? ' baseline_lost=1' : ''}`;
     }
     await sleep(120);
   }
@@ -799,12 +893,21 @@ async function newRefsSince(tabId, seq, epoch) {
   }
 }
 
-async function consoleErrorCount(tabId) {
+/**
+ * 统计 console error 数量。传 mark 时只统计同一 console epoch 且 seq 大于水位的条目；
+ * epoch 变化（导航到新文档）时统计新文档里的全部 error；无水位时退回全量统计。
+ */
+async function consoleErrorCount(tabId, mark) {
+  const scoped = !!mark && typeof mark === 'object';
+  const markEpoch = scoped ? String(mark.epoch || '') : '';
+  const markSeq = scoped ? Number(mark.seq) || 0 : 0;
   try {
-    return await runInTab(tabId, () => {
+    return await runInTab(tabId, (epoch, seq, useMark) => {
       if (!window.__ema2_console) return 0;
-      return window.__ema2_console.filter(e => (e.order || 0) >= 4).length;
-    }, [], 'MAIN');
+      const sameDoc = useMark && !!epoch && (window.__ema2_console_epoch || '') === epoch;
+      return window.__ema2_console.filter(e => (e.order || 0) >= 4
+        && (!sameDoc || (e.seq || 0) > seq)).length;
+    }, [markEpoch, markSeq, scoped], 'MAIN');
   } catch (_) { return 0; }
 }
 

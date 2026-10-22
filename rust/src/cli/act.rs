@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use super::ToolCall;
-use super::shared::{TokenCursor, parse_duration_secs, parse_port, set_opt};
+use super::shared::{TokenCursor, parse_duration_secs, parse_port, set_opt, split_flag};
 
 const ACT_ACTIONS: &[&str] = &[
     "click", "type", "fill", "select", "press", "hover", "scroll", "submit", "back", "forward",
@@ -60,6 +60,53 @@ fn check_ref_token(token: &str) -> Result<(), String> {
     ))
 }
 
+/// 重复 flag 不能静默 last-wins：多写一个 `--tab` 会悄悄改变目标标签。
+fn set_once<T>(slot: &mut Option<T>, value: T, context: &str, flag: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("{context}: {flag} given twice"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// 三个定位器（裸 ref / selector= / target=）只能出现一个，否则扩展按 ref 优先，
+/// 其余参数会被静默忽略（`act click e12 --selector '#x'` 实际点 e12）。
+fn ensure_single_locator(
+    r#ref: Option<&str>,
+    selector: Option<&str>,
+    target: Option<&str>,
+    context: &str,
+) -> Result<(), String> {
+    let locators = [
+        r#ref
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| "ref"),
+        selector
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| "selector"),
+        target
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| "target"),
+    ];
+    let used: Vec<&str> = locators.into_iter().flatten().collect();
+    if used.len() > 1 {
+        return Err(format!(
+            "{context}: use only one of ref, selector=, target= (got {})",
+            used.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// CLI 与 daemon 共用 tools.rs 的 waitFor 校验，避免 timeout=60 / url= 只在
+/// 扩展侧才失败。
+fn validate_wait_for_value(value: &Value, context: &str) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err(format!("{context}: waitFor must be an object"));
+    };
+    crate::tools::validate_wait_for_spec(object).map_err(|error| format!("{context}: {error}"))
+}
+
 pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
     let mut selector: Option<String> = None;
     let mut target: Option<String> = None;
@@ -87,42 +134,63 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             cursor.advance();
             continue;
         }
-        // 值型 flag：取下一个 token；缺失时报错而不是 panic。
-        match token {
-            "--selector" => selector = Some(cursor.required_next("act", "--selector")?),
-            "--target" => target = Some(cursor.required_next("act", "--target")?),
-            "--key" => key = Some(cursor.required_next("act", "--key")?),
+        // 值型 flag：`--flag value` 与 `--flag=value` 都支持；缺失时报错而不是 panic。
+        let (flag, inline) = split_flag(token);
+        match flag {
+            "--selector" => {
+                let value = cursor.take_flag_value(inline, "act", "--selector")?;
+                set_once(&mut selector, value, "act", "--selector")?;
+            }
+            "--target" => {
+                let value = cursor.take_flag_value(inline, "act", "--target")?;
+                set_once(&mut target, value, "act", "--target")?;
+            }
+            "--key" => {
+                let value = cursor.take_flag_value(inline, "act", "--key")?;
+                set_once(&mut key, value, "act", "--key")?;
+            }
             "--delta-y" => {
-                let value = cursor.required_next("act", "--delta-y")?;
-                delta_y = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("act: invalid --delta-y {value:?}"))?,
-                );
+                let value = cursor.take_flag_value(inline, "act", "--delta-y")?;
+                let parsed: f64 = value
+                    .parse()
+                    .map_err(|_| format!("act: invalid --delta-y {value:?}"))?;
+                if !parsed.is_finite() {
+                    return Err(format!("act: invalid --delta-y {value:?}"));
+                }
+                set_once(&mut delta_y, parsed, "act", "--delta-y")?;
             }
             "--tab" => {
-                let value = cursor.required_next("act", "--tab")?;
-                tab = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("act: invalid --tab {value:?}"))?,
-                );
+                let value = cursor.take_flag_value(inline, "act", "--tab")?;
+                let parsed: u64 = value
+                    .parse()
+                    .map_err(|_| format!("act: invalid --tab {value:?}"))?;
+                set_once(&mut tab, parsed, "act", "--tab")?;
             }
             "--port" => {
-                let value = cursor.required_next("act", "--port")?;
-                port_override = Some(
-                    parse_port(&value)
-                        .map_err(|error| format!("act: invalid --port {value:?}: {error}"))?,
-                );
+                let value = cursor.take_flag_value(inline, "act", "--port")?;
+                let parsed = parse_port(&value)
+                    .map_err(|error| format!("act: invalid --port {value:?}: {error}"))?;
+                set_once(&mut port_override, parsed, "act", "--port")?;
             }
-            "--wait-for" => wait_for = Some(cursor.required_next("act", "--wait-for")?),
-            "--steps" => steps_inline = Some(cursor.required_next("act", "--steps")?),
-            "--script" => script_path = Some(cursor.required_next("act", "--script")?),
+            "--wait-for" => {
+                let value = cursor.take_flag_value(inline, "act", "--wait-for")?;
+                set_once(&mut wait_for, value, "act", "--wait-for")?;
+            }
+            "--steps" => {
+                let value = cursor.take_flag_value(inline, "act", "--steps")?;
+                set_once(&mut steps_inline, value, "act", "--steps")?;
+            }
+            "--script" => {
+                let value = cursor.take_flag_value(inline, "act", "--script")?;
+                set_once(&mut script_path, value, "act", "--script")?;
+            }
             "--submit" => {
                 // 布尔 flag：不消耗下一个 token，否则 `--submit e1 hi` 会吞掉 ref。
+                if inline.is_some() {
+                    return Err("act: --submit does not take a value".into());
+                }
                 submit_flag = true;
                 cursor.advance();
-                continue;
             }
             other if other.starts_with('-') => {
                 // trailing_var_arg + allow_hyphen_values 会把拼错的 flag 变成位置参数；
@@ -134,10 +202,8 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             other => {
                 positional.push(other.to_owned());
                 cursor.advance();
-                continue;
             }
         }
-        cursor.advance_by(2);
     }
 
     if let Some(path) = &script_path {
@@ -180,6 +246,10 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
         }
         let parsed = parse_act_script(&source)?;
         let mut steps = parsed["steps"].as_array().cloned().unwrap_or_default();
+        // 先校验脚本本身，再注入 --wait-for：20 步脚本 + waitFor 是合法的 21 步。
+        if steps.is_empty() || steps.len() > 20 {
+            return Err("act: script must contain 1..20 steps; run `ema2 act --help`".into());
+        }
         if let Some(wait_for) = &wait_for {
             // 脚本里已经有 waitFor 时不再追加第二个；没有则挂在整次调用末尾。
             if steps
@@ -190,12 +260,15 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                     "act: only one waitFor per call (--wait-for or a script waitFor line)".into(),
                 );
             }
-            let mut step = parse_wait_for(wait_for)?;
+            let tokens =
+                tokenize_line(wait_for).map_err(|error| format!("act waitFor: {error}"))?;
+            let mut step = parse_wait_for(&tokens)?;
             step["action"] = json!("waitFor");
+            validate_wait_for_value(&step, "act waitFor")?;
             steps.push(step);
-        }
-        if steps.is_empty() || steps.len() > 20 {
-            return Err("act: script must contain 1..20 steps; run `ema2 act --help`".into());
+            if steps.len() > 21 {
+                return Err("act: --wait-for adds one step; scripts allow at most 20 + 1".into());
+            }
         }
         arguments["steps"] = json!(steps);
     } else {
@@ -228,7 +301,11 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
         }
         let rest: Vec<String> = positional[1..].to_vec();
         if let Some(wait_for) = &wait_for {
-            arguments["waitFor"] = parse_wait_for(wait_for)?;
+            let tokens =
+                tokenize_line(wait_for).map_err(|error| format!("act waitFor: {error}"))?;
+            let parsed = parse_wait_for(&tokens)?;
+            validate_wait_for_value(&parsed, "act waitFor")?;
+            arguments["waitFor"] = parsed;
         }
         arguments["action"] = json!(action);
         set_opt(&mut arguments, "selector", selector.clone());
@@ -246,18 +323,42 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
             "click" | "hover" | "submit" => {
                 if rest.len() > 1 {
                     return Err(format!(
-                        "act {action}: unexpected extra argument {:?}; quote values with spaces",
-                        rest[1]
+                        "act {action}: takes at most one ref; use --selector/--target for CSS/role locators"
                     ));
                 }
-                if let Some(r#ref) = rest.first() {
+                let positional_ref = rest.first();
+                if let Some(r#ref) = positional_ref {
                     check_ref_token(r#ref)?;
+                }
+                ensure_single_locator(
+                    positional_ref.map(String::as_str),
+                    selector.as_deref(),
+                    target.as_deref(),
+                    &format!("act {action}"),
+                )?;
+                if let Some(r#ref) = positional_ref {
                     arguments["ref"] = json!(r#ref);
                 }
             }
             "type" | "fill" | "select" => {
                 // 位置参数有两种形态：`[ref] <text>` 或（有 --selector/--target 时）`<text>`。
                 let located = selector.is_some() || target.is_some();
+                // 有命名定位器时，两个位置参数只可能是“ref + 忘记加引号的文本”；
+                // 若首 token 是合法 ref，就按定位器冲突报，而不是误导成引号问题。
+                let ref_candidate = if located {
+                    rest.len()
+                        .eq(&2)
+                        .then(|| rest[0].as_str())
+                        .filter(|token| check_ref_token(token).is_ok())
+                } else {
+                    rest.first().map(String::as_str)
+                };
+                ensure_single_locator(
+                    ref_candidate,
+                    selector.as_deref(),
+                    target.as_deref(),
+                    &format!("act {action}"),
+                )?;
                 let (text, positional_ref) = if located {
                     if rest.len() != 1 {
                         return Err(format!(
@@ -321,6 +422,12 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                 } else {
                     None
                 };
+                ensure_single_locator(
+                    positional_ref.as_deref(),
+                    selector.as_deref(),
+                    target.as_deref(),
+                    "act press",
+                )?;
                 let press_key = key
                     .clone()
                     .or_else(|| rest.get(1).cloned())
@@ -351,14 +458,17 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
                     direction = Some("down".to_owned());
                 }
                 if let Some(dir) = direction {
-                    let count = rest.get(1).cloned().unwrap_or_else(|| "1".to_owned());
-                    let count: f64 = count
+                    let raw = rest.get(1).cloned().unwrap_or_else(|| "1".to_owned());
+                    let count: u64 = raw
                         .parse()
                         .map_err(|_| format!("act scroll: invalid count {:?}", rest.get(1)))?;
-                    if count < 1.0 || count.fract() != 0.0 {
+                    if count == 0 {
                         return Err("act scroll: count must be a positive integer".into());
                     }
-                    arguments["text"] = json!(format!("{dir} {}", count as u64));
+                    if count > 1000 {
+                        return Err("act scroll: count must be at most 1000".into());
+                    }
+                    arguments["text"] = json!(format!("{dir} {count}"));
                 }
             }
             "back" | "forward" | "reload" => {
@@ -378,10 +488,12 @@ pub fn build_act(tokens: &[String]) -> Result<ToolCall, String> {
 /// `--wait-for "url=api/save status=200 timeout=5s"` 或
 /// `--wait-for "text=保存成功 timeout=5s"` → waitFor 对象。
 ///
+/// 接收已经分好的 token（脚本入口直接传 `tokens[1..]`，flag 入口先 `tokenize_line`），
+/// 避免把 `selector=#main a` 这样的单 token 再次按空格撕开。
+///
 /// 网络/导航条件（url/status）和页面条件（text/textGone/selector）是两种语义：
 /// 前者可以 url+status 组合，后者与 `ema2 wait` 一样只接受一个条件。
-fn parse_wait_for(input: &str) -> Result<Value, String> {
-    let tokens = tokenize_line(input)?;
+fn parse_wait_for(tokens: &[String]) -> Result<Value, String> {
     let mut out = json!({});
     for token in tokens {
         let Some((key, value)) = token.split_once('=') else {
@@ -395,7 +507,12 @@ fn parse_wait_for(input: &str) -> Result<Value, String> {
             ));
         };
         match key {
-            "url" => out["url"] = json!(value),
+            "url" => {
+                if value.trim().is_empty() {
+                    return Err("act waitFor: url= must not be empty".into());
+                }
+                out["url"] = json!(value);
+            }
             "status" => {
                 let status: u16 = value
                     .parse()
@@ -447,14 +564,43 @@ fn parse_wait_for(input: &str) -> Result<Value, String> {
     Ok(out)
 }
 
+/// 行尾 `#` 注释：引号外、且位于行首或空白之后才算注释；
+/// 引号内的 `#`（`fill e1 "#hashtag"`）与 `e1#x` 这类紧贴 token 的 `#` 保留。
+fn strip_trailing_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut previous: Option<char> = None;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            previous = Some(ch);
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes && previous.is_none_or(char::is_whitespace) => {
+                return &line[..index];
+            }
+            _ => {}
+        }
+        previous = Some(ch);
+    }
+    line
+}
+
 /// `.ema2` 脚本 / `--steps` 文本 → steps[] 数组。
 ///
-/// 语法：每行一条；空行与 `#` 注释忽略；含空格的值加双引号（支持 `\"` 转义）；
-/// `waitFor` 是独立步骤，保持它在脚本中的位置（不再挪到整次调用末尾）。
+/// 语法：每行一条；空行与 `#` 注释（行首或行尾）忽略；含空格的值加双引号
+/// （支持 `\"` 转义）；`waitFor` 是独立步骤，保持它在脚本中的位置
+/// （不再挪到整次调用末尾）。
 fn parse_act_script(source: &str) -> Result<Value, String> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut steps = Vec::new();
     for (number, raw) in source.lines().enumerate() {
-        if raw.trim().is_empty() || raw.trim_start().starts_with('#') {
+        // 注释在拆语句之前剥离：`click e1 # note; click e2` 的整段注释都不会成为语句。
+        let raw = strip_trailing_comment(raw);
+        if raw.trim().is_empty() {
             continue;
         }
         for line in split_statements(raw) {
@@ -468,8 +614,12 @@ fn parse_act_script(source: &str) -> Result<Value, String> {
                 .first()
                 .ok_or_else(|| format!("script line {}: empty statement", number + 1))?;
             if action == "waitFor" {
-                let mut parsed = parse_wait_for(&tokens[1..].join(" "))
+                let mut parsed = parse_wait_for(&tokens[1..])
                     .map_err(|error| format!("script line {}: {error}", number + 1))?;
+                crate::tools::validate_wait_for_spec(
+                    parsed.as_object().expect("waitFor is always an object"),
+                )
+                .map_err(|error| format!("script line {}: {error}", number + 1))?;
                 parsed["action"] = json!("waitFor");
                 steps.push(parsed);
                 continue;
@@ -530,17 +680,39 @@ fn parse_act_script(source: &str) -> Result<Value, String> {
                 "click" | "hover" | "submit" => {
                     if rest.len() > 1 {
                         return Err(script_error(format!(
-                            "{action}: unexpected extra argument {:?}; quote values with spaces",
-                            rest[1]
+                            "{action}: takes at most one ref; use selector=/target= for CSS/role locators"
                         )));
                     }
-                    if let Some(r#ref) = rest.first() {
+                    let positional_ref = rest.first();
+                    if let Some(r#ref) = positional_ref {
                         check_ref_token(r#ref).map_err(script_error)?;
+                    }
+                    ensure_single_locator(
+                        positional_ref.map(String::as_str),
+                        step.get("selector").and_then(Value::as_str),
+                        step.get("target").and_then(Value::as_str),
+                        &script_error(action.to_string()),
+                    )?;
+                    if let Some(r#ref) = positional_ref {
                         step["ref"] = json!(r#ref);
                     }
                 }
                 "type" | "fill" | "select" => {
                     let located = step.get("selector").is_some() || step.get("target").is_some();
+                    let ref_candidate = if located {
+                        rest.len()
+                            .eq(&2)
+                            .then(|| rest[0].as_str())
+                            .filter(|token| check_ref_token(token).is_ok())
+                    } else {
+                        rest.first().map(String::as_str)
+                    };
+                    ensure_single_locator(
+                        ref_candidate,
+                        step.get("selector").and_then(Value::as_str),
+                        step.get("target").and_then(Value::as_str),
+                        &script_error(action.to_string()),
+                    )?;
                     let (text, positional_ref) = if located {
                         if rest.len() != 1 {
                             return Err(script_error(format!(
@@ -598,10 +770,17 @@ fn parse_act_script(source: &str) -> Result<Value, String> {
                         .or_else(|| rest.first())
                         .cloned()
                         .ok_or_else(|| script_error("press needs a key".into()))?;
+                    let positional_ref = (rest.len() >= 2).then(|| rest[0].as_str());
+                    ensure_single_locator(
+                        positional_ref,
+                        step.get("selector").and_then(Value::as_str),
+                        step.get("target").and_then(Value::as_str),
+                        &script_error("press".into()),
+                    )?;
                     step["key"] = json!(key);
-                    if rest.len() >= 2 {
-                        check_ref_token(&rest[0]).map_err(script_error)?;
-                        step["ref"] = json!(rest[0]);
+                    if let Some(r#ref) = positional_ref {
+                        check_ref_token(r#ref).map_err(script_error)?;
+                        step["ref"] = json!(r#ref);
                     }
                 }
                 "scroll" => {
@@ -612,16 +791,19 @@ fn parse_act_script(source: &str) -> Result<Value, String> {
                     if direction != "down" && direction != "up" {
                         return Err(script_error("scroll direction must be down|up".into()));
                     }
-                    let count = rest.get(1).cloned().unwrap_or_else(|| "1".to_owned());
-                    let count: f64 = count
+                    let raw = rest.get(1).cloned().unwrap_or_else(|| "1".to_owned());
+                    let count: u64 = raw
                         .parse()
                         .map_err(|_| script_error("invalid scroll count".into()))?;
-                    if count < 1.0 || count.fract() != 0.0 {
+                    if count == 0 {
                         return Err(script_error(
                             "scroll count must be a positive integer".into(),
                         ));
                     }
-                    step["text"] = json!(format!("{direction} {}", count as u64));
+                    if count > 1000 {
+                        return Err(script_error("scroll count must be at most 1000".into()));
+                    }
+                    step["text"] = json!(format!("{direction} {count}"));
                 }
                 "back" | "forward" | "reload" => {
                     if !rest.is_empty() {
@@ -1134,5 +1316,195 @@ click target=\"button:提交\"
         // 合法组合仍然可用。
         assert!(build_act(&["press".into(), "e1".into(), "--key".into(), "Enter".into()]).is_ok());
         assert!(build_act(&["scroll".into(), "--delta-y".into(), "-100".into()]).is_ok());
+    }
+
+    /// P1-2：脚本里的 waitFor 不能把已经分好的 token 再按空格撕开。
+    #[test]
+    fn script_wait_for_keeps_quoted_spaces() {
+        let parsed = parse_act_script("waitFor selector=\"#main a\" timeout=3s").unwrap();
+        assert_eq!(parsed["steps"][0]["selector"], "#main a");
+        assert_eq!(parsed["steps"][0]["timeout"], 3.0);
+
+        let parsed = parse_act_script("waitFor text=\"保存 成功\" timeout=3s").unwrap();
+        assert_eq!(parsed["steps"][0]["text"], "保存 成功");
+
+        let call = build_act(&["--steps".into(), "waitFor selector=\"#main a\"".into()]).unwrap();
+        assert_eq!(call.args["steps"][0]["selector"], "#main a");
+
+        // 未加引号时仍然报 key=value，而不是把第二个词当条件。
+        let error = parse_act_script("waitFor selector=#main a").unwrap_err();
+        assert!(error.contains("expected key=value"), "{error}");
+
+        // --wait-for 字符串入口先 tokenize 一次，再走同一个函数。
+        let call = build_act(&[
+            "click".into(),
+            "e1".into(),
+            "--wait-for".into(),
+            "selector=\"#main a\" timeout=3s".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["waitFor"]["selector"], "#main a");
+    }
+
+    /// P1-3：裸 ref 与 selector=/target= 不能同时出现（扩展按 ref 优先，其余会被忽略）。
+    #[test]
+    fn locators_are_mutually_exclusive() {
+        let error = build_act(&[
+            "click".into(),
+            "e12".into(),
+            "--selector".into(),
+            "#x".into(),
+        ])
+        .err()
+        .expect("expected an error");
+        assert!(error.contains("use only one of ref"), "{error}");
+
+        let error = build_act(&[
+            "click".into(),
+            "e12".into(),
+            "--selector".into(),
+            "#x".into(),
+            "--target".into(),
+            "button:y".into(),
+        ])
+        .err()
+        .expect("expected an error");
+        assert!(error.contains("use only one of ref"), "{error}");
+
+        let error = build_act(&[
+            "press".into(),
+            "e1".into(),
+            "Enter".into(),
+            "--selector".into(),
+            "#x".into(),
+        ])
+        .err()
+        .expect("expected an error");
+        assert!(error.contains("use only one of ref"), "{error}");
+
+        // 脚本分支同样互斥。
+        for script in [
+            "click selector=#x e1",
+            "fill selector=#x e1 hello",
+            "press selector=#x e1 Enter",
+            "type target=button:x e1 hello",
+        ] {
+            let error = parse_act_script(script).unwrap_err();
+            assert!(error.contains("use only one of ref"), "{script}: {error}");
+        }
+    }
+
+    /// 多参数报错要区分动作：click 没有“加引号”这种说法。
+    #[test]
+    fn extra_argument_hint_depends_on_action() {
+        let error = build_act(&["click".into(), "e1".into(), "extra".into()])
+            .err()
+            .expect("expected an error");
+        assert!(error.contains("takes at most one ref"), "{error}");
+        assert!(!error.contains("quote values with spaces"), "{error}");
+
+        let error = build_act(&["type".into(), "e1".into(), "hello".into(), "world".into()])
+            .err()
+            .expect("expected an error");
+        assert!(error.contains("quote values with spaces"), "{error}");
+
+        let error = parse_act_script("click e1 extra").unwrap_err();
+        assert!(error.contains("takes at most one ref"), "{error}");
+    }
+
+    #[test]
+    fn flags_accept_inline_values_and_reject_duplicates() {
+        let call = build_act(&[
+            "click".into(),
+            "e1".into(),
+            "--tab=3".into(),
+            "--wait-for=url=api/save timeout=2s".into(),
+        ])
+        .unwrap();
+        assert_eq!(args_of(&call)["tabId"], 3);
+        assert_eq!(args_of(&call)["waitFor"]["url"], "api/save");
+
+        let call = build_act(&["press".into(), "e1".into(), "--key=Enter".into()]).unwrap();
+        assert_eq!(args_of(&call)["key"], "Enter");
+
+        let error = build_act(&[
+            "click".into(),
+            "e1".into(),
+            "--tab".into(),
+            "1".into(),
+            "--tab".into(),
+            "2".into(),
+        ])
+        .err()
+        .expect("expected an error");
+        assert!(error.contains("--tab given twice"), "{error}");
+
+        let error = build_act(&[
+            "click".into(),
+            "--selector=#a".into(),
+            "--selector=#b".into(),
+        ])
+        .err()
+        .expect("expected an error");
+        assert!(error.contains("--selector given twice"), "{error}");
+
+        assert!(build_act(&["click".into(), "e1".into(), "--tab=".into()]).is_err());
+        assert!(build_act(&["click".into(), "e1".into(), "--submit=true".into()]).is_err());
+    }
+
+    #[test]
+    fn numeric_flags_reject_non_finite_and_oversized_values() {
+        assert!(build_act(&["scroll".into(), "--delta-y".into(), "nan".into()]).is_err());
+        assert!(build_act(&["scroll".into(), "--delta-y=inf".into()]).is_err());
+        assert!(build_act(&["scroll".into(), "--delta-y".into(), "-100".into()]).is_ok());
+
+        // 1e30 以前会被 saturating cast 成 u64::MAX。
+        assert!(build_act(&["scroll".into(), "down".into(), "1e30".into()]).is_err());
+        assert!(build_act(&["scroll".into(), "down".into(), "1001".into()]).is_err());
+        assert!(build_act(&["scroll".into(), "down".into(), "1000".into()]).is_ok());
+        let error = build_act(&["scroll".into(), "down".into(), "0".into()])
+            .err()
+            .expect("expected an error");
+        assert!(error.contains("positive integer"), "{error}");
+        assert!(parse_act_script("scroll down 1e30").is_err());
+        assert!(parse_act_script("scroll down 0").is_err());
+    }
+
+    #[test]
+    fn script_strips_bom_and_trailing_comments() {
+        let parsed = parse_act_script(
+            "\u{feff}click e1\ntype e2 \"#hashtag\" # 行尾注释\nfill e3 \"a#b\"\n",
+        )
+        .unwrap();
+        let steps = parsed["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0]["action"], "click");
+        assert_eq!(steps[1]["text"], "#hashtag");
+        assert_eq!(steps[2]["fields"][0]["value"], "a#b");
+
+        // 注释吞掉同一行后面的语句；紧贴 token 的 `#` 不算注释。
+        let parsed = parse_act_script("click e1 # note; click e2").unwrap();
+        assert_eq!(parsed["steps"].as_array().unwrap().len(), 1);
+        let parsed = parse_act_script("click e1#frag").unwrap_err();
+        assert!(parsed.contains("not a ref"), "{parsed}");
+    }
+
+    #[test]
+    fn steps_limit_checks_script_before_adding_wait_for() {
+        let twenty = "click e1\n".repeat(20);
+        let call = build_act(&[
+            "--steps".into(),
+            twenty.clone(),
+            "--wait-for".into(),
+            "url=api/save".into(),
+        ])
+        .unwrap();
+        assert_eq!(call.args["steps"].as_array().unwrap().len(), 21);
+
+        let twenty_one = "click e1\n".repeat(21);
+        let error = build_act(&["--steps".into(), twenty_one])
+            .err()
+            .expect("expected an error");
+        assert!(error.contains("script must contain 1..20 steps"), "{error}");
     }
 }

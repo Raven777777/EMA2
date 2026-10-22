@@ -77,7 +77,7 @@ let sessionTabs = [];
 let sessionTabsLoaded = false;
 let sessionTabsLoad = null;
 let sessionWriteChain = Promise.resolve();
-let lastActContext = null;
+// lastAct 的上下文按 tab 分槽存在 act.js；这里只保留串行写链。
 let lastActWrite = Promise.resolve();
 let commandGuardLeases = 0;
 let commandGuardLifecycle = Promise.resolve();
@@ -86,6 +86,9 @@ let commandGuardLeaseSeq = 0;
 // 只清理真正被 arm 过的 tab；动态 document_start 脚本会在新文档里报告自己。
 // SW 可能随时被回收，已 arm 的 tab 同时写入 storage.session，重启后继续 disarm。
 const commandGuardTabs = new Set();
+// 本次命令真正要操作的 tab（tabId -> 租约计数）。不在这里的标签即使新文档
+// 被 document_start guard arm，也会马上收到 lease=0 而恢复原生 API。
+const commandGuardTargetTabs = new Map();
 let commandGuardTabsLoaded = false;
 let commandGuardTabsLoad = null;
 let commandGuardTabsWrite = Promise.resolve();
@@ -258,12 +261,15 @@ async function handlePageMessage(message, sender) {
   switch (message.type) {
     case 'ema2/guard-armed': {
       const tabId = sender && sender.tab && sender.tab.id;
-      // 租约期间的导航文档也纳入清理集合；租约已释放则让页面自己 disarm。
-      if (commandGuardLeases > 0 && Number.isInteger(tabId)) {
+      // 只有本次命令的目标 tab 才续租；其它标签（如长命令期间后台打开的页）
+      // 立即拿到 lease=0，bridge 会马上让它 disarm，不吞无关的对话框。
+      const scoped = Number.isInteger(tabId) && commandGuardTargetTabs.has(tabId);
+      // 租约期间的目标 tab 导航也纳入清理集合；租约已释放则让它自己 disarm。
+      if (scoped && commandGuardLeases > 0) {
         commandGuardTabs.add(tabId);
         await persistCommandGuardTabs();
       }
-      return { ok: true, lease: commandGuardLeases };
+      return { ok: true, lease: scoped ? commandGuardLeases : 0 };
     }
     case 'ema2/state': {
       const relay = await probeRelay(port);
@@ -297,7 +303,13 @@ async function handlePageMessage(message, sender) {
 // ---------------------------------------------------------------- relay plumbing
 
 async function handleRelayMessage(data, ws) {
-  if (typeof data !== 'string' || data.length > MAX_INCOMING_CHARS) return;
+  if (typeof data !== 'string') return;
+  if (data.length > MAX_INCOMING_CHARS) {
+    // 超限消息无法安全解析出 id；关闭连接让 daemon 立刻失败，而不是等满工具超时。
+    console.warn('[EMA2] incoming relay message exceeds the size limit; closing the connection');
+    try { ws.close(1009, 'incoming message too large'); } catch (_) { /* ignore */ }
+    return;
+  }
   if (ws !== socket) return; // 旧连接的迟到消息不得影响当前状态
   let req;
   try { req = JSON.parse(data); } catch (_) { return; }
@@ -310,7 +322,13 @@ async function handleRelayMessage(data, ws) {
     lastError = '';
     return;
   }
-  if (!relayReady) return;
+  if (!relayReady) {
+    // welcome 之前收到 tools/call：明确回 JSON-RPC 错误，别让 daemon 空等到超时。
+    if (hasId) {
+      sendResponse(ws, req.id, { error: { code: -32000, message: 'bridge/welcome has not completed' } });
+    }
+    return;
+  }
   try {
     if (req.method === 'ping') { if (hasId) sendResponse(ws, req.id, { result: {} }); return; }
     if (req.method !== 'tools/call') {

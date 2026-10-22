@@ -6,9 +6,12 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+/// 响应体的累计上限：daemon 正常响应远小于此，超过即视为异常对端。
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct HttpResponse {
@@ -28,9 +31,10 @@ pub fn request(
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| std::io::Error::other("cannot resolve 127.0.0.1"))?;
+    // `timeout` 是整次请求的总预算，不只是单次 read 的超时。
+    let deadline = Instant::now() + timeout;
     let connect_timeout = timeout.min(Duration::from_secs(3));
     let mut stream = TcpStream::connect_timeout(&address, connect_timeout)?;
-    let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let _ = stream.set_nodelay(true);
 
@@ -49,9 +53,65 @@ pub fn request(
     }
     stream.flush()?;
 
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
+    let raw = read_response(&mut stream, deadline, timeout)?;
     parse_response(&raw)
+}
+
+/// 按总 deadline 读取完整响应，并限制累计字节数。
+///
+/// `SO_RCVTIMEO` 只约束单次 `read`：对端每 100ms 吐 1 字节即可无限拖住 CLI。
+/// 这里每次 read 前按剩余预算重设超时，并在累计超过 32MB 时报错。
+fn read_response(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    budget: Duration,
+) -> std::io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "HTTP response did not complete within {:.1}s ({} bytes read)",
+                    budget.as_secs_f64(),
+                    raw.len()
+                ),
+            ));
+        }
+        let remaining = (deadline - now).max(Duration::from_millis(1));
+        let _ = stream.set_read_timeout(Some(remaining));
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(raw),
+            Ok(read) => {
+                if raw.len() + read > MAX_RESPONSE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("HTTP response exceeded the {MAX_RESPONSE_BYTES} byte limit"),
+                    ));
+                }
+                raw.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "HTTP response did not complete within {:.1}s ({} bytes read)",
+                        budget.as_secs_f64(),
+                        raw.len()
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn parse_response(raw: &[u8]) -> std::io::Result<HttpResponse> {
@@ -157,7 +217,14 @@ pub fn get_json(port: u16, path: &str, timeout: Duration) -> Option<Value> {
     if response.status != 200 {
         return None;
     }
-    serde_json::from_str(&response.body).ok()
+    let value = serde_json::from_str::<Value>(&response.body).ok()?;
+    // 端口可能被别的 HTTP 服务占用：有 name 的响应必须是 ema2。
+    // 没有该字段的响应（例如未来新增的端点）保持兼容。
+    match value.get("name") {
+        Some(Value::String(name)) if name == "ema2" => Some(value),
+        Some(_) => None,
+        None => Some(value),
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +261,63 @@ mod tests {
             parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
                 .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// 起一个只应答一次的 HTTP 服务，返回端口和线程句柄。
+    fn serve_once(body: String) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).unwrap();
+            socket.write_all(body.as_bytes()).unwrap();
+            socket.flush().unwrap();
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn get_json_accepts_ema2_health_and_rejects_other_services() {
+        let (port, server) = serve_once(r#"{"name":"ema2","port":7744}"#.to_owned());
+        let value = get_json(port, "/health", Duration::from_secs(2)).unwrap();
+        assert_eq!(value["port"], 7744);
+        server.join().unwrap();
+
+        let (port, server) = serve_once(r#"{"name":"not-ema2","port":7744}"#.to_owned());
+        assert!(
+            get_json(port, "/health", Duration::from_secs(2)).is_none(),
+            "a foreign service on the same port must not be treated as ema2"
+        );
+        server.join().unwrap();
+    }
+
+    /// 总预算必须约束“慢速滴灌”的对端，而不只是单次 read。
+    #[test]
+    fn slow_drip_response_hits_the_overall_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer);
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+            // 每 40ms 一个字节：单次 read 永远不超时，总预算必须兜住。
+            for _ in 0..100 {
+                if socket.write_all(b"x").is_err() {
+                    return;
+                }
+                let _ = socket.flush();
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let error = request(port, "GET", "/health", None, Duration::from_millis(250)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        server.join().unwrap();
     }
 }

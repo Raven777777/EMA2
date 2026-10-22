@@ -340,7 +340,7 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
                 let Some(wait_for) = wait_for.as_object() else {
                     return Err("waitFor must be an object".into());
                 };
-                validate_wait_for(wait_for)?;
+                validate_wait_for_spec(wait_for)?;
             }
         }
         "wait" => {
@@ -585,8 +585,11 @@ pub fn validate_arguments(name: &str, args: &Value) -> Result<(), String> {
 }
 
 /// act 的 waitFor（顶层钩子与脚本步骤共用）：网络/导航条件或单个页面条件。
-fn validate_wait_for(wait_for: &Map<String, Value>) -> Result<(), String> {
-    let url = string_arg(wait_for, "url", 2_048, false, true)?;
+///
+/// CLI（`ema2 act --wait-for` / 脚本 `waitFor`）也调用这里，避免 `timeout=60`、
+/// `url=` 空值在 daemon/扩展阶段才失败。
+pub(crate) fn validate_wait_for_spec(wait_for: &Map<String, Value>) -> Result<(), String> {
+    let url = string_arg(wait_for, "url", 2_048, false, false)?;
     let text = string_arg(wait_for, "text", 100_000, false, false)?;
     let text_gone = string_arg(wait_for, "textGone", 100_000, false, false)?;
     let selector = string_arg(wait_for, "selector", 2_048, false, false)?;
@@ -695,7 +698,7 @@ fn validate_action(object: &Map<String, Value>) -> Result<(), String> {
         return Ok(());
     }
     if action == "waitFor" {
-        return validate_wait_for(object);
+        return validate_wait_for_spec(object);
     }
     if action == "fill"
         && object
@@ -972,6 +975,8 @@ mod tests {
 
     #[test]
     fn registry_is_compact_and_complete() {
+        use clap::CommandFactory as _;
+
         assert_eq!(TOOL_NAMES.len(), 11);
         // CLI 子命令与 /cmd 白名单共用这一份名单。
         for name in TOOL_NAMES {
@@ -980,6 +985,30 @@ mod tests {
         assert!(!contains("edge_get_tabs"));
         assert!(!contains("pair"));
         assert!(!contains("install"));
+
+        // `contains()` 只证明白名单，不证明 clap 里真有这个子命令：
+        // 收集真实子命令名，工具类必须与 TOOL_NAMES 完全相等。
+        let command = crate::cli::Cli::command();
+        let names: Vec<String> = command
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_owned())
+            .collect();
+        const INFRA_COMMANDS: &[&str] = &["await", "daemon", "init", "server", "status"];
+        for name in INFRA_COMMANDS {
+            assert!(names.iter().any(|actual| actual == name), "{name} missing");
+        }
+        let mut tools: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !INFRA_COMMANDS.contains(name))
+            .collect();
+        let mut expected: Vec<&str> = TOOL_NAMES.to_vec();
+        tools.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            tools, expected,
+            "clap tool subcommands must match TOOL_NAMES exactly"
+        );
     }
 
     #[test]
@@ -1109,6 +1138,21 @@ mod tests {
             validate_arguments(
                 "act",
                 &json!({ "action": "click", "waitFor": { "timeout": 60 } })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "action": "click", "waitFor": { "url": "", "status": 200 } })
+            )
+            .is_err(),
+            "empty url= must be rejected (not merely missing)"
+        );
+        assert!(
+            validate_arguments(
+                "act",
+                &json!({ "action": "click", "waitFor": { "url": "   " } })
             )
             .is_err()
         );
@@ -1857,7 +1901,9 @@ mod tests {
     #[test]
     fn runtime_contract_matches_rust_and_extension() {
         let contract = runtime_contract();
-        let timeouts = &contract["timeouts"];
+        let timeouts = contract["timeouts"]
+            .as_object()
+            .expect("contract timeouts must be an object");
         assert_eq!(
             contract["productVersion"].as_str(),
             Some(crate::paths::PRODUCT_VERSION)
@@ -1878,35 +1924,65 @@ mod tests {
             contract["helpersVersion"].as_u64(),
             Some(number_after(
                 include_str!("../../extension/modules/injected_helpers.js"),
-                "window.__ema2_helpers_version ="
+                "const HELPERS_VERSION ="
             ) as u64)
         );
-        assert_eq!(
-            timeouts["defaultSecs"].as_u64(),
-            Some(DEFAULT_TIMEOUT.as_secs())
-        );
-        assert_eq!(timeouts["actSecs"].as_u64(), Some(ACT_TIMEOUT.as_secs()));
-        assert_eq!(
-            timeouts["shotFilesSecs"].as_u64(),
-            Some(LONG_TIMEOUT.as_secs())
-        );
-        assert_eq!(
-            timeouts["waitDefaultSecs"].as_u64(),
-            Some(PAGE_WAIT_TIMEOUT.as_secs())
-        );
-        assert_eq!(
-            timeouts["batchMaxSecs"].as_u64(),
-            Some(MAX_CALL_TIMEOUT.as_secs())
-        );
-        assert_eq!(
-            timeouts["relayMarginSecs"].as_f64(),
-            Some(RELAY_MARGIN_SECS)
-        );
-        assert_eq!(
-            timeouts["actExtensionGraceSecs"].as_f64(),
-            Some(ACT_EXTENSION_GRACE_SECS)
-        );
-        assert_eq!(timeouts["actStepsSettleSecs"].as_f64(), Some(3.0));
+
+        // Rust 拥有的键：值必须与常量逐字相等。
+        let rust_owned: &[(&str, f64)] = &[
+            ("defaultSecs", DEFAULT_TIMEOUT.as_secs_f64()),
+            ("actSecs", ACT_TIMEOUT.as_secs_f64()),
+            ("actExtensionGraceSecs", ACT_EXTENSION_GRACE_SECS),
+            ("actStepsSettleSecs", 3.0),
+            ("shotFilesSecs", LONG_TIMEOUT.as_secs_f64()),
+            ("waitDefaultSecs", PAGE_WAIT_TIMEOUT.as_secs_f64()),
+            ("batchMaxSecs", MAX_CALL_TIMEOUT.as_secs_f64()),
+            ("relayMarginSecs", RELAY_MARGIN_SECS),
+        ];
+        for (key, expected) in rust_owned {
+            assert_eq!(
+                timeouts.get(*key).and_then(Value::as_f64),
+                Some(*expected),
+                "timeouts.{key} drifted from the Rust constant"
+            );
+        }
+
+        // 扩展侧拥有的键：至少一处扩展模块必须真的从这个键取值。
+        let extension_owned = [
+            "jsDefaultSecs",
+            "jsMaxSecs",
+            "jsExtensionGraceSecs",
+            "openDefaultSecs",
+            "openExtensionGraceSecs",
+            "waitMaxSecs",
+            "waitExtensionGraceSecs",
+            "batchExtensionWatchdogMs",
+            "toolWatchdogMs",
+            "debuggerTaskTimeoutMs",
+            "debuggerQueueTimeoutMs",
+        ];
+        let extension = extension_source();
+        for key in extension_owned {
+            assert!(
+                timeouts.contains_key(key),
+                "timeouts.{key} missing from contract/runtime.json"
+            );
+            assert!(
+                extension.contains(&format!("CONTRACT.timeouts.{key}")),
+                "extension never reads CONTRACT.timeouts.{key}"
+            );
+        }
+
+        // 19 个键必须全部被上面两类断言覆盖；新增键不能悄悄无人校验。
+        assert_eq!(timeouts.len(), 19, "timeout key count changed");
+        for key in timeouts.keys() {
+            let rust = rust_owned.iter().any(|(owned, _)| *owned == key.as_str());
+            let ext = extension_owned.contains(&key.as_str());
+            assert!(
+                rust || ext,
+                "timeouts.{key} is not asserted anywhere; add it to rust_owned or extension_owned"
+            );
+        }
 
         let extension_watchdog = timeouts["toolWatchdogMs"].as_f64().unwrap();
         assert!(DEFAULT_TIMEOUT.as_secs_f64() > extension_watchdog / 1000.0);
