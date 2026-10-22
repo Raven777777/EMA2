@@ -1,5 +1,43 @@
 # 变更记录
 
+## v2.4.3.22 — hint 带方向：正文回退时直接给候选选择器
+
+v2.4.3.21 的回退提示只说"用 `--selector` 或 `--no-main`"，调用方拿到后仍要再跑一次
+`snapshot` 去猜容器。这一版让页面侧在同一轮遍历里顺手记下候选容器，hint 直接点名。
+
+工具数仍是 **11**，CLI 命令面没有变化；`productVersion` 2.4.3.22，`helpersVersion` 22。
+
+### 扩展
+
+- `injected_helpers.js`：`mainRoot()` 在评分循环里记录候选（`suggestSelector()` 优先
+  `tag#id`，其次首个稳定 class，最后退回标签名），返回 `candidates`（按文本长度去重取前 3）。
+  `HELPERS_VERSION` 21 → 22。
+- `read_snapshot.js`：`readPageContent` 透传 `candidates`；`main=body(fallback)` 的 hint
+  追加 `try --selector "<sel>" (~N chars)`。候选必须不小于整页正文的 15%，
+  否则视为卡片/摘要并退回通用措辞（Phoronix 首页的 `article` 卡片 531/30858 就是反例）。
+- `read_snapshot.js`：`snapshot` 未指定 `--filter`、结果被截断且 refs > 40 时，
+  追加 `hint=many refs; narrow with --filter form|links|buttons, or --near <ref>`。
+- 没有新增错误码，退出码语义不变。
+
+### 真机验证（Edge，前台可见）
+
+| 页面 | 回退字符 | 候选 | 结果 |
+|---|---|---|---|
+| anthropic.com/news | 1086 / 2324 | `main#main-content` | 建议有效，`--selector` 直接读到正文 |
+| bbc.com/news | 7961 / 11101 | `main#bbc-main` | 建议有效，返回 10814 字符正文 |
+| phoronix.com | 531 / 30858 | 无（1.7% < 15%） | 正确退回通用措辞，不误导 |
+| wikipedia 首页 | 245 refs | — | 触发 `many refs` 收窄提示 |
+
+`cargo test` 127 passed；`clippy -D warnings`、`fmt --check` 通过；
+`contract.js` 由 `scripts/sync_contract.py` 重新生成。
+
+### 已知代价
+
+- 候选只在页面侧遍历时顺带收集，不额外遍历 DOM；但 `plainText` 的 12 次上限仍是
+  `mainRoot` 的既有成本，本次没有改动。
+- 扩展 service worker 若一直有心跳连接，会缓存旧脚本；改完 `extension/` 后必须经过
+  一次 SW 重启（停 daemon 等 30s+ 再起，或 `edge://extensions` 重新加载）才生效。
+
 ## v2.4.3.21 — 删掉旧解析器（`batch` 只做执行器）
 
 v2.4.3.11 隐藏的旧面在这一版从 CLI 解析器里彻底删除；扩展侧的 action 仍留给 `/cmd`。

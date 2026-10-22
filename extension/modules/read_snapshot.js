@@ -90,6 +90,7 @@ function readPageContent(modeName, selectorArg, mainWanted) {
   let mainFallback = false;
   let textLength = 0;
   let bodyLength = 0;
+  let candidates = [];
   if (kind === 'ok') {
     let root = document.body || document.documentElement;
     if (selectorArg) {
@@ -103,6 +104,7 @@ function readPageContent(modeName, selectorArg, mainWanted) {
       mainFallback = !!picked.fallback;
       textLength = picked.textLength || 0;
       bodyLength = picked.bodyLength || 0;
+      candidates = Array.isArray(picked.candidates) ? picked.candidates : [];
     }
     text = modeName === 'visible' ? helpers.visibleText(root)
       : modeName === 'html' ? root.innerHTML
@@ -128,6 +130,7 @@ function readPageContent(modeName, selectorArg, mainWanted) {
     mainFallback,
     textLength,
     bodyLength,
+    candidates,
     http,
     contentType,
   };
@@ -139,6 +142,20 @@ function readPageContent(modeName, selectorArg, mainWanted) {
 /** 正文地标 selector：未命中时回退到默认 main/body，避免多一次往返。 */
 function isMainLandmarkSelector(selector) {
   return /^(?:main|article|\[role\s*=\s*['"]?main['"]?\])$/i.test(String(selector || '').trim());
+}
+
+/**
+ * hint 里的候选容器：页面侧按文本长度给了前 3 个，这里取第一个够大的。
+ * 只给「像正文」的候选——小于页面正文 15% 的多半是卡片/摘要，
+ * 拿它当建议反而会把调用方引到更小的一块上（phoronix 的 article 卡片就是这样）。
+ */
+function pickCandidate(candidates, minChars) {
+  for (const item of candidates || []) {
+    if (!item || !item.selector) continue;
+    if (minChars && Number(item.chars) < minChars) continue;
+    return item;
+  }
+  return null;
 }
 
 /** challenge / login 是页面状态而不是错误：state= + hint，退出 0。 */
@@ -208,6 +225,8 @@ async function readTool(args) {
   const parts = [data.header, slice.text, footer(slice.total, slice.text.length, slice.next)];
   if (slice.next != null) parts.push('truncated=1');
   const hint = truncationHint('read', slice.total, slice.text.length, slice.next, cursor);
+  // 候选只在「正文其实是整页 body」时有意义：那时收窄到一个容器才是真建议。
+  const minCandidate = Math.max(200, Math.round((slice.total || 0) * 0.15));
   if (hint) {
     let message = hint.replace(/^hint=/, '');
     if (!cursor && slice.total <= MAX_OUTPUT_CHARS) {
@@ -219,7 +238,11 @@ async function readTool(args) {
   if (selectorFallback) {
     parts.push(`hint=selector "${oneLine(selectorFallback)}" not found; used default main/body instead`);
   } else if (data.mainFallback) {
-    parts.push(`hint=main extraction too short (${data.textLength || 0} chars); fell back to body. Use --selector or --no-main to control this.`);
+    const pick = pickCandidate(data.candidates, minCandidate);
+    const direction = pick
+      ? `try --selector "${pick.selector}" (~${pick.chars} chars), or --no-main`
+      : 'use --selector or --no-main';
+    parts.push(`hint=main extraction too short (${data.textLength || 0} chars); fell back to body. ${direction} to control this.`);
   }
   if (mode === 'visible' && !slice.total) {
     parts.push('hint=visible text is empty; the page may render in canvas/PDF/cross-origin iframe; try js or shot --annotate');
@@ -255,6 +278,9 @@ async function snapshotTool(args) {
   if (data.next != null) parts.push('truncated=1');
   const hint = truncationHint('snapshot', data.total, data.shown, data.next, cursor, 'refs');
   if (hint) parts.push(hint);
+  if (filter === 'interactive' && data.next != null && !cursor && data.total > 40) {
+    parts.push('hint=many refs; narrow with --filter form|links|buttons, or --near <ref> to see its neighbors');
+  }
   const refs = Number((/refs=(\d+)/.exec(data.header) || [])[1] || 0);
   const visual = Number((/visual=(\d+)/.exec(data.header) || [])[1] || 0);
   if (refs === 0 && visual > 0) {

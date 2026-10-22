@@ -5,9 +5,9 @@
 ## 当前版本
 
 ```text
-exe        2.4.3.21（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.3.21
-helper     21
+exe        2.4.3.22（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.3.22
+helper     22
 guard      5（guardProtocolVersion 5）
 tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch；batch 仅 /cmd）
 可见 CLI  14 个顶层命令（没有 batch 子命令）
@@ -158,8 +158,14 @@ cargo test
 - 整页 md/text 为空 → `empty_page`；HTTP ≥400 → `page_error`；PDF → `pdf_page`（均 exit 4）；
   登录墙 → `state=login_required`，人机验证 → `state=challenge`（`state=` + hint，exit 0）；
   头部始终带 `http=` / `content_type=`；**不检测 paywall**
-- main 太短（<200 字符，或 body>2000 且候选 <body 5%）回退 `main=body(fallback)` 并给 hint
-- 被截断必须给 `next` 和 cursor hint
+- main 太短（<200 字符，或 body>2000 且候选 <body 5%）回退 `main=body(fallback)` 并给 hint；
+  v2.4.3.22 起 hint 带 `try --selector "<sel>" (~N chars)`，候选来自 `mainRoot()` 同一轮遍历
+  （`candidates`，按文本长度去重取前 3），且必须 ≥ 整页正文 15% 才推荐——低于这个比例的是
+  卡片/摘要，指向它只会让调用方读到更小的一块
+- 被截断必须给 `next` 和 cursor hint；`snapshot` 未指定 `--filter`、被截断且 refs>40 时
+  追加 `hint=many refs; narrow with --filter form|links|buttons, or --near <ref>`
+- **改 `mainRoot()` 的返回结构必须提升 `helpersVersion`**：`candidates` 只经页面 helper 产出，
+  旧 helper 不会返回它，hint 会静默退回通用措辞（不是错误，但会让人以为新代码没生效）
 
 ### 其他
 

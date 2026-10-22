@@ -6,7 +6,7 @@
 function installHelpers() {
   // 版本只在这里声明一次：rust/src/tools.rs 的契约测试会解析下面这行
   // `const NAME = N` 常量声明取版本号；页面里的判定与写入也都引用它，避免字面量漂移。
-  const HELPERS_VERSION = 21;
+  const HELPERS_VERSION = 22;
   if (window.__ema2_helpers && window.__ema2_helpers_version === HELPERS_VERSION) {
     return { installed: false, handle: String(window.__ema2_doc_handle || '') };
   }
@@ -534,6 +534,21 @@ function installHelpers() {
     }
   };
 
+  /**
+   * 给 hint 用的候选 selector：id 最稳，其次首个「像名字」的 class，最后退回标签名。
+   * 只用于提示，不参与定位；宁可给一个可试的方向，也不要让调用方再从 snapshot 猜起。
+   */
+  const suggestSelector = (el) => {
+    if (!el || el === document.body || el === document.documentElement) return '';
+    const tag = String(el.tagName || '').toLowerCase();
+    if (!tag) return '';
+    const id = String(el.id || '').trim();
+    if (id && /^[A-Za-z][\w:-]{0,60}$/.test(id)) return `${tag}#${id}`;
+    const classes = String(el.getAttribute('class') || '').trim().split(/\s+/)
+      .filter((name) => /^[A-Za-z][\w-]{2,40}$/.test(name) && !/^[a-f0-9]{8,}$/i.test(name));
+    return classes.length ? `${tag}.${classes[0]}` : tag;
+  };
+
   /** 正文容器启发式：取文本最多、链接密度最低的候选；太短就回退 body。 */
   const mainRoot = () => {
     const selectors = ['main', '[role="main"]', 'article', '#content', '#main', '.content', '.main',
@@ -544,6 +559,7 @@ function installHelpers() {
     let candidateLength = 0;
     let sawCandidate = false;
     let evaluated = 0;
+    const found = [];
     for (const selector of selectors) {
       for (const el of document.querySelectorAll(selector)) {
         sawCandidate = true;
@@ -558,8 +574,17 @@ function installHelpers() {
         if (text.length < 200) continue;
         const linkLength = [...el.querySelectorAll('a')].reduce((sum, link) => sum + (link.innerText || '').length, 0);
         const score = text.length - linkLength * 1.5;
+        const suggested = suggestSelector(el);
+        if (suggested) found.push({ selector: suggested, chars: text.length });
         if (score > bestScore) { bestScore = score; best = el; bestLength = text.length; }
       }
+    }
+    // 只留长度前 3 且去重；hint 里多给方向，但不要变成第二个 snapshot。
+    const candidates = [];
+    for (const item of found.sort((a, b) => b.chars - a.chars)) {
+      if (candidates.some((entry) => entry.selector === item.selector)) continue;
+      candidates.push(item);
+      if (candidates.length >= 3) break;
     }
     const body = document.body || document.documentElement;
     const bodyLength = body ? plainText(body).length : 0;
@@ -570,11 +595,19 @@ function installHelpers() {
         fallback: sawCandidate,
         bodyLength,
         textLength: candidateLength,
+        candidates,
       };
     }
     const tooShort = bestLength < 200 || (bodyLength > 2000 && bestLength < bodyLength * 0.05);
     if (tooShort) {
-      return { root: body, selector: 'body(fallback)', fallback: true, bodyLength, textLength: bestLength };
+      return {
+        root: body,
+        selector: 'body(fallback)',
+        fallback: true,
+        bodyLength,
+        textLength: bestLength,
+        candidates,
+      };
     }
     return {
       root: best,
@@ -582,6 +615,7 @@ function installHelpers() {
       fallback: false,
       bodyLength,
       textLength: bestLength,
+      candidates,
     };
   };
 

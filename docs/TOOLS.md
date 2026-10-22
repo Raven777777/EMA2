@@ -346,7 +346,12 @@ ema2 read --url <u> [...]                        # --urls 的单数形式
   多目标输出按 `---` 分块，单块失败不影响其它块。
 - `--main` 默认开：按清洁后文本量/链接密度选正文容器，头部回 `main=<selector>`。
 - 正文容器太短（<200 字符，或不到 body 的 5%）时回退 `main=body(fallback)`，并给
-  `hint=main extraction too short (...); fell back to body`。
+  `hint=main extraction too short (...); fell back to body. try --selector "<sel>" (~N chars), or --no-main`。
+  候选来自同一轮遍历里"文本最长、链接密度最低"的前 3 个容器，`~N chars` 是清洁后文本的估算值
+  （与 `total=` 的 Markdown 长度不完全相等）。候选小于整页正文 15% 时不建议
+  （那种多半是卡片/摘要，指向它反而更糟），hint 退回通用措辞。
+- `snapshot` 未指定 `--filter` 且结果被截断、refs 超过 40 时，追加
+  `hint=many refs; narrow with --filter form|links|buttons, or --near <ref>`。
 - `--selector` 优先于 `--main`，支持 shadow DOM / 同源 iframe 内的元素。
 - `--selector main|article|[role=main]` 未命中时自动回退到默认 `main`/`body`，头部加
   `selector_fallback=1 selector=<原值>` 并给 hint；其他 selector 仍报 `selector_not_found`。
