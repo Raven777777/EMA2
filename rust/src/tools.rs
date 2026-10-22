@@ -985,7 +985,7 @@ mod tests {
         use clap::CommandFactory as _;
 
         assert_eq!(TOOL_NAMES.len(), 11);
-        // CLI 子命令与 /cmd 白名单共用这一份名单。
+        // /cmd 白名单有 11 个；CLI 顶层少一个 batch（它只是 --tabs/--urls 的执行器）。
         for name in TOOL_NAMES {
             assert!(contains(name), "{name} missing from contains()");
         }
@@ -1001,15 +1001,23 @@ mod tests {
             .map(|sub| sub.get_name().to_owned())
             .collect();
         const INFRA_COMMANDS: &[&str] = &["await", "daemon", "init", "server", "status"];
+        // v2.4.3.21：batch 不再有 CLI 子命令，只保留为 /cmd 执行器。
+        const CMD_ONLY_TOOLS: &[&str] = &["batch"];
+        assert!(TOOL_NAMES.contains(&"batch"));
+        assert!(!names.iter().any(|name| name == "batch"));
         for name in INFRA_COMMANDS {
             assert!(names.iter().any(|actual| actual == name), "{name} missing");
         }
         let mut tools: Vec<&str> = names
             .iter()
             .map(String::as_str)
-            .filter(|name| !INFRA_COMMANDS.contains(name))
+            .filter(|name| !INFRA_COMMANDS.contains(name) && !CMD_ONLY_TOOLS.contains(name))
             .collect();
-        let mut expected: Vec<&str> = TOOL_NAMES.to_vec();
+        let mut expected: Vec<&str> = TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !CMD_ONLY_TOOLS.contains(name))
+            .collect();
         tools.sort_unstable();
         expected.sort_unstable();
         assert_eq!(

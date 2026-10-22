@@ -69,7 +69,7 @@ ema2 open --urls "https://a.example/,https://b.example/" --background
 - 被截断的块会追加一行 `resume=<tool> --tab <id> --cursor <next>`（`wait` 没有 cursor，不追加），
   直接把这一行改写成命令即可续读。
 
-旧的多目标语法已移入[Legacy](#legacyv24311-起隐藏)，运行时仍兼容；新脚本请用 `--tabs/--urls`。
+多目标由内部的 `/cmd` 工具 `batch` 执行；CLI 不暴露 `batch` 子命令。
 
 ## 等待语义
 
@@ -143,7 +143,7 @@ total=2 shown=2 next=none
 | `invalid_action` | 未支持的 act 动作 | 用 click/type/fill/select/press/hover/scroll/submit/back/forward/reload |
 | `invalid_step` | `steps[]` 缺 action | 每步都要写动作名 |
 | `invalid_tab` | tabId 不是非负整数 | `tabs list` 拿 id |
-| `invalid_tool` | batch 不支持该工具 | batch 只跑 open/read/snapshot/js/wait |
+| `invalid_tool` | 内部 batch 执行器收到不支持的工具名 | 只跑 open/read/snapshot/js/wait（CLI 不会触发） |
 | `invalid_url` | URL 不是 http(s) | 用完整 http(s) 地址 |
 | `invalid_regex` | `bodyFilter` 不合法或有灾难性回溯风险 | 改写正则或改用子串 |
 | `invalid_selector` | CSS selector 语法非法（`[`、未闭合括号等） | 修正 selector；或改用 snapshot ref/target |
@@ -819,51 +819,3 @@ ema2 server stop
   页面完全由 Service Worker 缓存返回、或 `--wait none` 时可能是 `status=unknown|pending`。
 - `js` 的语句体回退只在**语法错误**时触发；如果代码本身在运行时抛 `SyntaxError`（如 `JSON.parse('{')`），
   会按原样报错，不会重复执行副作用。
-
-## Legacy（v2.4.3.11 起隐藏）
-
-这些写法不再出现在 `ema2 --help` 或主命令表里，但运行时仍可执行；新脚本请用上面的写法。
-v2.4.3.21 会删除对应解析器，届时才真正失效。
-
-### batch
-
-```bash
-ema2 batch <tool> [tool flags...] --urls "u1,u2" [--reuse url]
-ema2 batch <tool> [tool flags...] --tab-ids "1,2" [--concurrency 2]
-```
-
-- 同一执行器，默认并发 2、最大 4，块之间 `---`；单块失败不影响其它块。
-- 内层参数与 v2.4.3.1 之前一致；完整列表仍可看 `ema2 batch --help`。
-- 被 budget/cursor 截断的块追加 `resume=<tool> --tab <id> --cursor <next>`（`wait` 不追加）。
-- 新写法：`read/snapshot/js/wait --tabs/--urls`、`open --urls`（见[目标与并发](#目标与并发)）。
-  运行时输出保持字节兼容（只多了上面的 `resume=` 行，不加 `deprecated=`）。
-
-### tabs new / tabs current
-
-```bash
-ema2 tabs new <url> [--background]   # 默认激活并聚焦；--background 后台
-ema2 tabs current
-```
-
-- `tabs new` 输出末尾追加 `deprecated=1 use ema2 open --background`；
-  替代写法是 `ema2 open <url>`（前景）或 `ema2 open <url> --background`（后台）。
-- `tabs current` 输出末尾追加 `deprecated=1 use ema2 status or ema2 tabs list`；
-  活动页可从 `ema2 status` 的 `active_tab=` 或 `ema2 tabs list` 的 `*` 得到。
-
-### files download-dir
-
-```bash
-ema2 files download-dir
-```
-
-固定返回 `error=download_dir_unsupported`，错误末尾追加
-`deprecated=1 set the directory in edge://settings/downloads`。
-Edge 不允许扩展改下载目录，请在 `edge://settings/downloads` 手动设置。
-
-### 其他隐藏别名
-
-- `open --wait` = `open --until`
-- `observe --filter` = `observe --url-filter`（network）；console 的旧文本过滤仍可用
-- `observe --wait` = `observe --collect`
-- `observe --bodies=false` = `observe --no-bodies`
-- `--reuse session` = `open --reuse last` / `--urls --reuse url`

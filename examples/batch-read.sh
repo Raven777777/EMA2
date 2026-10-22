@@ -9,4 +9,4 @@ if [ "$#" -lt 1 ]; then
 fi
 
 urls=$(printf '%s,' "$@" | sed 's/,$//')
-exec ema2 batch read --urls "$urls" --mode md --budget 8000
+exec ema2 read --urls "$urls" --mode md --budget 8000

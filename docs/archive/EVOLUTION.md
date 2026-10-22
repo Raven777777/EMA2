@@ -1,8 +1,8 @@
 # EMA2 命令面演进方案
 
-> 状态：**v2.4.3.1 / v2.4.3.11 已实施**；v2.4.3.21 仍为提案。
+> 状态：**v2.4.3.1 / v2.4.3.11 / v2.4.3.21 已全部实施**，本文已归档。
 > 依据 v2.4.2.7 源码与文档（2026-10-22）。
-> 实施完成后本文迁入 `docs/archive/`；现行行为以 `docs/TOOLS.md` 与 `ema2 <cmd> --help` 为准。
+> 本文仅用于追溯设计过程；现行行为以 `docs/TOOLS.md` 与 `ema2 <cmd> --help` 为准。
 
 ## 0. 结论
 
@@ -378,7 +378,12 @@ ema2 js --file extract.js
 | 测试 | 旧写法仍可执行；help 不再列出；新写法全覆盖 |
 | 契约 | 可见面缩小，运行时不破坏 |
 
-### v2.4.3.21 — 删代码（可选，视 v2.4.3.11 使用情况）
+### v2.4.3.21 — 删代码 ✅ 已实施
+
+见 `docs/CHANGELOG.md` 的 v2.4.3.21 条目。落地时删除的是 `rust/src/cli/batch.rs`
+整个文件（含 `build_batch` / `parse_tool_flags` 与解析测试），以及 `Command::Batch`、
+`TabsCommand::New/Current`、`FilesCommand::DownloadDir` 的 clap 变体和 builder 分支；
+扩展侧的 `tabs`/`files` action 与 `batchTool` 执行器保留给 `/cmd`。
 
 | 项 | 内容 |
 |---|---|

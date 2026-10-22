@@ -189,7 +189,6 @@ fn main() {
             format,
             out,
         } => run_built(cli::build_shot(tab, inline, annotate, &format, out), port),
-        cli::Command::Batch { tokens } => run_built(cli::build_batch(&tokens), port),
     };
     std::process::exit(code);
 }

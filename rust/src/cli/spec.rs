@@ -318,28 +318,6 @@ act 的 --wait-for 也接受同样的 text=/textGone=/selector=。")]
         #[arg(long = "out")]
         out: Option<PathBuf>,
     },
-    /// （隐藏）多标签并发 open/read/snapshot/js/wait；新写法用各命令的 --tabs/--urls
-    #[command(
-        hide = true,
-        after_help = "\
-v2.4.3.11 起从主 help 隐藏；新写法用 read/snapshot/js/wait --tabs/--urls、open --urls。
-目标工具 flags（与 --tab-ids/--urls 混用）：
-  --reuse url|session  与 --urls 使用：精确 URL 命中本会话标签时复用文档（不重载），否则新开
-  read      --mode md|text|html|visible  --selector S  --no-main  --budget N  --cursor N
-  snapshot  --filter F  --near REF  --budget N  --cursor N
-  js        --code CODE | --file FILE  --budget N  --cursor N  --timeout 10s
-            （也可以直接写位置参数 CODE；--code/位置参数与 --file 互斥）
-  wait      --text S | --text-gone S | --selector S | --time 5s | --timeout 30s | --idle
-            （也可以直接写位置参数 TEXT，等价于 --text）
-  open      --wait load|dom|none  --timeout 15
-"
-    )]
-    Batch {
-        /// `<tool>` 之后的所有 token：--tab-ids / --urls / --concurrency / --port
-        /// 以及目标工具自己的 flags（如 read 的 --mode visible）。
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        tokens: Vec<String>,
-    },
     /// （内部）daemon 进程本体；由 `ema2 server` detached spawn
     #[command(hide = true)]
     Daemon,
@@ -354,7 +332,7 @@ pub enum ServerAction {
 /// 多目标参数（read/snapshot/js/wait 共享）。
 ///
 /// 带 `--tabs` / `--urls` / `--url` 时，命令不再直达工具，而是编译成一次
-/// `batch` 调用；`batch` 从此只是执行器，不再是唯一的多标签语法。
+/// 内部 `batch` 工具调用；`batch` 只是执行器，CLI 没有它的子命令。
 #[derive(Args, Debug, Clone, Default)]
 pub struct FanoutArgs {
     /// 对已有标签并发执行（逗号分隔，可重复；≤8）
@@ -389,20 +367,6 @@ pub enum TabsCommand {
         budget: Option<u64>,
         #[arg(long)]
         cursor: Option<u64>,
-    },
-    /// （隐藏）当前活动标签页；改用 status 的 active_tab= 或 tabs list 的 *
-    #[command(hide = true)]
-    Current,
-    /// （隐藏）新建标签页并激活：tabs new <URL> [--background]；改用 open
-    #[command(hide = true)]
-    New {
-        url: String,
-        /// 兼容旧写法：显式激活（默认就是激活）
-        #[arg(long)]
-        active: bool,
-        /// 在后台新建，不切换当前标签
-        #[arg(long)]
-        background: bool,
     },
     /// 关闭标签页（位置参数 id ≤8 个，或 --session）
     Close {
@@ -439,9 +403,6 @@ pub enum FilesCommand {
         #[arg(long = "tab")]
         tab: Option<u64>,
     },
-    /// （隐藏）Edge 不允许扩展改下载目录：固定返回 download_dir_unsupported
-    #[command(hide = true)]
-    DownloadDir,
 }
 
 #[cfg(test)]
@@ -513,9 +474,9 @@ mod tests {
         names
     }
 
-    /// v2.4.3.11：旧面从 help 隐藏，但运行时不硬失败（v2.4.3.21 才删解析器）。
+    /// v2.4.3.21：旧面已从 CLI 删除；扩展的 tabs/files action 仍留给 /cmd。
     #[test]
-    fn legacy_commands_are_hidden_but_still_parse() {
+    fn removed_commands_are_not_subcommands() {
         let root = Cli::command();
         let visible: Vec<&str> = root
             .get_subcommands()
@@ -524,58 +485,32 @@ mod tests {
             .collect();
         assert_eq!(visible.len(), 14, "visible commands: {visible:?}");
         assert!(!visible.contains(&"batch"));
-        assert!(
-            root.find_subcommand("batch")
-                .is_some_and(|command| command.is_hide_set())
-        );
+        assert!(root.find_subcommand("batch").is_none());
 
         let tabs = root.find_subcommand("tabs").expect("tabs");
-        assert!(
-            tabs.find_subcommand("new")
-                .is_some_and(|command| command.is_hide_set())
-        );
-        assert!(
-            tabs.find_subcommand("current")
-                .is_some_and(|command| command.is_hide_set())
-        );
-        assert!(
-            tabs.find_subcommand("list")
-                .is_some_and(|command| !command.is_hide_set())
-        );
+        assert!(tabs.find_subcommand("new").is_none());
+        assert!(tabs.find_subcommand("current").is_none());
+        assert!(tabs.find_subcommand("list").is_some());
         let files = root.find_subcommand("files").expect("files");
-        assert!(
-            files
-                .find_subcommand("download-dir")
-                .is_some_and(|command| command.is_hide_set())
-        );
-        assert!(
-            files
-                .find_subcommand("upload")
-                .is_some_and(|command| !command.is_hide_set())
-        );
+        assert!(files.find_subcommand("download-dir").is_none());
+        assert!(files.find_subcommand("upload").is_some());
 
-        // 隐藏只影响 help，不影响解析。
+        // 解析器已删除：这些输入现在是 clap 的用法错误（CLI 退出 1）。
         assert!(
-            Cli::try_parse_from(["ema2", "batch", "read", "--urls", "https://a.example/"]).is_ok()
+            Cli::try_parse_from(["ema2", "batch", "read", "--urls", "https://a.example/"]).is_err()
         );
-        assert!(Cli::try_parse_from(["ema2", "tabs", "new", "https://a.example/"]).is_ok());
-        assert!(Cli::try_parse_from(["ema2", "tabs", "current"]).is_ok());
-        assert!(Cli::try_parse_from(["ema2", "files", "download-dir"]).is_ok());
+        assert!(Cli::try_parse_from(["ema2", "tabs", "new", "https://a.example/"]).is_err());
+        assert!(Cli::try_parse_from(["ema2", "tabs", "current"]).is_err());
+        assert!(Cli::try_parse_from(["ema2", "files", "download-dir"]).is_err());
 
-        // 顶层 help 不再列 batch；batch/tabs/files 自己的 help 仍可打开。
+        // 顶层 help 仍只列 14 个可见命令。
         let top = Cli::command().render_long_help().to_string();
         assert!(!top.contains("  batch"), "top-level help leaks batch");
-        let mut root = Cli::command();
-        for name in ["batch", "tabs", "files"] {
-            let command = root.find_subcommand_mut(name).expect(name);
-            let help = command.render_long_help().to_string();
-            assert!(!help.is_empty(), "{name} help must still render");
-        }
     }
 
     /// 命令表是用户侧文档的第二份拷贝；它和 clap 可见子命令必须同步。
     ///
-    /// 隐藏的子命令（`daemon`，以及后续版本要隐藏的 `batch`）不在表里，
+    /// 隐藏的子命令（`daemon`）不在表里，
     /// 所以这里只比较 `is_hide_set() == false` 的顶层命令。
     #[test]
     fn documented_command_tables_match_visible_subcommands() {

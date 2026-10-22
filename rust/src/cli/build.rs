@@ -20,18 +20,6 @@ pub fn build_tabs(args: &TabsArgs) -> Result<ToolCall, String> {
             set_opt(&mut arguments, "cursor", *cursor);
             arguments
         }
-        Some(TabsCommand::Current) => json!({ "action": "current" }),
-        Some(TabsCommand::New {
-            url,
-            active,
-            background,
-        }) => json!({
-            "action": "new",
-            "url": url,
-            // 默认激活：AI 执行 `tabs new` 后紧接着 snapshot/act 时，
-            // 不应默默操作旧标签。只有 --background 才保持后台。
-            "active": *active || !*background,
-        }),
         Some(TabsCommand::Close { ids, session }) => {
             if *session {
                 if !ids.is_empty() {
@@ -578,9 +566,6 @@ pub fn build_files(args: &FilesArgs) -> Result<ToolCall, String> {
             }
             set_opt(&mut arguments, "tabId", *tab);
             Ok(ToolCall::new("files", arguments))
-        }
-        FilesCommand::DownloadDir => {
-            Ok(ToolCall::new("files", json!({ "action": "download-dir" })))
         }
     }
 }
@@ -1340,29 +1325,6 @@ mod tests {
         assert_eq!(args_of(&call)["cursor"], 3);
 
         let call = build_tabs(&TabsArgs {
-            cmd: Some(TabsCommand::New {
-                url: "https://x.y".into(),
-                active: false,
-                background: false,
-            }),
-        })
-        .unwrap();
-        assert_eq!(
-            args_of(&call)["active"],
-            true,
-            "tabs new must activate by default"
-        );
-        let call = build_tabs(&TabsArgs {
-            cmd: Some(TabsCommand::New {
-                url: "https://x.y".into(),
-                active: false,
-                background: true,
-            }),
-        })
-        .unwrap();
-        assert_eq!(args_of(&call)["active"], false);
-
-        let call = build_tabs(&TabsArgs {
             cmd: Some(TabsCommand::Close {
                 ids: vec![1, 2, 3],
                 session: false,
@@ -1421,12 +1383,6 @@ mod tests {
         assert_eq!(args_of(&call)["files"][1]["data"], "d29ybGQ=");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
-
-        let call = build_files(&FilesArgs {
-            cmd: FilesCommand::DownloadDir,
-        })
-        .unwrap();
-        assert_eq!(args_of(&call)["action"], "download-dir");
 
         assert!(
             build_files(&FilesArgs {

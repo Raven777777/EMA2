@@ -48,6 +48,7 @@ tabs open read snapshot act wait js observe files shot batch
 ```
 
 `await` 是 CLI 命令，映射到 `wait` 工具，不新增第 12 个工具。
+`batch` 是 `--tabs/--urls` 的 `/cmd` 执行器，不是用户命令；工具仍是 11 个。
 
 不做：
 

@@ -24,7 +24,7 @@
 | 页内检索 | — | `__E.grep()` | 无核心改动 |
 | 搜索入口 | — | `serp.js` + `search.sh` | 无核心改动 |
 | 结构概览 | — | `__E.outline()` | 无核心改动 |
-| 多源并发 | `batch open` / `batch js` | `batch.sh` + `__E.digest()` | 无核心改动 |
+| 多源并发 | `open --urls` / `js --tabs` | `batch.sh` + `__E.digest()` | 无核心改动 |
 
 总量（`wc -l` 实测）：`lib.js` 202 行 + `serp.js` 100 行 + 三个包装器 97 行 = **399 行**，
 另加 17 行 `_env.sh`（只负责找 exe）。**核心一行没动。**
@@ -55,7 +55,7 @@
 | `_env.sh` | 定位 exe：`EMA2_BIN` → `PATH` → 仓库内 `bin/ema2(.exe)` |
 | `run.sh` | 单页包装器：把 `lib.js` 与表达式拼成**一次** `js` 调用 |
 | `search.sh` | 一条命令完成「编码查询 → 打开 → 解析」 |
-| `batch.sh` | 并发打开多个 URL → `batch js --file` 统一跑 `__E.digest()` |
+| `batch.sh` | 并发打开多个 URL → `js --tabs --file` 统一跑 `__E.digest()` |
 
 ---
 
@@ -103,12 +103,12 @@ export EMA2_BIN=/path/to/ema2        # 或把 ema2 放进 PATH，或让仓库里
 | # | 现象 | 处置 |
 |---|---|---|
 | 1 | `js` 没有 `--arg` | **不采纳**。`--arg` 不消除转义成本，只是把它从代码体搬进命令行；`run.sh` 已把这段成本摊成 3 行。它还会新增参数通道——与本节目录的原则相反。 |
-| 2 | `batch js` 只有 `--code` | **已实现** `batch js --file`：客户端读一次再分发；`--code`/位置参数与 `--file` 互斥，空文件在发请求前报 `invalid_argument`。 |
+| 2 | `js --tabs` 只有 `--code` | **已实现** `js --tabs --file`（旧 `batch js --file`）：客户端读一次再分发；`--code`/位置参数与 `--file` 互斥，空文件在发请求前报 `invalid_argument`。 |
 | 3 | 多行即 async 函数体，必须显式 `return` | **已写进 `ema2 js --help`**：求值规则 + 多行必须 `return` + `note=ran as an async function body`。 |
 | 4 | 页面级注入会「粘住」 | **已写进 `ema2 js --help`**（注入生命周期）；`lib.js` v3 额外回 `replaced=<旧版本>`，改完库没生效立刻可见。 |
 | 5 | `--cursor` 是字符偏移 | **不改成不透明游标**。`docs/TOOLS.md` 与 `read --help` 已把字符偏移写成契约，`tabs list` 的 cursor 单位还是行号；改成不透明令牌会废掉「把 `next` 原样传回」这条最稳定的用法。改为在 `js --help` 点明「换 code / budget 续读会错位」。 |
 | 6 | `open` 报 `status=pending timed_out=1` 但正文可读 | **延后**。`--wait dom` 已能直接表达「DOM 就绪即可」；是否再加 `content=ready` 字段，先用外围脚本验证 `--wait dom` 是否够用。 |
-| 7 | `focused=0` 在每个 `batch open` 都出现 | **延后**。核心保留这个事实字段；读任务在外围过滤（`batch.sh` 现在只打印 `id/title/status/error`）。 |
+| 7 | `focused=0` 在每个 `open --urls` 都出现 | **延后**。核心保留这个事实字段；读任务在外围过滤（`batch.sh` 现在只打印 `id/title/status/error`）。 |
 
 第 2、3、4 条这一轮已经落地；第 1、5 条明确不做，理由是它们与「减少表面积」冲突。
 
@@ -120,13 +120,13 @@ export EMA2_BIN=/path/to/ema2        # 或把 ema2 放进 PATH，或让仓库里
 
 - `lib.js` v3：`js --file lib.js` → `lib=installed v=3 methods=meta,grep,outline,links,main,digest,tables`；
   紧接着 `js "return __E.outline(5)"` 直接可用（注入粘住），无需重新投递库。
-- `batch js --file`：同一份「库 + `return __E.digest(300)`」脚本一次投递跑完所有标签；
+- `js --tabs --file`：同一份「库 + `return __E.digest(300)`」脚本一次投递跑完所有标签；
   `--file` 与 `--code` 同时给 → `invalid_argument`（exit 1）；空文件同样在发请求前拒绝。
 - `search.sh "Rust 2024 edition"`：`serp=ok engine=bing results=10 total=10 chars=1867`，
   10 条全部写进正文（无 `capped=1`）。
 - `search.sh "C++ operator= && std::vector"`：`results=9 total=9 chars=1951` ——
   空格、`+`、`=`、`&&` 全部百分号编码，查询不再走样。
-- `batch.sh` 两源：一次 `batch open` + 一次 `batch js --file`，逐源摘要；输出按 `url → id → 明细` 重排，无重复 `url=`。
+- `batch.sh` 两源：一次 `open --urls` + 一次 `js --tabs --file`，逐源摘要；输出按 `url → id → 明细` 重排，无重复 `url=`。
 
 ### 2026-10-22 · ema2 2.4.2.5（旧记录，计数口径已变）
 
@@ -157,7 +157,7 @@ export EMA2_BIN=/path/to/ema2        # 或把 ema2 放进 PATH，或让仓库里
 - 这些脚本**不应该**被核心吸收。如果哪天核心开始内置 `grep` 或搜索引擎适配，
   说明缝隙没磨平，而不是这些功能值得内置。
 - 核心要做的是让**写扩展这件事足够便宜**。本轮落地的三条都是契约层改动：
-  `batch js --file` 对齐投递方式、`js --help` 写清求值与注入生命周期、`--file`/内联的互斥规则。
+  `js --tabs --file` 对齐投递方式、`js --help` 写清求值与注入生命周期、`--file`/内联的互斥规则。
   它们不新增命令，反而降低使用成本。
 - 反过来，`--arg` 与不透明游标被明确拒绝：前者新增参数通道却不消除转义，后者会把一条
   已文档化的稳定契约改成破坏性变更。

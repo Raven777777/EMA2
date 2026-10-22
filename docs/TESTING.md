@@ -15,7 +15,7 @@
 - 禁止新增或运行 Node 测试（`node:test`、jest、jsdom、Playwright、Puppeteer、VM 模拟）。
 - 禁止提交 `package.json`、`package-lock.json`、`node_modules/`。
 - 原因：模拟测试慢、维护成本高，而且找不到真实浏览器差异——
-  `type/select`、短 ref、`observe console --filter`、`files download-dir`
+  `type/select`、短 ref、`observe console --filter`、`files upload`
   都是真机验收才发现的问题。
 
 ### 3. 断言输出，而不是“看起来对”
@@ -41,7 +41,7 @@ python scripts/verify.py --skip-real-edge  # 只检查错误码文档漂移
 `verify.py` 只用标准库，不引入 Node；它启动本机 fixture HTTP 服务，
 用真实 `ema2` CLI 驱动真实 Edge 打开它，覆盖
 open / snapshot / act（按钮+链接+SPA+scroll）/ read（md 链接·表格·列表·shadow DOM）/ js /
-wait / observe console·network / shot / files upload（含 5 MiB 边界）/ batch / 负例错误码，
+wait / observe console·network / shot / files upload（含 5 MiB 边界）/ `--tabs/--urls` / 负例错误码，
 并静态断言 `extension/modules/*.js` 的每个 `fail('code'` 都写进了 `docs/TOOLS.md`，
 同时检查 `contract/runtime.json` 与生成的 `extension/contract.js` 是否同步。
 
@@ -87,7 +87,7 @@ bin\ema2.exe status          # extension=connected
 | 0 | 普通浏览任意页面（不执行 EMA2 命令） | 无 `window.__ema2_guard`；alert/confirm/prompt/window.open 为原生行为 |
 | 1 | `ema2 server` ×2 | 第二次 `relay=already_running pid=...`，退出 0 |
 | 2 | `ema2 status` | `relay=running`、`extension=connected`、`tabs=N active_tab=ID` |
-| 3 | `ema2 status` / `ema2 tabs list` | `active_tab=ID` / `*` 标记活动页；`tabs current`（legacy）仍回 `id/window/os/title/url` + `deprecated=` |
+| 3 | `ema2 status` / `ema2 tabs list` | `active_tab=ID` / `*` 标记活动页 |
 | 4 | `ema2 open https://example.com/` | `status=200`、`net_hook=on`、`id=`、`focused=1` |
 | 5 | `ema2 read --mode md` | 正文；链接是 `[text](url)`；截断时给 `--cursor N` |
 | 5a | 百度 `read --mode text` | 不出现 `hotsearch_data` / `card_title` JSON / `/* eslint` |
@@ -121,7 +121,7 @@ bin\ema2.exe status          # extension=connected
 | 14 | `ema2 observe network --har out.har` | `path=... entries=N`，HAR 可解析 |
 | 15 | `ema2 observe console --filter log-119` | 命中 console 行 |
 | 16 | `ema2 files upload <abs> --ref e8` | `uploaded=1`；`js` 能看到文件名 |
-| 17 | `ema2 files download-dir`（legacy） | `download_dir_unsupported` + `deprecated=1`，退出 4 |
+| 17 | `/cmd` `files` action=download-dir | `download_dir_unsupported` + `deprecated=1`（CLI 已删除） |
 | 18 | `ema2 shot --out out.png` | `path=` + `bytes=`，文件存在 |
 | 19 | `ema2 shot --annotate --format jpeg` | 标注图落盘 |
 | 20 | `ema2 shot --inline` | `data:image/png;base64,...` |
@@ -144,8 +144,9 @@ bin\ema2.exe status          # extension=connected
 | 33 | 命令执行中的 `alert/print` | 非阻塞并回 `dialog_opened=` |
 | 34 | 命令结束后定时检查 guard | `window.__ema2_guard.armed=0`，原生 API 已恢复 |
 | 35 | `ema2 --help` | 只列 14 个顶层命令，不出现 `batch` |
-| 36 | `ema2 tabs new` / `tabs current`（legacy） | 仍可执行，输出末尾 `deprecated=1 ...` |
-| 37 | `ema2 batch read --urls "u1"`（legacy） | 仍可执行，输出无 `deprecated=` |
+| 36 | `ema2 batch ...` | CLI 用法错误，退出 1（batch 只是 `/cmd` 执行器） |
+| 37 | `ema2 tabs new` / `tabs current` | CLI 用法错误，退出 1 |
+| 38 | `ema2 files download-dir` | CLI 用法错误，退出 1 |
 
 错误路径：
 
@@ -160,12 +161,12 @@ bin\ema2.exe status          # extension=connected
 | `ema2 act click <disabled>` | `error=element_disabled`，退出 4 |
 | `ema2 act click <旧完整 ref>` | `error=stale_ref`，退出 4 |
 | `ema2 read --selector "#nope"` | `error=selector_not_found`，退出 4 |
-| `ema2 files download-dir`（legacy） | `error=download_dir_unsupported` + `deprecated=1`，退出 4 |
+| `ema2 files download-dir` | CLI 已删除，用法错误退出 1；`/cmd` action 仍返回 `download_dir_unsupported` |
 
 ## 开发注意
 
 - 扩展是普通 MV3 service worker。改完 `extension/` 后必须在 `edge://extensions/`
-  点“重新加载”，并确认 `ema2 status` 输出 `version=2.4.3.11`（版本对不上说明还在跑旧脚本）；
+  点“重新加载”，并确认 `ema2 status` 输出 `version=2.4.3.21`（版本对不上说明还在跑旧脚本）；
   如果 Edge 仍用旧脚本，把 `extension/manifest.json` 的 `version` 加一
   （Edge 按 manifest 版本缓存扩展脚本）。
 - 页面 helper 有版本号（`__ema2_helpers_version`）。改 helper 行为时同步加一，

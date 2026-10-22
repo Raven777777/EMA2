@@ -61,7 +61,7 @@ pub(super) fn split_flag(token: &str) -> (&str, Option<String>) {
 
 /// 顺序读取 token 的游标；越界返回 None，错误文案由调用方的 context/flag 决定。
 ///
-/// act/batch 原来各自维护 `index` + `tokens.get(index)` 样板代码；行为完全一致：
+/// act 原来自己维护 `index` + `tokens.get(index)` 样板代码；抽到游标后行为完全一致：
 /// - `required_next` 取紧跟当前 flag 的值（`--flag value`），不前进；
 /// - `take_flag_value` 兼容 `--flag=value`，内联值只前进一格；
 /// - 其余情况由调用方显式 `advance`。
@@ -78,11 +78,6 @@ impl<'a> TokenCursor<'a> {
     /// 当前 token（不前进）。
     pub(super) fn peek(&self) -> Option<&'a str> {
         self.tokens.get(self.index).map(String::as_str)
-    }
-
-    /// 当前位置之后第 `offset` 个 token。
-    pub(super) fn peek_at(&self, offset: usize) -> Option<&'a str> {
-        self.tokens.get(self.index + offset).map(String::as_str)
     }
 
     /// 紧跟当前 flag 的值；缺失时按 `<context>: <flag> needs a value` 报错。
@@ -117,7 +112,7 @@ impl<'a> TokenCursor<'a> {
     }
 }
 
-/// 多目标上限：与 `batch` 的 MAX_BATCH_TABS 一致（扩展侧也会再校验一次）。
+/// 多目标上限：与扩展侧 MAX_BATCH_TABS 一致。
 pub(super) const MAX_TARGETS: usize = 8;
 
 /// `--tabs "1,2"`（可重复）→ 1..8 个 tab id。

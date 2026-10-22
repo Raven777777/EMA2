@@ -1,5 +1,50 @@
 # 变更记录
 
+## v2.4.3.21 — 删掉旧解析器（`batch` 只做执行器）
+
+v2.4.3.11 隐藏的旧面在这一版从 CLI 解析器里彻底删除；扩展侧的 action 仍留给 `/cmd`。
+工具数仍是 **11**，可见顶层命令仍是 **14**。
+
+### CLI
+
+- 删除 `rust/src/cli/batch.rs`（`build_batch` / `parse_tool_flags` 及解析测试）、
+  `Command::Batch`、`cli::build_batch` 导出与 `main.rs` 分支。
+- 删除 `TabsCommand::New` / `TabsCommand::Current` 与 `FilesCommand::DownloadDir`
+  的 clap 变体和 `build_tabs` / `build_files` 分支。
+- 这些输入现在是 clap 用法错误（退出 1）：
+  `ema2 batch ...`、`ema2 tabs new ...`、`ema2 tabs current`、`ema2 files download-dir`。
+- 多目标仍走 `read/snapshot/js/wait --tabs/--urls` 与 `open --urls`；
+  CLI 侧只是把它们编译成一次内部 `batch` `/cmd` 调用，不再有第二套参数解析器。
+
+### 扩展
+
+- `batchTool` 执行器、`tabs action=new/current`、`files action=download-dir` 全部保留，
+  供 `/cmd` 兼容；它们仍输出 v2.4.3.11 的 `deprecated=` 行。
+- 没有改页面 helper，`helpersVersion` 仍是 21；改了扩展脚本，需要重新加载扩展。
+
+### 文档
+
+- `docs/PHILOSOPHY.md` 补一句：`batch` 是 `--tabs/--urls` 的 `/cmd` 执行器，不是用户命令。
+- `docs/TOOLS.md` 删除「Legacy」整节；主表与「目标与并发」只描述新语法，
+  并说明内部执行器仍叫 `batch`。
+- `docs/ARCHITECTURE.md` 的 batch 章节改为「/cmd 执行器」。
+- 演进方案迁入 `docs/archive/EVOLUTION.md`，三个阶段的规划全部标为已实施。
+- `examples/batch-read.sh` 改用 `read --urls`；`examples/jss/batch.sh` 改用
+  `open --urls` + `js --tabs --file`；相关 README 同步。
+
+### 测试
+
+- `cargo test`：删除 batch 解析测试；`registry_is_compact_and_complete` 增加显式例外
+  `CMD_ONLY_TOOLS = ["batch"]`，工具仍 11、CLI 工具子命令 10；新增「旧命令不再是子命令」断言。
+- `scripts/verify.py`：删除旧 CLI 路径的用例；新增
+  `batch` / `tabs new` / `tabs current` / `files download-dir` 的用法错误负例，
+  以及 `/cmd` 下 `tabs action=new/current`、`files action=download-dir` 的兼容用例。
+
+### 版本
+
+- 对外产品/扩展 `2.4.3.21`；`guardVersion` / `guardProtocolVersion` 5；`helpersVersion` 21；
+  Cargo crate metadata 仍为 SemVer 2.4.2。
+
 ## v2.4.3.11 — 隐藏旧面（运行时兼容）
 
 可见契约缩小，但不破坏旧脚本。顶层 help 从 15 个命令降到 **14** 个；隐藏的四个旧入口
@@ -37,7 +82,7 @@
 
 ## v2.4.3.1 — 命令面语义统一（纯增量）
 
-不删旧语法、不改退出码、不新增工具（仍是 11 个）。这一版只补 EVOLUTION.md 的第一段：
+不删旧语法、不改退出码、不新增工具（仍是 11 个）。这一版只补演进方案的第一段：
 把同一能力从「换个命令重新学一套 flag」收敛成 `--tabs/--urls`，把同名不同义的等待/过滤
 拆成一名一义，并修掉 `internal` 这个无法自我纠正的兜底码。
 

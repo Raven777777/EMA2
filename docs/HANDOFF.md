@@ -5,12 +5,12 @@
 ## 当前版本
 
 ```text
-exe        2.4.3.11（Cargo crate metadata 仍为 SemVer 2.4.2）
-extension  2.4.3.11
+exe        2.4.3.21（Cargo crate metadata 仍为 SemVer 2.4.2）
+extension  2.4.3.21
 helper     21
 guard      5（guardProtocolVersion 5）
-tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch）
-可见 CLI  14 个顶层命令（batch 已隐藏，仍可调用）
+tools      11（tabs/open/read/snapshot/act/wait/js/observe/files/shot/batch；batch 仅 /cmd）
+可见 CLI  14 个顶层命令（没有 batch 子命令）
 ```
 
 `await` 是 CLI 命令，映射到 `wait` 工具，不增加第 12 个工具。
@@ -41,7 +41,7 @@ AI / shell
 | 路径 | 内容 |
 |---|---|
 | `rust/src/main.rs` | CLI 入口、daemon 启停、`status`、`init`、工具调用与退出码 |
-| `rust/src/cli/` | clap 子命令、参数/脚本/batch 编译（spec/build/act/batch/shared） |
+| `rust/src/cli/` | clap 子命令、参数/脚本编译（spec/build/act/shared）；batch 内层解析已删除 |
 | `rust/src/server.rs` | axum 单端口路由、`/cmd`、`/health`、`/shutdown` |
 | `rust/src/relay.rs` | 扩展 WS、hello/welcome、keepalive |
 | `rust/src/state.rs` | 扩展 generation、pending 请求、锁兜底 |
@@ -102,7 +102,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-运行 `cargo test` 查看当前用例数（本版为 **131**）。
+运行 `cargo test` 查看当前用例数（本版为 **127**）。
 
 真实浏览器验收按 [TESTING.md](TESTING.md)。  
 **绝对禁止 Node.js 测试**，不要新增 `package.json` / `node_modules` / jsdom。
@@ -181,9 +181,12 @@ cargo test
 - `open/js --timeout`、`wait --timeout`、`observe --collect` 统一接受 `30` / `30s` / `500ms`
 - observe 新名：`--url-filter`（network; 旧 `--filter` 隐藏）、`--collect`（旧 `--wait` 隐藏）、
   `--no-bodies`（旧 `--bodies=false` 保留）
+- v2.4.3.21：删除 CLI `batch` 子命令与 `build_batch` / `parse_tool_flags`（`rust/src/cli/batch.rs`），
+  同时删除 `tabs new/current`、`files download-dir` 的 CLI 分支；扩展的 `tabs/files` action
+  仍保留给 `/cmd`，`batch` 只作为 `--tabs/--urls` 的执行器
 - v2.4.3.11：`batch`、`tabs new`、`tabs current`、`files download-dir` 从 help 隐藏；
   `batch` 输出保持字节兼容（无 `deprecated=`），`tabs new/current` 与 `files download-dir`
-  在输出/错误末尾追加 `deprecated=1`；运行时仍可执行，v2.4.3.21 才删解析器
+  在输出/错误末尾追加 `deprecated=1`；运行时仍可执行（v2.4.3.21 已删除 CLI 解析器）
 - `batch` 在 budget/cursor 截断的块后追加 `resume=<tool> --tab <id> --cursor <next>`
 - `batch` 内层参数放在 `args`；内层校验复用子工具 validator
 - `batch --urls --reuse url`（旧名 `session`）只复用精确 URL 命中的会话标签；默认仍新开
@@ -234,7 +237,7 @@ v2.2.1 起：
 
 ### P2：动态页面可读时机
 
-GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
+GitHub 首页在 `read --tabs/--urls` 时可能只有 `Loading`，等几秒才渲染。
 现在 AI 需要自己 `wait time 3s`。可考虑：
 
 - `read` / `snapshot` 增加可选 `--wait-stable 500ms`
@@ -283,7 +286,7 @@ GitHub 首页在 `batch read` 时可能只有 `Loading`，等几秒才渲染。
 5. **`.` 脚本 pending 停止**
    不要在 pending 后继续执行 ref 操作；先 `await`。
 
-6. **`batch` 预算**
+6. **多目标预算**
    内层工具仍走 validator；不要把 600s 上限绕过去。
 
 7. **截图需要活动 tab 且窗口可见**

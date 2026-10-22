@@ -7,7 +7,7 @@
    `docs/TOOLS.md` 的错误码表里（文档漂移会让 AI 无法自我纠正）；同时检查
    `contract/runtime.json` 与生成的 `extension/contract.js` 是否同步。
 2. 真实 Edge 冒烟：起一个本机 fixture HTTP 服务，用真实 `ema2` CLI 跑
-   open / snapshot / act / read / js / wait / observe / files / shot / batch，
+   open / snapshot / act / read / js / wait / observe / files / shot / --tabs/--urls，
    以及几个必须报错的负例。
 
 **只在真实、前台可见的 Edge 里跑**：脚本会 `tabs activate` 把窗口提到前台，
@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -498,15 +499,41 @@ class Runner:
         return result
 
     def _record_opened_tab(self, args: tuple[str, ...], stdout: str) -> None:
-        """记录 `open` / `tabs new` 真正新建的标签 id。"""
+        """记录 `open` 真正新建的标签 id。"""
         if not args:
             return
-        is_new_tab = args[0] == "open" or (args[0] == "tabs" and args[1:2] == ("new",))
+        is_new_tab = args[0] == "open"
         if not is_new_tab:
             return
         match = re.search(r"^id=(\d+)", stdout, re.M)
         if match:
             self.opened_tabs.append(match.group(1))
+
+    def cmd_tool(self, tool: str, args: dict, timeout: float = 90.0) -> tuple[int, str]:
+        """直接 POST /cmd，覆盖只保留给 /cmd 的旧 action（tabs new/current 等）。"""
+        payload = json.dumps({"tool": tool, "args": args}).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/cmd",
+            data=payload,
+            headers={"Content-Type": "application/json", "X-EMA2-Client": "ema2-cli"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+                status = response.status
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", "replace")
+            return error.code, body
+        text = ""
+        result = data.get("result") if isinstance(data, dict) else None
+        if isinstance(result, dict):
+            text = "\n".join(
+                item.get("text", "")
+                for item in result.get("content", [])
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return status, text
 
     def check(self, name: str, condition: bool, detail: str = "") -> bool:
         if condition:
@@ -826,18 +853,20 @@ def main() -> int:
             (status.stdout or "") + (status.stderr or ""),
         )
 
-        # 普通浏览不注入 guard：tabs new 不是会等待页面的工具命令。
+        # 普通浏览不注入 guard：/cmd 的 tabs action=new 不是会等待页面的工具命令。
         server.guard_reports.clear()
-        idle_tab = runner.run("tabs", "new", f"{base}/idle.html")
-        idle_match = re.search(r"^id=(\d+)", (idle_tab.stdout or ""), re.M)
+        idle_code, idle_text = runner.cmd_tool(
+            "tabs", {"action": "new", "url": f"{base}/idle.html", "active": True}
+        )
+        idle_match = re.search(r"^id=(\d+)", idle_text, re.M)
         idle_deadline = time.time() + 5
         while time.time() < idle_deadline and not server.guard_reports:
             time.sleep(0.1)
         idle_report = server.guard_reports[-1] if server.guard_reports else {}
         runner.check(
             "idle browsing has no EMA2 page guard",
-            idle_tab.returncode == 0 and idle_report.get("guard") == "0",
-            f"tabs={idle_tab.stdout or ''}{idle_tab.stderr or ''} report={idle_report}",
+            idle_code == 200 and idle_match is not None and idle_report.get("guard") == "0",
+            f"tabs={idle_text} report={idle_report}",
         )
         if idle_match:
             runner.run("tabs", "close", idle_match.group(1))
@@ -957,11 +986,18 @@ def main() -> int:
 
         # P0-1：新文档的 performance 历史回填只证明“动作前发生过”，不能被
         # --wait-for url= 当成本次动作的响应；真实请求仍要能匹配。
-        # 必须用 tabs new（不预装网络 hook）打开，才能覆盖「hook 从未安装 →
-        # 无基线」这条真正的 P0-1 路径；open 会预装 hook，测不出回填误匹配。
-        history_tab = runner.run("tabs", "new", f"{base}/history.html")
-        history_match = re.search(r"^id=(\d+)", history_tab.stdout or "", re.M)
-        runner.check("history tab opened", history_match is not None, history_tab.stdout or "")
+        # 必须用 /cmd 的 tabs action=new（不预装网络 hook）打开，才能覆盖
+        # 「hook 从未安装 → 无基线」；open 会预装 hook，测不出回填误匹配。
+        history_code, history_text = runner.cmd_tool(
+            "tabs", {"action": "new", "url": f"{base}/history.html", "active": True}
+        )
+        history_match = re.search(r"^id=(\d+)", history_text, re.M)
+        runner.check(
+            "history tab opened via /cmd tabs action=new",
+            history_code == 200 and history_match is not None
+            and "deprecated=1 use ema2 open --background" in history_text,
+            history_text,
+        )
         if history_match:
             runner.run("wait", "selector", "#noop")
             no_hook = runner.run("js", "return !!window.__ema2_net")
@@ -1029,10 +1065,6 @@ def main() -> int:
         runner.expect_ok(
             "observe --help exposes console default",
             runner.run("observe", "--help"), "默认 error",
-        )
-        runner.expect_ok(
-            "batch --help still works while hidden",
-            runner.run("batch", "--help"), "--reuse url|session",
         )
         top_help = runner.run("--help")
         top_out = (top_help.stdout or "") + (top_help.stderr or "")
@@ -1206,25 +1238,6 @@ def main() -> int:
         big_state = runner.run("js", "const f = document.getElementById('file').files[0]; return f ? f.size : -1")
         runner.check("large upload reaches input", str(5 * 1024 * 1024) in (big_state.stdout or ""), (big_state.stdout or "") + (big_state.stderr or "")[:300])
 
-        batch = runner.run("batch", "read", "--urls", f"{base}/,{base}/second.html", "--concurrency", "2", timeout=120)
-        runner.check(
-            "batch reads both tabs",
-            batch.returncode == 0 and batch.stdout.count("url=") >= 2 and "Second Page" in (batch.stdout or "")
-            and "deprecated=" not in (batch.stdout or ""),
-            (batch.stdout or "") + (batch.stderr or "")[-600:],
-        )
-        reused_batch = runner.run(
-            "batch", "read", "--urls", f"{base}/",
-            "--reuse", "session", "--concurrency", "1", timeout=120,
-        )
-        reused_out = (reused_batch.stdout or "") + (reused_batch.stderr or "")
-        runner.check(
-            "batch --reuse session reuses a session tab",
-            reused_batch.returncode == 0 and "reused=1" in reused_out
-            and "Fixture Home" in reused_out,
-            reused_out[-1000:],
-        )
-
         # ---- v2.4.3.1: fan-out on the normal commands, background open, error page ----
         url_read = runner.run(
             "read", "--url", f"{base}/second.html", "--mode", "text", "--no-main", timeout=120
@@ -1249,6 +1262,18 @@ def main() -> int:
             and len(re.findall(r"^tab=\d+$", urls_read_out, re.M)) >= 2
             and "Fixture Home" in urls_read_out and "Second Page" in urls_read_out,
             urls_read_out[:1600],
+        )
+
+        reused_read = runner.run(
+            "read", "--urls", f"{base}/", "--reuse", "url",
+            "--mode", "text", "--no-main", "--concurrency", "1", timeout=120,
+        )
+        reused_out = (reused_read.stdout or "") + (reused_read.stderr or "")
+        runner.check(
+            "read --urls --reuse url reuses a session tab",
+            reused_read.returncode == 0 and "reused=1" in reused_out
+            and "Fixture Home" in reused_out,
+            reused_out[-1000:],
         )
 
         fanout_tab_ids = re.findall(r"^tab=(\d+)$", urls_read_out, re.M)
@@ -1284,13 +1309,13 @@ def main() -> int:
             resume_out[:1600],
         )
 
-        before_bg = runner.run("tabs", "current")
-        before_bg_id = re.search(r"^id=(\d+)", before_bg.stdout or "", re.M)
+        before_bg = runner.run("status")
+        before_bg_id = re.search(r"active_tab=(\d+)", before_bg.stdout or "")
         background_open = runner.run(
             "open", f"{base}/second.html", "--background", "--until", "dom", timeout=120
         )
-        after_bg = runner.run("tabs", "current")
-        after_bg_id = re.search(r"^id=(\d+)", after_bg.stdout or "", re.M)
+        after_bg = runner.run("status")
+        after_bg_id = re.search(r"active_tab=(\d+)", after_bg.stdout or "")
         background_out = (background_open.stdout or "") + (background_open.stderr or "")
         runner.check(
             "open --background keeps the active tab and reports focused=0",
@@ -1716,47 +1741,21 @@ def main() -> int:
         runner.expect_error("js hard timeout", timed, "script_timeout", 4)
         runner.expect_ok("js recovers after timeout", runner.run("js", "1+1"), "2")
 
-        new_tab = runner.run("tabs", "new", f"{base}/second.html")
-        new_out = (new_tab.stdout or "") + (new_tab.stderr or "")
-        new_match = re.search(r"^id=(\d+)", new_out, re.M)
-        current_tab = runner.run("tabs", "current")
-        runner.check(
-            "tabs new activates by default",
-            new_tab.returncode == 0 and new_match is not None
-            and f"id={new_match.group(1)}" in (current_tab.stdout or ""),
-            new_out + (current_tab.stdout or "") + (current_tab.stderr or ""),
-        )
-        runner.check(
-            "tabs new appends deprecated= last",
-            new_out.strip().splitlines()[-1] == "deprecated=1 use ema2 open --background",
-            new_out,
-        )
-        current_out = (current_tab.stdout or "") + (current_tab.stderr or "")
-        runner.check(
-            "tabs current appends deprecated= last",
-            current_tab.returncode == 0
-            and current_out.strip().splitlines()[-1]
-            == "deprecated=1 use ema2 status or ema2 tabs list",
-            current_out,
-        )
-        if new_match:
-            runner.run("tabs", "close", new_match.group(1))
-
         if bug_tab:
             # act --tab 必须操作非活动标签，而不是当前活动标签。
-            other_tab = runner.run("tabs", "new", f"{base}/second.html")
+            other_tab = runner.run("open", f"{base}/second.html")
             other_match = re.search(r"^id=(\d+)", other_tab.stdout or "", re.M)
-            current_before = runner.run("tabs", "current")
+            current_before = runner.run("status")
             tab_act = runner.run(
                 "act", "fill", "--tab", bug_tab, "--selector", "#a", "background-tab-value"
             )
-            current_after = runner.run("tabs", "current")
+            current_after = runner.run("status")
             background_value = runner.run(
                 "js", "--tab", bug_tab, "return document.getElementById('a').value"
             )
             tab_act_out = (tab_act.stdout or "") + (tab_act.stderr or "")
-            active_before = re.search(r"^id=(\d+)", current_before.stdout or "", re.M)
-            active_after = re.search(r"^id=(\d+)", current_after.stdout or "", re.M)
+            active_before = re.search(r"active_tab=(\d+)", current_before.stdout or "")
+            active_after = re.search(r"active_tab=(\d+)", current_after.stdout or "")
             runner.check(
                 "act --tab changes an inactive tab without activating it",
                 tab_act.returncode == 0 and "ok=fill" in tab_act_out
@@ -1825,20 +1824,35 @@ def main() -> int:
             "invalid_argument",
             1,
         )
-        runner.expect_error(
-            "batch urls rejects replace",
-            runner.run("batch", "open", "--urls", f"{base}/", "--replace"),
-            "invalid_argument",
-            1,
-        )
-        download_dir = runner.run("files", "download-dir")
-        download_dir_out = (download_dir.stdout or "") + (download_dir.stderr or "")
+        for removed in (
+            ("batch", "read", "--urls", f"{base}/"),
+            ("tabs", "new", f"{base}/second.html"),
+            ("tabs", "current"),
+            ("files", "download-dir"),
+        ):
+            result = runner.run(*removed)
+            output = (result.stdout or "") + (result.stderr or "")
+            runner.check(
+                f"{' '.join(removed[:2])} is no longer a CLI subcommand",
+                result.returncode == 1 and "subcommand" in output.lower(),
+                output[:800],
+            )
+
+        current_code, current_text = runner.cmd_tool("tabs", {"action": "current"})
         runner.check(
-            "files download-dir still errors with a deprecated line",
-            download_dir.returncode == 4
-            and "error=download_dir_unsupported" in download_dir_out
-            and "deprecated=1 set the directory in edge://settings/downloads" in download_dir_out,
-            download_dir_out[:800],
+            "tabs current /cmd action still works and is deprecated",
+            current_code == 200
+            and current_text.strip().splitlines()[-1]
+            == "deprecated=1 use ema2 status or ema2 tabs list",
+            current_text,
+        )
+        files_code, files_text = runner.cmd_tool("files", {"action": "download-dir"})
+        runner.check(
+            "files download-dir /cmd action still errors with a deprecated line",
+            files_code == 200
+            and "error=download_dir_unsupported" in files_text
+            and "deprecated=1 set the directory in edge://settings/downloads" in files_text,
+            files_text[:800],
         )
         # P1-3：ref 与 selector 同时给出时必须由 CLI 拒绝，而不是扩展按 ref 优先。
         runner.expect_error(
@@ -1858,7 +1872,7 @@ def main() -> int:
             )
         except Exception as exc:  # noqa: BLE001 - 清理失败不能掩盖原始失败
             print(f"cleanup: tabs close --session failed ({type(exc).__name__}: {exc})")
-        # 二次兜底：本次 open / tabs new 打开过的标签逐个关闭（best effort）。
+        # 二次兜底：本次 open 打开过的标签逐个关闭（best effort；/cmd tabs new 由 --session 关）。
         for tab_id in dict.fromkeys(runner.opened_tabs):
             try:
                 runner.run("tabs", "close", tab_id, timeout=15)
